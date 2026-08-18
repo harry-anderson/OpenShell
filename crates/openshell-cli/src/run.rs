@@ -74,8 +74,9 @@ use tonic::{Code, Status};
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
-    sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
+    sandbox_connect, sandbox_connect_editor, sandbox_connect_forward_agent, sandbox_exec,
+    sandbox_forward, sandbox_forward_agent, sandbox_ssh_proxy, sandbox_ssh_proxy_by_name,
+    sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
     ForwardSpec, find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
@@ -218,8 +219,8 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
-    keep || forward.is_some()
+fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, forward_agent: bool) -> bool {
+    keep || forward.is_some() || forward_agent
 }
 
 fn build_sandbox_resource_limits(
@@ -376,6 +377,7 @@ pub struct SandboxCreateConfig<'a> {
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
+    pub forward_agent: bool,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -400,6 +402,7 @@ impl Default for SandboxCreateConfig<'_> {
             providers: &[],
             policy: None,
             forward: None,
+            forward_agent: false,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -432,14 +435,21 @@ pub async fn sandbox_create(
         providers,
         policy,
         forward,
+        forward_agent,
         command,
         tty_override,
         auto_providers_override,
         labels,
-        environment,
+        mut environment,
         approval_mode,
         output,
     } = config;
+
+    if forward_agent {
+        openshell_core::ssh_agent::host_agent_socket_ok()
+            .map_err(|err| miette::miette!("{err}"))?;
+        openshell_core::ssh_agent::inject_forward_agent_env(&mut environment);
+    }
 
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
@@ -552,7 +562,7 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
+    let persist = sandbox_should_persist(keep, forward.as_ref(), forward_agent);
     let sandbox_name = if sandbox.object_name().is_empty() {
         "unknown".to_string()
     } else {
@@ -923,6 +933,27 @@ pub async fn sandbox_create(
                 eprintln!(
                     "  Stop with: openshell forward stop {} {sandbox_name}",
                     spec.port,
+                );
+            }
+
+            if forward_agent {
+                sandbox_forward_agent(
+                    &effective_server,
+                    &sandbox_name,
+                    &effective_tls,
+                    workspace,
+                )
+                .await?;
+                eprintln!(
+                    "  {} SSH agent forwarded into {sandbox_name} ({})",
+                    "\u{2713}".green().bold(),
+                    openshell_core::ssh_agent::SANDBOX_AGENT_SOCK,
+                );
+                eprintln!(
+                    "  Host agent stays on this machine. Stop with: openshell sandbox delete {sandbox_name}"
+                );
+                eprintln!(
+                    "  WARNING: any process in the sandbox can now sign as your host SSH key (YubiKey tap still required)."
                 );
             }
 
@@ -7661,18 +7692,23 @@ mod tests {
 
     #[test]
     fn sandbox_should_persist_defaults_to_persistent() {
-        assert!(sandbox_should_persist(true, None));
+        assert!(sandbox_should_persist(true, None, false));
     }
 
     #[test]
     fn sandbox_should_not_persist_when_no_keep_is_set() {
-        assert!(!sandbox_should_persist(false, None));
+        assert!(!sandbox_should_persist(false, None, false));
     }
 
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
-        assert!(sandbox_should_persist(false, Some(&spec)));
+        assert!(sandbox_should_persist(false, Some(&spec), false));
+    }
+
+    #[test]
+    fn sandbox_should_persist_when_forward_agent_is_requested() {
+        assert!(sandbox_should_persist(false, None, true));
     }
 
     #[test]

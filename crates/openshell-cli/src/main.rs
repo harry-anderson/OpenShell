@@ -1360,7 +1360,7 @@ enum SandboxCommands {
         keep: bool,
 
         /// Delete the sandbox after the initial command or shell exits.
-        #[arg(long, conflicts_with_all = ["keep", "editor", "forward"])]
+        #[arg(long, conflicts_with_all = ["keep", "editor", "forward", "forward_agent"])]
         no_keep: bool,
 
         /// Launch a remote editor after the sandbox is ready.
@@ -1406,6 +1406,15 @@ enum SandboxCommands {
         /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
         forward: Option<String>,
+
+        /// Forward this host's SSH agent into the sandbox (`SSH_AUTH_SOCK`).
+        /// Uses the existing authenticated SSH relay (works on Kubernetes;
+        /// does not require host.docker.internal). Opt-in: the sandbox can
+        /// then sign git commits / `ssh-add -l` as your host key. Keeps the
+        /// sandbox alive. Requires a forked supervisor that implements
+        /// agent_request.
+        #[arg(long, conflicts_with = "no_keep")]
+        forward_agent: bool,
 
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
@@ -1601,6 +1610,12 @@ enum SandboxCommands {
         /// Installs OpenShell-managed SSH config if needed.
         #[arg(long, value_enum)]
         editor: Option<CliEditor>,
+
+        /// Re-establish SSH agent forwarding for this connect (host
+        /// `SSH_AUTH_SOCK` → pinned `/tmp/openshell-ssh-agent/agent.sock`).
+        /// The sandbox must have been created with `--forward-agent`.
+        #[arg(long)]
+        forward_agent: bool,
     },
 
     /// Upload local files to a sandbox.
@@ -2973,6 +2988,7 @@ async fn run_async() -> Result<()> {
                     providers,
                     policy,
                     forward,
+                    forward_agent,
                     tty,
                     no_tty,
                     auto_providers,
@@ -3040,7 +3056,7 @@ async fn run_async() -> Result<()> {
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
-                    let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let keep = keep || !no_keep || editor.is_some() || forward.is_some() || forward_agent;
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -3063,6 +3079,7 @@ async fn run_async() -> Result<()> {
                             providers: &providers,
                             policy: policy.as_deref(),
                             forward,
+                            forward_agent,
                             command: &command,
                             tty_override,
                             auto_providers_override,
@@ -3187,7 +3204,11 @@ async fn run_async() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
-                        SandboxCommands::Connect { name, editor } => {
+                        SandboxCommands::Connect {
+                            name,
+                            editor,
+                            forward_agent,
+                        } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
@@ -3195,6 +3216,21 @@ async fn run_async() -> Result<()> {
                                     &ctx.name,
                                     &name,
                                     editor,
+                                    &tls,
+                                    &cli.workspace,
+                                )
+                                .await?;
+                            } else if forward_agent {
+                                run::sandbox_forward_agent(
+                                    endpoint,
+                                    &name,
+                                    &tls,
+                                    &cli.workspace,
+                                )
+                                .await?;
+                                run::sandbox_connect_forward_agent(
+                                    endpoint,
+                                    &name,
                                     &tls,
                                     &cli.workspace,
                                 )

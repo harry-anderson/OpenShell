@@ -107,6 +107,14 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 /// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
+/// Sandbox-level opt-in for SSH agent forwarding. Defaults to false.
+///
+/// The CLI `--forward-agent` flag sets this and injects the pinned
+/// `SSH_AUTH_SOCK`. The supervisor still fail-closes `agent_request` unless
+/// the pinned env is present. A global `true` does not auto-forward; the
+/// client must pass `--forward-agent` (CLI forces `ForwardAgent=no` otherwise).
+pub const SSH_FORWARD_AGENT_KEY: &str = crate::ssh_agent::SSH_FORWARD_AGENT_KEY;
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
@@ -136,6 +144,12 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: PROPOSAL_APPROVAL_MODE_KEY,
         kind: SettingValueKind::String,
         allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
+    },
+    // Opt-in SSH agent forwarding. See SSH_FORWARD_AGENT_KEY. Defaults false.
+    RegisteredSetting {
+        key: SSH_FORWARD_AGENT_KEY,
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
     },
 ];
 

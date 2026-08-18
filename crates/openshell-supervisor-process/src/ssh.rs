@@ -20,10 +20,14 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
+use openshell_core::ssh_agent::{
+    SANDBOX_AGENT_DIR, SANDBOX_AGENT_SOCK, agent_forward_env_enabled,
+};
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -547,6 +551,49 @@ impl russh::server::Handler for SshHandler {
         Ok(())
     }
 
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Fail closed unless create injected the pinned SSH_AUTH_SOCK.
+        // A client `ForwardAgent yes` in ~/.ssh/config must not expose the
+        // host YubiKey just because someone can SSH into the sandbox.
+        if !agent_forward_env_enabled(&self.user_environment) {
+            ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .message("agent-forward rejected: sandbox was not created with --forward-agent")
+                .build());
+            session.channel_failure(channel)?;
+            return Ok(false);
+        }
+
+        if let Err(err) = start_pinned_agent_listener(session.handle(), self.resolved_identity) {
+            ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .message(format!("agent-forward listener failed: {err}"))
+                .build());
+            session.channel_failure(channel)?;
+            return Ok(false);
+        }
+
+        ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(format!("agent-forward listening on {SANDBOX_AGENT_SOCK}"))
+            .build());
+        session.channel_success(channel)?;
+        Ok(true)
+    }
+
     async fn data(
         &mut self,
         channel: ChannelId,
@@ -741,6 +788,89 @@ fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> 
     };
     let home = workdir_home.map_or(default_home, str::to_string);
     (user, home)
+}
+
+static AGENT_LISTENER: OnceLock<()> = OnceLock::new();
+
+/// Create `/tmp/openshell-ssh-agent` (0755) and chown to the sandbox user
+/// when we know the uid. Returns the pinned socket path.
+fn prepare_agent_socket_dir(identity: ResolvedProcessIdentity) -> std::io::Result<&'static str> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(SANDBOX_AGENT_DIR)?;
+    std::fs::set_permissions(SANDBOX_AGENT_DIR, std::fs::Permissions::from_mode(0o755))?;
+    if let Some((uid, gid)) = resolve_agent_owner(identity) {
+        let _ = nix::unistd::chown(
+            SANDBOX_AGENT_DIR,
+            Some(nix::unistd::Uid::from_raw(uid)),
+            Some(nix::unistd::Gid::from_raw(gid)),
+        );
+    }
+    if Path::new(SANDBOX_AGENT_SOCK).exists() {
+        std::fs::remove_file(SANDBOX_AGENT_SOCK)?;
+    }
+    Ok(SANDBOX_AGENT_SOCK)
+}
+
+fn resolve_agent_owner(identity: ResolvedProcessIdentity) -> Option<(u32, u32)> {
+    if let (Some(uid), Some(gid)) = (identity.uid(), identity.gid()) {
+        return Some((uid, gid));
+    }
+    let user = nix::unistd::User::from_name("sandbox").ok().flatten()?;
+    Some((user.uid.as_raw(), user.gid.as_raw()))
+}
+
+/// Bind the pinned agent socket once and, on each accept, open an
+/// `auth-agent@openssh.com` channel back to the client that requested
+/// forwarding. The first caller wins; later SSH sessions reuse the listener.
+fn start_pinned_agent_listener(
+    handle: Handle,
+    identity: ResolvedProcessIdentity,
+) -> anyhow::Result<()> {
+    if AGENT_LISTENER.set(()).is_err() {
+        return Ok(());
+    }
+
+    let sock_path = prepare_agent_socket_dir(identity)?;
+    let listener = std::os::unix::net::UnixListener::bind(sock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some((uid, gid)) = resolve_agent_owner(identity) {
+            let _ = nix::unistd::chown(
+                sock_path,
+                Some(nix::unistd::Uid::from_raw(uid)),
+                Some(nix::unistd::Gid::from_raw(gid)),
+            );
+        }
+    }
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)?;
+
+    tokio::spawn(async move {
+        loop {
+            let (mut incoming, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!("agent-forward accept failed: {err}");
+                    break;
+                }
+            };
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let channel = match handle.channel_open_agent().await {
+                    Ok(channel) => channel,
+                    Err(err) => {
+                        warn!("agent-forward channel_open_agent failed: {err}");
+                        return;
+                    }
+                };
+                let mut agent = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut agent).await;
+            });
+        }
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2137,5 +2267,13 @@ mod tests {
             .expect("relayed response should arrive before the timeout")
             .expect("read from channel");
         assert_eq!(&echoed, b"ping", "bytes round-trip through the tunnel");
+    }
+
+    #[test]
+    fn prepare_agent_socket_dir_uses_pinned_tmp_path() {
+        let path = prepare_agent_socket_dir(ResolvedProcessIdentity::default())
+            .expect("create agent dir");
+        assert_eq!(path, SANDBOX_AGENT_SOCK);
+        assert!(Path::new(SANDBOX_AGENT_DIR).is_dir());
     }
 }

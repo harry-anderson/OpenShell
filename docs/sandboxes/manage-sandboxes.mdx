@@ -379,6 +379,15 @@ openshell sandbox create --forward 8000 -- claude
 
 </Tip>
 
+<Tip>
+To sign git commits with the host SSH agent (including on Kubernetes), pass `--forward-agent`. See [SSH agent forwarding](/sandboxes/ssh-agent-forwarding). This is opt-in: the sandbox becomes a signing oracle for your host key.
+
+```shell
+openshell sandbox create --forward-agent -- claude
+```
+
+</Tip>
+
 ## SSH Config
 
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:

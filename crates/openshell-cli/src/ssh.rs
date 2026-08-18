@@ -8,9 +8,11 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
-    validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, find_ssh_agent_forward_pid, format_gateway_url,
+    resolve_ssh_gateway, shell_escape, validate_ssh_session_response, write_agent_forward_pid,
+    write_forward_pid,
 };
+use openshell_core::ssh_agent;
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
     tcp_forward_init,
@@ -167,8 +169,18 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("ServerAliveInterval=15")
         .arg("-o")
-        .arg("ServerAliveCountMax=3");
+        .arg("ServerAliveCountMax=3")
+        // Override a user ~/.ssh/config `ForwardAgent yes`. Agent
+        // forwarding is opt-in per sandbox via `--forward-agent`.
+        .arg("-o")
+        .arg("ForwardAgent=no");
     command
+}
+
+fn apply_forward_agent(command: &mut Command, enabled: bool) {
+    if enabled {
+        command.arg("-o").arg("ForwardAgent=yes");
+    }
 }
 
 #[cfg(unix)]
@@ -259,10 +271,12 @@ async fn sandbox_connect_with_mode(
     tls: &TlsOptions,
     replace_process: bool,
     workspace: &str,
+    forward_agent: bool,
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
+    apply_forward_agent(&mut command, forward_agent);
     command
         .arg("-tt")
         .arg("-o")
@@ -288,7 +302,16 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    sandbox_connect_with_mode(server, name, tls, true, workspace).await
+    sandbox_connect_with_mode(server, name, tls, true, workspace, false).await
+}
+
+pub async fn sandbox_connect_forward_agent(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    sandbox_connect_with_mode(server, name, tls, true, workspace, true).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -297,7 +320,7 @@ pub(crate) async fn sandbox_connect_without_exec(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    sandbox_connect_with_mode(server, name, tls, false, workspace).await
+    sandbox_connect_with_mode(server, name, tls, false, workspace, false).await
 }
 
 pub async fn sandbox_connect_editor(
@@ -403,6 +426,53 @@ pub async fn sandbox_forward(
         return Err(miette::miette!("ssh exited with status {status}"));
     }
 
+    Ok(())
+}
+
+/// Keep an authenticated SSH session with `ForwardAgent=yes` so the
+/// supervisor can bind the pinned in-sandbox agent socket. Lives as long
+/// as this laptop process (and the host agent).
+pub async fn sandbox_forward_agent(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    ssh_agent::host_agent_socket_ok().map_err(|err| miette::miette!("{err}"))?;
+
+    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
+    command
+        .arg("-N")
+        .arg("-o")
+        .arg("ForwardAgent=yes")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-f")
+        .arg("sandbox")
+        .kill_on_drop(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = command.status().await.into_diagnostic()?;
+    if !status.success() {
+        return Err(miette::miette!(
+            "ssh agent-forward exited with status {status}. \
+             The sandbox supervisor must include the --forward-agent build \
+             (agent_request). Rebuild/install the forked supervisor image."
+        ));
+    }
+
+    if let Some(pid) = find_ssh_agent_forward_pid(&session.sandbox_id) {
+        write_agent_forward_pid(name, pid, &session.sandbox_id)?;
+    } else {
+        eprintln!(
+            "{} Could not discover backgrounded agent-forward SSH; \
+             it may be running but is not tracked",
+            "!".yellow(),
+        );
+    }
     Ok(())
 }
 

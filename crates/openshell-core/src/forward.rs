@@ -27,6 +27,86 @@ pub fn forward_pid_path(name: &str, port: u16) -> Result<PathBuf> {
     Ok(forward_pid_dir()?.join(format!("{name}-{port}.pid")))
 }
 
+/// PID file for the background `ForwardAgent=yes` session. The suffix is
+/// not a port so [`list_forwards`] ignores it.
+pub fn agent_forward_pid_path(name: &str) -> Result<PathBuf> {
+    Ok(forward_pid_dir()?.join(format!("{name}-ssh-agent.pid")))
+}
+
+/// Write a PID file for a background SSH-agent forward.
+pub fn write_agent_forward_pid(name: &str, pid: u32, sandbox_id: &str) -> Result<()> {
+    let dir = forward_pid_dir()?;
+    create_dir_restricted(&dir)?;
+    let path = agent_forward_pid_path(name)?;
+    std::fs::write(&path, format!("{pid}\t{sandbox_id}\tagent"))
+        .into_diagnostic()
+        .wrap_err("failed to write agent-forward PID file")?;
+    Ok(())
+}
+
+/// True when `command` is an OpenShell SSH session with agent forwarding
+/// for `sandbox_id`.
+#[must_use]
+pub fn command_matches_agent_forward(command: &str, sandbox_id: &str) -> bool {
+    command.contains("ssh")
+        && command.contains("ssh-proxy")
+        && command.contains(sandbox_id)
+        && command.contains("ForwardAgent=yes")
+}
+
+/// Find a backgrounded SSH agent-forward PID via `pgrep`.
+#[must_use]
+pub fn find_ssh_agent_forward_pid(sandbox_id: &str) -> Option<u32> {
+    let pattern = format!("ssh.*sandbox-id.*{sandbox_id}.*ForwardAgent=yes");
+    let output = Command::new("pgrep").arg("-f").arg(&pattern).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+}
+
+/// Stop the background agent-forward session for `name`, if tracked.
+pub fn stop_agent_forward(name: &str) -> Result<bool> {
+    let pid_path = agent_forward_pid_path(name)?;
+    let Ok(contents) = std::fs::read_to_string(&pid_path) else {
+        return Ok(false);
+    };
+    let mut parts = contents.split('\t');
+    let Some(pid) = parts.next().and_then(|s| s.trim().parse::<u32>().ok()) else {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(false);
+    };
+    let sandbox_id = parts.next().map(str::trim);
+    if pid_is_alive(pid) {
+        if let Some(id) = sandbox_id {
+            let output = Command::new("ps")
+                .arg("-ww")
+                .arg("-o")
+                .arg("command=")
+                .arg("-p")
+                .arg(pid.to_string())
+                .output();
+            let cmd = output.map_or_else(
+                |_| String::new(),
+                |o| String::from_utf8_lossy(&o.stdout).into_owned(),
+            );
+            if !command_matches_agent_forward(&cmd, id) {
+                let _ = std::fs::remove_file(&pid_path);
+                return Ok(false);
+            }
+        }
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    Ok(true)
+}
+
 /// Write a PID file for a background forward.
 ///
 /// File format: `<pid>\t<sandbox_id>\t<bind_addr>`
@@ -457,6 +537,8 @@ pub fn stop_forwards_for_sandbox(name: &str) -> Result<Vec<u16>> {
             stopped.push(port);
         }
     }
+
+    let _ = stop_agent_forward(name)?;
 
     Ok(stopped)
 }
@@ -1605,6 +1687,16 @@ mod tests {
 
         assert!(!command_matches_ssh_forward(wrong_ssh, 80, Some("sbx-1")));
         assert!(!command_matches_ssh_forward(wrong_proxy, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn agent_forward_command_requires_forward_agent_and_sandbox_id() {
+        let good = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -o ForwardAgent=yes sandbox";
+        let no_flag = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N sandbox";
+        let other_id = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-2 -N -o ForwardAgent=yes sandbox";
+        assert!(command_matches_agent_forward(good, "sbx-1"));
+        assert!(!command_matches_agent_forward(no_flag, "sbx-1"));
+        assert!(!command_matches_agent_forward(other_id, "sbx-1"));
     }
 
     #[test]

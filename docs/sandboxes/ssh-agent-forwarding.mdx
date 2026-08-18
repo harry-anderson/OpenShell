@@ -1,0 +1,39 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "SSH agent forwarding"
+sidebar-title: "SSH agent forwarding"
+description: "Opt-in forwarding of the host SSH agent into a sandbox for signed git commits. Works on Kubernetes."
+---
+
+OpenShell does **not** forward your SSH agent by default. A sandbox with a live agent is a signing oracle: any process inside can `ssh-add -l`, `git commit`, and `git push` as you (a YubiKey tap still applies).
+
+`--forward-agent` is the create-time opt-in. It does **not** use `host.docker.internal` or a host TCP relay. The CLI opens an authenticated SSH session (`ForwardAgent=yes`) over the existing gateway relay; the supervisor binds `/tmp/openshell-ssh-agent/agent.sock` and sets `SSH_AUTH_SOCK`. Docker, VM, and Kubernetes all use this path.
+
+```bash
+# Host: agent must already be running
+ssh-add -l
+
+openshell sandbox create --forward-agent --name signed -- claude
+
+# Later, if the laptop slept and the tunnel died:
+openshell sandbox connect signed --forward-agent
+
+# Inside the sandbox
+ssh-add -l
+git commit -m "signed with the host key"
+```
+
+## Requirements
+
+- Host `SSH_AUTH_SOCK` is set and the socket exists (ssh-agent, 1Password, PassportControl).
+- Sandbox policy allows Landlock `read_write` on `/tmp` (default policy does).
+- Supervisor image includes this change (`agent_request`). A stock NVIDIA supervisor **rejects** agent forwarding.
+
+## What this is not
+
+- Not a general `host.docker.internal` replacement for other host TCP ports. Use a future `--reverse-forward` / SSH `-R` (listen in the sandbox netns) for that.
+- Not a cluster Service. The agent never binds a Kubernetes port.
+- Not enabled by `ForwardAgent yes` in `~/.ssh/config`. The CLI forces `ForwardAgent=no` unless you pass the flag, and the supervisor fail-closes unless create injected the pinned `SSH_AUTH_SOCK`.
+
+The tunnel dies when this laptop's background SSH exits. Recreate it with `openshell sandbox connect NAME --forward-agent`.
