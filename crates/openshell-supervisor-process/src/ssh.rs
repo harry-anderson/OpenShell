@@ -918,6 +918,13 @@ fn apply_child_env(
         }
         cmd.env(key, value);
     }
+
+    // Prefer the pinned sandbox gitconfig when --forward-agent uploaded it.
+    // Home is often Landlock read-only, so ~/.gitconfig cannot be created.
+    if Path::new(openshell_core::git_sign::SANDBOX_GIT_CONFIG).is_file() {
+        cmd.env("GIT_CONFIG_GLOBAL", openshell_core::git_sign::SANDBOX_GIT_CONFIG);
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -17,6 +17,7 @@ pub mod edge_tunnel;
 pub mod oidc_auth;
 pub mod output;
 pub(crate) mod policy_update;
+pub(crate) mod git_sign;
 pub mod run;
 pub mod ssh;
 pub mod tls;

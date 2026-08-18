@@ -3221,11 +3221,12 @@ async fn run_async() -> Result<()> {
                                 )
                                 .await?;
                             } else if forward_agent {
-                                run::sandbox_forward_agent(
+                                run::sandbox_prepare_forward_agent(
                                     endpoint,
                                     &name,
                                     &tls,
                                     &cli.workspace,
+                                    None,
                                 )
                                 .await?;
                                 run::sandbox_connect_forward_agent(

@@ -10,8 +10,16 @@ OpenShell does **not** forward your SSH agent by default. A sandbox with a live 
 
 `--forward-agent` is the create-time opt-in. It does **not** use `host.docker.internal` or a host TCP relay. The CLI opens an authenticated SSH session (`ForwardAgent=yes`) over the existing gateway relay; the supervisor binds `/tmp/openshell-ssh-agent/agent.sock` and sets `SSH_AUTH_SOCK`. Docker, VM, and Kubernetes all use this path.
 
+This is built for **SSH certificates in the host agent** (PassportControl / YubiKey), not a copied `user.signingKey` file. Git inside the sandbox gets:
+
+- `user.name` / `user.email` from the host (`git config` walk: local → global → system)
+- `gpg.format=ssh` and `commit.gpgsign=true` when the host signs that way
+- `gpg.ssh.defaultKeyCommand=ssh-add -L` so git picks the cert from the forwarded agent
+- `gpg.ssh.allowedSignersFile` copied off the host and rewritten to `/tmp/openshell-git/allowed_signers` (the macOS `~/Library/Group Containers/...` path does not exist in-pod)
+- `GIT_CONFIG_GLOBAL=/tmp/openshell-git/config` because sandbox home is often Landlock read-only
+
 ```bash
-# Host: agent must already be running
+# Host: agent must already be running and list a cert
 ssh-add -l
 
 openshell sandbox create --forward-agent --name signed -- claude
@@ -20,8 +28,9 @@ openshell sandbox create --forward-agent --name signed -- claude
 openshell sandbox connect signed --forward-agent
 
 # Inside the sandbox
-ssh-add -l
-git commit -m "signed with the host key"
+ssh-add -l                    # same cert as the host
+git config --get gpg.format   # ssh
+git commit -m "signed with the host cert"
 ```
 
 ## Requirements

@@ -19,6 +19,7 @@ pub mod driver_utils;
 pub mod endpoint_path;
 pub mod error;
 pub mod forward;
+pub mod git_sign;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;

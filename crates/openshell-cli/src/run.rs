@@ -414,6 +414,49 @@ impl Default for SandboxCreateConfig<'_> {
     }
 }
 
+/// Install host SSH-cert git config and start the agent-forward tunnel.
+///
+/// Used by `sandbox create --forward-agent` and `sandbox connect --forward-agent`.
+/// Certs stay in the host agent; git uses `ssh-add -L` as `defaultKeyCommand`.
+pub async fn sandbox_prepare_forward_agent(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+    git_cfg: Option<&openshell_core::git_sign::HostGitSignConfig>,
+) -> Result<()> {
+    let owned;
+    let cfg = match git_cfg {
+        Some(cfg) => cfg,
+        None => {
+            owned = crate::git_sign::collect_host_git_sign_config();
+            crate::git_sign::warn_if_missing_identity(&owned);
+            &owned
+        }
+    };
+    if let Some(staged) = crate::git_sign::stage_host_git_sign(cfg)? {
+        crate::git_sign::install_staged_git_sign(server, name, &staged, tls, workspace).await?;
+        eprintln!(
+            "  {} Host git signing config installed ({})",
+            "\u{2713}".green().bold(),
+            staged.summary,
+        );
+    }
+    sandbox_forward_agent(server, name, tls, workspace).await?;
+    eprintln!(
+        "  {} SSH agent forwarded into {name} ({})",
+        "\u{2713}".green().bold(),
+        openshell_core::ssh_agent::SANDBOX_AGENT_SOCK,
+    );
+    eprintln!(
+        "  Host agent stays on this machine. Git signs via the forwarded SSH cert (`ssh-add -L`), not a copied signing key."
+    );
+    eprintln!(
+        "  WARNING: any process in the sandbox can now request signatures from your host agent (YubiKey tap still required)."
+    );
+    Ok(())
+}
+
 /// Create a sandbox with default settings.
 pub async fn sandbox_create(
     server: &str,
@@ -445,10 +488,19 @@ pub async fn sandbox_create(
         output,
     } = config;
 
+    let git_sign_cfg = if forward_agent {
+        Some(crate::git_sign::collect_host_git_sign_config())
+    } else {
+        None
+    };
     if forward_agent {
         openshell_core::ssh_agent::host_agent_socket_ok()
             .map_err(|err| miette::miette!("{err}"))?;
         openshell_core::ssh_agent::inject_forward_agent_env(&mut environment);
+        crate::git_sign::inject_git_env(&mut environment);
+        if let Some(cfg) = git_sign_cfg.as_ref() {
+            crate::git_sign::warn_if_missing_identity(cfg);
+        }
     }
 
     if editor.is_some() && !command.is_empty() {
@@ -937,24 +989,14 @@ pub async fn sandbox_create(
             }
 
             if forward_agent {
-                sandbox_forward_agent(
+                sandbox_prepare_forward_agent(
                     &effective_server,
                     &sandbox_name,
                     &effective_tls,
                     workspace,
+                    git_sign_cfg.as_ref(),
                 )
                 .await?;
-                eprintln!(
-                    "  {} SSH agent forwarded into {sandbox_name} ({})",
-                    "\u{2713}".green().bold(),
-                    openshell_core::ssh_agent::SANDBOX_AGENT_SOCK,
-                );
-                eprintln!(
-                    "  Host agent stays on this machine. Stop with: openshell sandbox delete {sandbox_name}"
-                );
-                eprintln!(
-                    "  WARNING: any process in the sandbox can now sign as your host SSH key (YubiKey tap still required)."
-                );
             }
 
             if structured_output {

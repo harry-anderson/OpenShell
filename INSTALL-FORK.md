@@ -47,5 +47,10 @@ Local Docker gateway: point the gateway config at the same supervisor image, or 
 export SSH_AUTH_SOCK=...   # already set if ssh-add -l works
 openshell sandbox create --forward-agent --name agent-smoke -- ssh-add -l
 openshell sandbox connect agent-smoke --forward-agent
-# in sandbox: echo $SSH_AUTH_SOCK  →  /tmp/openshell-ssh-agent/agent.sock
+# in sandbox:
+#   echo $SSH_AUTH_SOCK              → /tmp/openshell-ssh-agent/agent.sock
+#   echo $GIT_CONFIG_GLOBAL          → /tmp/openshell-git/config
+#   git config --get gpg.format      → ssh
+#   git config --get gpg.ssh.defaultKeyCommand → ssh-add -L
+# No user.signingKey is copied. Git asks the forwarded agent for the SSH cert.
 ```
