@@ -58,7 +58,11 @@ pub fn command_matches_agent_forward(command: &str, sandbox_id: &str) -> bool {
 #[must_use]
 pub fn find_ssh_agent_forward_pid(sandbox_id: &str) -> Option<u32> {
     let pattern = format!("ssh.*sandbox-id.*{sandbox_id}.*ForwardAgent=yes");
-    let output = Command::new("pgrep").arg("-f").arg(&pattern).output().ok()?;
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg(&pattern)
+        .output()
+        .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
         .lines()
@@ -1692,9 +1696,12 @@ mod tests {
     #[test]
     fn agent_forward_command_requires_forward_agent_and_sandbox_id() {
         let good = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -o ForwardAgent=yes sandbox";
-        let no_flag = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N sandbox";
+        let session = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -o IdentityAgent=/tmp/agent.sock -o ForwardAgent=yes -f sandbox sleep infinity";
+        let no_flag =
+            "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N sandbox";
         let other_id = "/usr/bin/ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-2 -N -o ForwardAgent=yes sandbox";
         assert!(command_matches_agent_forward(good, "sbx-1"));
+        assert!(command_matches_agent_forward(session, "sbx-1"));
         assert!(!command_matches_agent_forward(no_flag, "sbx-1"));
         assert!(!command_matches_agent_forward(other_id, "sbx-1"));
     }

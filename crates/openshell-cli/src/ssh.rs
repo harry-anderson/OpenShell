@@ -12,11 +12,11 @@ use openshell_core::forward::{
     resolve_ssh_gateway, shell_escape, validate_ssh_session_response, write_agent_forward_pid,
     write_forward_pid,
 };
-use openshell_core::ssh_agent;
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
     tcp_forward_init,
 };
+use openshell_core::ssh_agent;
 use openshell_core::{ObjectId, driver_mounts};
 use owo_colors::OwoColorize;
 use std::fs;
@@ -38,9 +38,15 @@ use tokio_stream::wrappers::ReceiverStream;
 const FORWARD_LISTENER_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delay between listener/PID probes within the configured timeout.
 const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+/// Remote `test -S` is an SSH round-trip; do not hammer the gateway.
+const AGENT_SOCKET_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// Per-attempt connect timeout, so one hung probe cannot consume the whole
 /// grace period.
 const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// Remote command for the agent-forward keep-alive. Must be a real session:
+/// OpenSSH only sends `auth-agent-req@openssh.com` on a session channel, so
+/// `ssh -N` never forwards the agent even with `ForwardAgent=yes`.
+const AGENT_FORWARD_HOLD_COMMAND: &str = "sleep infinity";
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -144,7 +150,7 @@ async fn ssh_session_config(
     })
 }
 
-fn ssh_base_command(proxy_command: &str) -> Command {
+fn ssh_common_options(proxy_command: &str) -> Command {
     // SSH log level follows the program's verbosity.  main() maps the `-v`
     // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
     let ssh_log_level =
@@ -169,18 +175,71 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("ServerAliveInterval=15")
         .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        // Override a user ~/.ssh/config `ForwardAgent yes`. Agent
-        // forwarding is opt-in per sandbox via `--forward-agent`.
-        .arg("-o")
-        .arg("ForwardAgent=no");
+        .arg("ServerAliveCountMax=3");
+    command
+}
+
+fn ssh_base_command(proxy_command: &str) -> Command {
+    let mut command = ssh_common_options(proxy_command);
+    apply_forward_agent(&mut command, false);
+    command
+}
+
+/// SSH argv for `--forward-agent` sessions.
+///
+/// Never emit `ForwardAgent=no` on this path (do not rely on last-`-o`-wins).
+/// Pass `IdentityAgent` from `SSH_AUTH_SOCK` so OpenSSH can open a socket
+/// whose path contains spaces (`Group Containers` / `PassportControl`).
+fn ssh_forward_agent_command(proxy_command: &str) -> Command {
+    let mut command = ssh_common_options(proxy_command);
+    apply_forward_agent(&mut command, true);
     command
 }
 
 fn apply_forward_agent(command: &mut Command, enabled: bool) {
     if enabled {
+        if let Ok(sock) = std::env::var(ssh_agent::SSH_AUTH_SOCK_ENV)
+            && !sock.is_empty()
+        {
+            command.env(ssh_agent::SSH_AUTH_SOCK_ENV, &sock);
+            // Single `-o` value so spaces in the socket path stay one argv.
+            command.arg("-o").arg(format!("IdentityAgent={sock}"));
+        }
         command.arg("-o").arg("ForwardAgent=yes");
+    } else {
+        // Override a user ~/.ssh/config `ForwardAgent yes`. Agent
+        // forwarding is opt-in per sandbox via `--forward-agent`.
+        command.arg("-o").arg("ForwardAgent=no");
     }
+}
+
+fn interactive_ssh_command(proxy_command: &str, forward_agent: bool) -> Command {
+    let mut command = if forward_agent {
+        ssh_forward_agent_command(proxy_command)
+    } else {
+        ssh_base_command(proxy_command)
+    };
+    command
+        .arg("-tt")
+        .arg("-o")
+        .arg("RequestTTY=force")
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("sandbox");
+    command
+}
+
+/// Background hold that still opens a session channel (`sleep infinity`).
+/// `ssh -N` never sends `auth-agent-req`.
+fn agent_keepalive_command(proxy_command: &str) -> Command {
+    let mut command = ssh_forward_agent_command(proxy_command);
+    command
+        .arg("-f")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(AGENT_FORWARD_HOLD_COMMAND);
+    command
 }
 
 #[cfg(unix)]
@@ -275,15 +334,8 @@ async fn sandbox_connect_with_mode(
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace).await?;
 
-    let mut command = ssh_base_command(&session.proxy_command);
-    apply_forward_agent(&mut command, forward_agent);
+    let mut command = interactive_ssh_command(&session.proxy_command, forward_agent);
     command
-        .arg("-tt")
-        .arg("-o")
-        .arg("RequestTTY=force")
-        .arg("-o")
-        .arg("SetEnv=TERM=xterm-256color")
-        .arg("sandbox")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -429,9 +481,13 @@ pub async fn sandbox_forward(
     Ok(())
 }
 
-/// Keep an authenticated SSH session with `ForwardAgent=yes` so the
-/// supervisor can bind the pinned in-sandbox agent socket. Lives as long
-/// as this laptop process (and the host agent).
+/// Keep an authenticated SSH **session** with `ForwardAgent=yes` so the
+/// supervisor can bind the pinned in-sandbox agent socket.
+///
+/// This must not use `ssh -N`. `-N` means no session channel, so OpenSSH
+/// never sends `auth-agent-req@openssh.com` and the supervisor never binds
+/// `/tmp/openshell-ssh-agent/agent.sock`. `ExitOnForwardFailure` only
+/// covers TCP `-L`/`-R`, not agent forwarding.
 pub async fn sandbox_forward_agent(
     server: &str,
     name: &str,
@@ -441,15 +497,8 @@ pub async fn sandbox_forward_agent(
     ssh_agent::host_agent_socket_ok().map_err(|err| miette::miette!("{err}"))?;
 
     let session = ssh_session_config(server, name, tls, workspace).await?;
-    let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
+    let mut command = TokioCommand::from(agent_keepalive_command(&session.proxy_command));
     command
-        .arg("-N")
-        .arg("-o")
-        .arg("ForwardAgent=yes")
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg("-f")
-        .arg("sandbox")
         .kill_on_drop(false)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -464,6 +513,17 @@ pub async fn sandbox_forward_agent(
         ));
     }
 
+    if let Err(err) = wait_for_agent_socket(&session).await {
+        if let Some(pid) = find_ssh_agent_forward_pid(&session.sandbox_id) {
+            let _ = Command::new("kill")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        return Err(err);
+    }
+
     if let Some(pid) = find_ssh_agent_forward_pid(&session.sandbox_id) {
         write_agent_forward_pid(name, pid, &session.sandbox_id)?;
     } else {
@@ -474,6 +534,50 @@ pub async fn sandbox_forward_agent(
         );
     }
     Ok(())
+}
+
+/// Probe the pinned in-sandbox socket. The CLI checkmark is a lie unless
+/// this path exists; `ssh -f` status 0 only means the client forked.
+async fn wait_for_agent_socket(session: &SshSessionConfig) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + FORWARD_LISTENER_READINESS_TIMEOUT;
+    loop {
+        if sandbox_agent_socket_exists(session).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "SSH agent forwarding did not bind {} within {}ms. \
+                 OpenSSH must send auth-agent-req@openssh.com \
+                 (debug1: Requesting authentication agent forwarding). \
+                 Re-run with OPENSHELL_SSH_LOG_LEVEL=DEBUG. \
+                 `-N` cannot request agent forwarding; the keep-alive \
+                 uses a session (`{AGENT_FORWARD_HOLD_COMMAND}`).",
+                ssh_agent::SANDBOX_AGENT_SOCK,
+                FORWARD_LISTENER_READINESS_TIMEOUT.as_millis(),
+            ));
+        }
+        tokio::time::sleep(AGENT_SOCKET_PROBE_INTERVAL).await;
+    }
+}
+
+async fn sandbox_agent_socket_exists(session: &SshSessionConfig) -> bool {
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(format!(
+            "test -S {}",
+            shell_escape(ssh_agent::SANDBOX_AGENT_SOCK)
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    tokio::task::spawn_blocking(move || ssh.status())
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .is_some_and(|status| status.success())
 }
 
 /// Wait for the local listener, racing the probe against the `ssh` child
@@ -1782,6 +1886,106 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
+
+    fn ssh_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn ssh_has_option(args: &[String], option: &str) -> bool {
+        args.windows(2)
+            .any(|window| window[0] == "-o" && window[1] == option)
+    }
+
+    #[test]
+    fn ssh_base_command_forces_forward_agent_no() {
+        let args = ssh_args(&ssh_base_command("openshell ssh-proxy"));
+        assert!(ssh_has_option(&args, "ForwardAgent=no"));
+        assert!(!ssh_has_option(&args, "ForwardAgent=yes"));
+        assert!(!args.iter().any(|arg| arg.starts_with("IdentityAgent=")));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn ssh_forward_agent_command_does_not_emit_forward_agent_no() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sock =
+            "/Users/harry/Library/Group Containers/U52857STQU.PassportControl/passportControl";
+        let old = std::env::var("SSH_AUTH_SOCK").ok();
+        unsafe {
+            std::env::set_var("SSH_AUTH_SOCK", sock);
+        }
+
+        let args = ssh_args(&ssh_forward_agent_command("openshell ssh-proxy"));
+        assert!(
+            ssh_has_option(&args, "ForwardAgent=yes"),
+            "expected ForwardAgent=yes in {args:?}"
+        );
+        assert!(
+            !ssh_has_option(&args, "ForwardAgent=no"),
+            "must not emit ForwardAgent=no when forwarding: {args:?}"
+        );
+        assert!(
+            ssh_has_option(&args, &format!("IdentityAgent={sock}")),
+            "IdentityAgent must be a single -o value so spaces survive: {args:?}"
+        );
+
+        unsafe {
+            match old {
+                Some(val) => std::env::set_var("SSH_AUTH_SOCK", val),
+                None => std::env::remove_var("SSH_AUTH_SOCK"),
+            }
+        }
+    }
+
+    #[test]
+    fn agent_keepalive_uses_session_not_minus_n() {
+        let args = ssh_args(&agent_keepalive_command("openshell ssh-proxy"));
+        assert!(
+            !args.iter().any(|arg| arg == "-N"),
+            "ssh -N has no session channel so OpenSSH never sends auth-agent-req: {args:?}"
+        );
+        assert!(args.iter().any(|arg| arg == "-f"));
+        assert!(args.iter().any(|arg| arg == AGENT_FORWARD_HOLD_COMMAND));
+        assert!(args.iter().any(|arg| arg == "sandbox"));
+        assert!(!args.iter().any(|arg| arg.contains("ExitOnForwardFailure")));
+        assert!(ssh_has_option(&args, "ForwardAgent=yes"));
+        assert!(!ssh_has_option(&args, "ForwardAgent=no"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn interactive_ssh_with_forward_agent_has_tty_and_identity_agent() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sock = "/tmp/openshell-test-agent.sock";
+        let old = std::env::var("SSH_AUTH_SOCK").ok();
+        unsafe {
+            std::env::set_var("SSH_AUTH_SOCK", sock);
+        }
+
+        let args = ssh_args(&interactive_ssh_command("openshell ssh-proxy", true));
+        assert!(args.iter().any(|arg| arg == "-tt"));
+        assert!(ssh_has_option(&args, "ForwardAgent=yes"));
+        assert!(!ssh_has_option(&args, "ForwardAgent=no"));
+        assert!(ssh_has_option(&args, &format!("IdentityAgent={sock}")));
+
+        let disabled = ssh_args(&interactive_ssh_command("openshell ssh-proxy", false));
+        assert!(ssh_has_option(&disabled, "ForwardAgent=no"));
+        assert!(!ssh_has_option(&disabled, "ForwardAgent=yes"));
+
+        unsafe {
+            match old {
+                Some(val) => std::env::set_var("SSH_AUTH_SOCK", val),
+                None => std::env::remove_var("SSH_AUTH_SOCK"),
+            }
+        }
+    }
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
