@@ -188,8 +188,11 @@ fn ssh_base_command(proxy_command: &str) -> Command {
 /// SSH argv for `--forward-agent` sessions.
 ///
 /// Never emit `ForwardAgent=no` on this path (do not rely on last-`-o`-wins).
-/// Pass `IdentityAgent` from `SSH_AUTH_SOCK` so OpenSSH can open a socket
-/// whose path contains spaces (`Group Containers` / `PassportControl`).
+/// Point OpenSSH at the host agent via `IdentityAgent=SSH_AUTH_SOCK` (the
+/// documented token that re-reads the env). Embedding the raw socket path
+/// fails on `PassportControl` because `-o` is parsed as an ssh_config line
+/// and `Group Containers` contains spaces
+/// (`keyword identityagent extra arguments at end of line`).
 fn ssh_forward_agent_command(proxy_command: &str) -> Command {
     let mut command = ssh_common_options(proxy_command);
     apply_forward_agent(&mut command, true);
@@ -202,8 +205,7 @@ fn apply_forward_agent(command: &mut Command, enabled: bool) {
             && !sock.is_empty()
         {
             command.env(ssh_agent::SSH_AUTH_SOCK_ENV, &sock);
-            // Single `-o` value so spaces in the socket path stay one argv.
-            command.arg("-o").arg(format!("IdentityAgent={sock}"));
+            command.arg("-o").arg("IdentityAgent=SSH_AUTH_SOCK");
         }
         command.arg("-o").arg("ForwardAgent=yes");
     } else {
@@ -1920,7 +1922,8 @@ mod tests {
             std::env::set_var("SSH_AUTH_SOCK", sock);
         }
 
-        let args = ssh_args(&ssh_forward_agent_command("openshell ssh-proxy"));
+        let command = ssh_forward_agent_command("openshell ssh-proxy");
+        let args = ssh_args(&command);
         assert!(
             ssh_has_option(&args, "ForwardAgent=yes"),
             "expected ForwardAgent=yes in {args:?}"
@@ -1930,8 +1933,21 @@ mod tests {
             "must not emit ForwardAgent=no when forwarding: {args:?}"
         );
         assert!(
-            ssh_has_option(&args, &format!("IdentityAgent={sock}")),
-            "IdentityAgent must be a single -o value so spaces survive: {args:?}"
+            ssh_has_option(&args, "IdentityAgent=SSH_AUTH_SOCK"),
+            "IdentityAgent must be the SSH_AUTH_SOCK token, not the raw path: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("Group Containers") || arg.contains(sock)),
+            "raw agent path must not appear in -o (OpenSSH splits on spaces): {args:?}"
+        );
+        assert!(
+            command.get_envs().any(|(key, value)| {
+                key == ssh_agent::SSH_AUTH_SOCK_ENV
+                    && value.is_some_and(|v| v == std::ffi::OsStr::new(sock))
+            }),
+            "child must inherit SSH_AUTH_SOCK so IdentityAgent=SSH_AUTH_SOCK resolves"
         );
 
         unsafe {
@@ -1973,7 +1989,8 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-tt"));
         assert!(ssh_has_option(&args, "ForwardAgent=yes"));
         assert!(!ssh_has_option(&args, "ForwardAgent=no"));
-        assert!(ssh_has_option(&args, &format!("IdentityAgent={sock}")));
+        assert!(ssh_has_option(&args, "IdentityAgent=SSH_AUTH_SOCK"));
+        assert!(!args.iter().any(|arg| arg.contains(sock)));
 
         let disabled = ssh_args(&interactive_ssh_command("openshell ssh-proxy", false));
         assert!(ssh_has_option(&disabled, "ForwardAgent=no"));

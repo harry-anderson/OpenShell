@@ -8,7 +8,7 @@ description: "Opt-in forwarding of the host SSH agent into a sandbox for signed 
 
 OpenShell does **not** forward your SSH agent by default. A sandbox with a live agent is a signing oracle: any process inside can `ssh-add -l`, `git commit`, and `git push` as you (a YubiKey tap still applies).
 
-`--forward-agent` is the create-time opt-in. It does **not** use `host.docker.internal` or a host TCP relay. The CLI opens an authenticated SSH **session** (`ForwardAgent=yes`, plus `IdentityAgent` from the host `SSH_AUTH_SOCK`) over the existing gateway relay; the supervisor binds `/tmp/openshell-ssh-agent/agent.sock` and sets `SSH_AUTH_SOCK`. Docker, VM, and Kubernetes all use this path.
+`--forward-agent` is the create-time opt-in. It does **not** use `host.docker.internal` or a host TCP relay. The CLI opens an authenticated SSH **session** (`ForwardAgent=yes`, plus `IdentityAgent=SSH_AUTH_SOCK` so OpenSSH re-reads the host agent socket even when the path contains spaces) over the existing gateway relay; the supervisor binds `/tmp/openshell-ssh-agent/agent.sock` and sets `SSH_AUTH_SOCK`. Docker, VM, and Kubernetes all use this path.
 
 The keep-alive is `ssh -f … sandbox 'sleep infinity'`, not `ssh -N`. OpenSSH only sends `auth-agent-req@openssh.com` on a session channel. Treat in-sandbox `ls /tmp/openshell-ssh-agent/agent.sock` and `ssh-add -l` as success, not the CLI checkmark. With `OPENSHELL_SSH_LOG_LEVEL=DEBUG` the client must print `Requesting authentication agent forwarding.`
 
