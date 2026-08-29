@@ -43,14 +43,21 @@ Local Docker gateway: point the gateway config at the same supervisor image, or 
 
 ## 3. Smoke
 
+Success is the **in-sandbox socket and `ssh-add -l`**, not the CLI checkmark. Reconnect must keep a **session** SSH with agent forwarding (`-tt` interactive plus a background `sleep infinity` hold). `ssh -N` never sends `auth-agent-req@openssh.com`, so the supervisor never binds `/tmp/openshell-ssh-agent/agent.sock`.
+
 ```bash
 export SSH_AUTH_SOCK=...   # already set if ssh-add -l works
-openshell sandbox create --forward-agent --name agent-smoke -- ssh-add -l
-openshell sandbox connect agent-smoke --forward-agent
+OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell sandbox connect agent-smoke --forward-agent
+# client debug must include:
+#   Requesting authentication agent forwarding.
+
 # in sandbox:
+#   ls -l /tmp/openshell-ssh-agent/agent.sock
+#   ssh-add -l                       → same cert as the host
 #   echo $SSH_AUTH_SOCK              → /tmp/openshell-ssh-agent/agent.sock
 #   echo $GIT_CONFIG_GLOBAL          → /tmp/openshell-git/config
 #   git config --get gpg.format      → ssh
 #   git config --get gpg.ssh.defaultKeyCommand → ssh-add -L
 # No user.signingKey is copied. Git asks the forwarded agent for the SSH cert.
+# kubectl exec into the pod must still fail ssh-add -l (no SSH session). That is correct.
 ```

@@ -1020,8 +1020,18 @@ pub async fn sandbox_create(
 
             if command.is_empty() {
                 let connect_result = if persist {
-                    sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace)
+                    if forward_agent {
+                        sandbox_connect_forward_agent(
+                            &effective_server,
+                            &sandbox_name,
+                            &effective_tls,
+                            workspace,
+                        )
                         .await
+                    } else {
+                        sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace)
+                            .await
+                    }
                 } else {
                     crate::ssh::sandbox_connect_without_exec(
                         &effective_server,

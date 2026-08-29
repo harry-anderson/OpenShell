@@ -8,7 +8,9 @@ description: "Opt-in forwarding of the host SSH agent into a sandbox for signed 
 
 OpenShell does **not** forward your SSH agent by default. A sandbox with a live agent is a signing oracle: any process inside can `ssh-add -l`, `git commit`, and `git push` as you (a YubiKey tap still applies).
 
-`--forward-agent` is the create-time opt-in. It does **not** use `host.docker.internal` or a host TCP relay. The CLI opens an authenticated SSH session (`ForwardAgent=yes`) over the existing gateway relay; the supervisor binds `/tmp/openshell-ssh-agent/agent.sock` and sets `SSH_AUTH_SOCK`. Docker, VM, and Kubernetes all use this path.
+`--forward-agent` is the create-time opt-in. It does **not** use `host.docker.internal` or a host TCP relay. The CLI opens an authenticated SSH **session** (`ForwardAgent=yes`, plus `IdentityAgent=SSH_AUTH_SOCK` so OpenSSH re-reads the host agent socket even when the path contains spaces) over the existing gateway relay; the supervisor binds `/tmp/openshell-ssh-agent/agent.sock` and sets `SSH_AUTH_SOCK`. Docker, VM, and Kubernetes all use this path.
+
+The keep-alive is `ssh -f … sandbox 'sleep infinity'`, not `ssh -N`. OpenSSH only sends `auth-agent-req@openssh.com` on a session channel. Treat in-sandbox `ls /tmp/openshell-ssh-agent/agent.sock` and `ssh-add -l` as success, not the CLI checkmark. With `OPENSHELL_SSH_LOG_LEVEL=DEBUG` the client must print `Requesting authentication agent forwarding.`
 
 This is built for **SSH certificates in the host agent** (PassportControl / YubiKey), not a copied `user.signingKey` file. Git inside the sandbox gets:
 
@@ -45,4 +47,4 @@ git commit -m "signed with the host cert"
 - Not a cluster Service. The agent never binds a Kubernetes port.
 - Not enabled by `ForwardAgent yes` in `~/.ssh/config`. The CLI forces `ForwardAgent=no` unless you pass the flag, and the supervisor fail-closes unless create injected the pinned `SSH_AUTH_SOCK`.
 
-The tunnel dies when this laptop's background SSH exits. Recreate it with `openshell sandbox connect NAME --forward-agent`.
+The tunnel dies when this laptop's background session SSH exits. Recreate it with `openshell sandbox connect NAME --forward-agent` (session SSH with agent, not `-N`).
