@@ -1163,6 +1163,35 @@ mod linux {
                 .map_err(|error| format!("write process attachment response: {error}"))?;
                 return runtime.stream_process(stream, attachment);
             }
+            Request::AgentListen => {
+                let listener = match crate::agent_forward::prepare_listener() {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response: guest_error(BoundaryErrorKind::Denied, error),
+                            },
+                        )
+                        .map_err(|error| format!("write agent-listen error response: {error}"))?;
+                        return Ok(());
+                    }
+                };
+                write_frame(
+                    &mut stream,
+                    &ResponseEnvelope {
+                        request_id: request.request_id,
+                        response: Response::AgentListening,
+                    },
+                )
+                .map_err(|error| format!("write agent-listen response: {error}"))?;
+                runtime.process_runtime.block_on(async move {
+                    let stream = stream.into_tokio()?;
+                    crate::agent_forward::serve(listener, stream).await
+                })?;
+                return Ok(());
+            }
             Request::LoopbackConnect { host, port } => {
                 let target = match LoopbackTarget::new(host, port)
                     .map_err(|error| format!("validate port-forward target: {error}"))
@@ -1984,6 +2013,7 @@ mod linux {
                 | Request::TerminateBoundary
                 | Request::AttachProcess { .. }
                 | Request::LoopbackConnect { .. }
+                | Request::AgentListen
                 | Request::AcceptNetwork => guest_error(
                     BoundaryErrorKind::Invalid,
                     "streaming request used on control path",

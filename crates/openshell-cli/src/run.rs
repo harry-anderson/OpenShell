@@ -93,7 +93,8 @@ fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::D
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
+    sandbox_connect, sandbox_connect_editor, sandbox_connect_forward_agent, sandbox_exec,
+    sandbox_forward, sandbox_forward_agent, sandbox_ssh_proxy,
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
@@ -251,8 +252,47 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
-    keep || forward.is_some() || expose.is_some()
+/// Install host SSH-cert git config and start the agent-forward session.
+pub async fn sandbox_prepare_forward_agent(
+    server: &str,
+    name: &str,
+    tls: &crate::tls::TlsOptions,
+    workspace: &str,
+    git_cfg: Option<&openshell_core::git_sign::HostGitSignConfig>,
+) -> Result<()> {
+    let owned;
+    let cfg = match git_cfg {
+        Some(cfg) => cfg,
+        None => {
+            owned = crate::git_sign::collect_host_git_sign_config();
+            crate::git_sign::warn_if_missing_identity(&owned);
+            &owned
+        }
+    };
+    if let Some(staged) = crate::git_sign::stage_host_git_sign(cfg)? {
+        crate::git_sign::install_staged_git_sign(server, name, &staged, tls, workspace).await?;
+        eprintln!(
+            "  {} Host git signing config installed ({})",
+            "\u{2713}".green().bold(),
+            staged.summary,
+        );
+    }
+    sandbox_forward_agent(server, name, tls, workspace).await?;
+    eprintln!(
+        "  {} SSH agent forwarded into {name} ({})",
+        "\u{2713}".green().bold(),
+        openshell_core::ssh_agent::SANDBOX_AGENT_SOCK,
+    );
+    Ok(())
+}
+
+fn sandbox_should_persist(
+    keep: bool,
+    forward: Option<&ForwardSpec>,
+    expose: Option<u16>,
+    forward_agent: bool,
+) -> bool {
+    keep || forward.is_some() || expose.is_some() || forward_agent
 }
 
 fn has_main_process_result(sandbox: &Sandbox) -> bool {
@@ -442,6 +482,7 @@ pub struct SandboxCreateConfig<'a> {
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
+    pub forward_agent: bool,
     pub expose: Option<u16>,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
@@ -470,6 +511,7 @@ impl Default for SandboxCreateConfig<'_> {
             providers: &[],
             policy: None,
             forward: None,
+            forward_agent: false,
             expose: None,
             command: &[],
             tty_override: None,
@@ -506,17 +548,33 @@ pub async fn sandbox_create(
         providers,
         policy,
         forward,
+        forward_agent,
         expose,
         command,
         tty_override,
         auto_providers_override,
         labels,
-        environment,
+        mut environment,
         approval_mode,
         output,
         detach,
         suppress_credential_warnings,
     } = config;
+
+    let git_sign_cfg = if forward_agent {
+        Some(crate::git_sign::collect_host_git_sign_config())
+    } else {
+        None
+    };
+    if forward_agent {
+        openshell_core::ssh_agent::host_agent_socket_ok()
+            .map_err(|err| miette::miette!("{err}"))?;
+        openshell_core::ssh_agent::inject_forward_agent_env(&mut environment);
+        crate::git_sign::inject_git_env(&mut environment);
+        if let Some(cfg) = git_sign_cfg.as_ref() {
+            crate::git_sign::warn_if_missing_identity(cfg);
+        }
+    }
 
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
@@ -642,7 +700,7 @@ pub async fn sandbox_create(
     // (bash when present, otherwise /bin/sh on minimal images like Alpine).
     // Baking a shell here would force a shell the image may not ship.
     let main_command = command.to_vec();
-    let persist = sandbox_should_persist(keep, forward.as_ref(), expose);
+    let persist = sandbox_should_persist(keep, forward.as_ref(), expose, forward_agent);
     let create_detaches = detach
         || (persist
             && command.is_empty()
@@ -1116,6 +1174,17 @@ pub async fn sandbox_create(
                 );
             }
 
+            if forward_agent {
+                sandbox_prepare_forward_agent(
+                    &effective_server,
+                    &sandbox_name,
+                    &effective_tls,
+                    workspace,
+                    git_sign_cfg.as_ref(),
+                )
+                .await?;
+            }
+
             if let Some(target_port) = expose
                 && !structured_output
             {
@@ -1166,7 +1235,18 @@ pub async fn sandbox_create(
             }
 
             let connect_result = if persist {
-                sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace).await
+                if forward_agent {
+                    sandbox_connect_forward_agent(
+                        &effective_server,
+                        &sandbox_name,
+                        &effective_tls,
+                        workspace,
+                    )
+                    .await
+                } else {
+                    sandbox_connect(&effective_server, &sandbox_name, &effective_tls, workspace)
+                        .await
+                }
             } else {
                 crate::ssh::sandbox_connect_without_exec(
                     &effective_server,
@@ -6878,23 +6958,28 @@ mod tests {
 
     #[test]
     fn sandbox_should_persist_defaults_to_persistent() {
-        assert!(sandbox_should_persist(true, None, None));
+        assert!(sandbox_should_persist(true, None, None, false));
     }
 
     #[test]
     fn sandbox_should_not_persist_when_no_keep_is_set() {
-        assert!(!sandbox_should_persist(false, None, None));
+        assert!(!sandbox_should_persist(false, None, None, false));
     }
 
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
-        assert!(sandbox_should_persist(false, Some(&spec), None));
+        assert!(sandbox_should_persist(false, Some(&spec), None, false));
     }
 
     #[test]
     fn sandbox_should_persist_when_service_exposure_is_requested() {
-        assert!(sandbox_should_persist(false, None, Some(8080)));
+        assert!(sandbox_should_persist(false, None, Some(8080), false));
+    }
+
+    #[test]
+    fn sandbox_should_persist_when_forward_agent_is_requested() {
+        assert!(sandbox_should_persist(false, None, None, true));
     }
 
     #[test]

@@ -627,6 +627,10 @@ pub trait RunningBoundary: Send + Sync {
     fn exec(&self) -> Arc<dyn BoundaryExec>;
     /// The loopback connection interface used by port forwarding and service exposure.
     fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector>;
+    /// Workload SSH-agent listener. The default refuses; remote boundaries override it.
+    fn agent_relay(&self) -> Arc<dyn BoundaryAgentRelay> {
+        Arc::new(UnavailableAgentRelay)
+    }
     /// Permanently terminate the boundary's owned process tree and return only
     /// after the backend has acknowledged terminal state. A driver may use
     /// destruction of the outer runtime as fallback proof when this operation
@@ -845,6 +849,28 @@ pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
 pub trait BoundaryLoopbackConnector: Send + Sync {
     /// Connect to `target` inside the boundary.
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
+}
+
+/// Opens the workload-side SSH agent listener.
+///
+/// The socket lives in the workload mount namespace. Bytes are carried back
+/// to the supervisor, which owns the russh session.
+#[async_trait]
+pub trait BoundaryAgentRelay: Send + Sync {
+    /// Bind the pinned agent socket and return the multiplexed byte stream.
+    async fn open_listener(&self) -> Result<BoundaryDuplexStream, BackendError>;
+}
+
+/// Relay used when a backend has no workload agent socket.
+pub struct UnavailableAgentRelay;
+
+#[async_trait]
+impl BoundaryAgentRelay for UnavailableAgentRelay {
+    async fn open_listener(&self) -> Result<BoundaryDuplexStream, BackendError> {
+        Err(BackendError::Process(
+            "ssh agent forwarding is not available on this boundary".to_string(),
+        ))
+    }
 }
 
 // ============================================================================

@@ -434,6 +434,9 @@ impl ReadyBoundary for RemoteReady {
                 publication_generation: tokio::sync::Mutex::new(provider_env_generation),
             }),
             loopback_connector: Arc::new(RemoteLoopbackConnector {
+                client: self.client.clone(),
+            }),
+            agent_relay: Arc::new(RemoteAgentRelay {
                 client: self.client,
             }),
         }))
@@ -444,6 +447,7 @@ struct RemoteRunning {
     process: Arc<RemoteProcess>,
     exec: Arc<RemoteExec>,
     loopback_connector: Arc<RemoteLoopbackConnector>,
+    agent_relay: Arc<RemoteAgentRelay>,
 }
 
 #[async_trait]
@@ -458,6 +462,10 @@ impl RunningBoundary for RemoteRunning {
 
     fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
         self.loopback_connector.clone()
+    }
+
+    fn agent_relay(&self) -> Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay> {
+        self.agent_relay.clone()
     }
 
     async fn terminate(&self) -> Result<(), BackendError> {
@@ -682,6 +690,23 @@ impl BoundaryExec for RemoteExec {
 
 struct RemoteLoopbackConnector {
     client: Arc<BoundaryClient>,
+}
+
+struct RemoteAgentRelay {
+    client: Arc<BoundaryClient>,
+}
+
+#[async_trait]
+impl openshell_isolation_interface::contract::BoundaryAgentRelay for RemoteAgentRelay {
+    async fn open_listener(
+        &self,
+    ) -> Result<BoundaryDuplexStream, BackendError> {
+        let (stream, response) = self.client.call_stream(Request::AgentListen).await?;
+        match response {
+            Response::AgentListening => Ok(stream),
+            response => Err(unexpected_response("agent_listening", &response)),
+        }
+    }
 }
 
 #[async_trait]
@@ -2317,6 +2342,11 @@ mod tests {
                             },
                             Request::Resize { .. } => Response::Resized,
                             Request::LoopbackConnect { .. } => Response::PortConnected,
+                            Request::AgentListen => Response::Error {
+                                kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
+                                message: "agent listen is not available in this test boundary"
+                                    .to_string(),
+                            },
                             Request::StartAgent {
                                 provider_env_revision,
                                 ..

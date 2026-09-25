@@ -51,6 +51,8 @@ pub mod sandbox_env;
 pub mod sandbox_generation;
 pub mod sandbox_session;
 pub mod secrets;
+pub mod ssh_agent;
+pub mod git_sign;
 pub mod settings;
 pub mod shell;
 pub mod spiffe;

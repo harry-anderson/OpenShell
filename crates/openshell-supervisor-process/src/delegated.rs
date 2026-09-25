@@ -85,6 +85,7 @@ pub async fn start_boundary_access(
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_exec: Arc<dyn BoundaryExec>,
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    agent_relay: Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
 ) -> Result<BoundaryAccess> {
@@ -110,6 +111,7 @@ pub async fn start_boundary_access(
     let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
     let listen_path = ssh_socket_path.clone();
     let ssh_port_forward = port_forward.clone();
+    let ssh_agent_relay = agent_relay.clone();
     let ssh_main_session = main_session.clone();
     let ssh_task = tokio::spawn(async move {
         if let Err(error) = crate::ssh::run_ssh_server(
@@ -118,6 +120,7 @@ pub async fn start_boundary_access(
             ca_file_paths,
             shared_ssh_socket,
             ssh_port_forward,
+            ssh_agent_relay,
             boundary_exec,
             Some(ssh_main_session),
         )

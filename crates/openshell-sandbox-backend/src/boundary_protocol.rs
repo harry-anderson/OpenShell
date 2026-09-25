@@ -730,6 +730,9 @@ pub enum Request {
         host: std::net::IpAddr,
         port: u16,
     },
+    /// Bind the pinned SSH agent socket in the workload and multiplex
+    /// accepted connections back on this stream.
+    AgentListen,
     /// Upgrade one authenticated logical stream into the persistent DNS data
     /// plane.
     OpenMediation,
@@ -844,6 +847,7 @@ impl fmt::Debug for Request {
                 .field("host", host)
                 .field("port", port)
                 .finish(),
+            Self::AgentListen => formatter.write_str("AgentListen"),
             Self::OpenMediation => formatter.write_str("OpenMediation"),
             Self::AcceptNetwork => formatter.write_str("AcceptNetwork"),
         }
@@ -897,6 +901,7 @@ pub enum Response {
     },
     Resized,
     PortConnected,
+    AgentListening,
     MediationReady,
     NetworkConnected {
         identity: BinaryIdentityWire,

@@ -1462,7 +1462,7 @@ enum SandboxCommands {
         keep: bool,
 
         /// Delete the sandbox after the initial command or shell exits.
-        #[arg(long, conflicts_with_all = ["keep", "editor", "forward", "expose"])]
+        #[arg(long, conflicts_with_all = ["keep", "editor", "forward", "forward_agent", "expose"])]
         no_keep: bool,
 
         /// Launch a remote editor after the sandbox is ready.
@@ -1519,6 +1519,12 @@ enum SandboxCommands {
             conflicts_with = "no_keep"
         )]
         expose: Option<u16>,
+
+        /// Forward this host's SSH agent into the sandbox (`SSH_AUTH_SOCK`).
+        /// The workload binds `/tmp/openshell-ssh-agent/agent.sock` and the
+        /// supervisor bridges it to this SSH session. Opt-in. Keeps the sandbox.
+        #[arg(long, conflicts_with = "no_keep")]
+        forward_agent: bool,
 
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
@@ -1728,6 +1734,10 @@ enum SandboxCommands {
         /// Installs OpenShell-managed SSH config if needed.
         #[arg(long, value_enum)]
         editor: Option<CliEditor>,
+
+        /// Forward this host's SSH agent for the connect session.
+        #[arg(long)]
+        forward_agent: bool,
     },
 
     /// Upload local files to a sandbox.
@@ -3310,6 +3320,7 @@ async fn run_async() -> Result<()> {
                     providers,
                     policy,
                     forward,
+                    forward_agent,
                     expose,
                     tty,
                     no_tty,
@@ -3382,6 +3393,7 @@ async fn run_async() -> Result<()> {
                         || !no_keep
                         || editor.is_some()
                         || forward.is_some()
+                        || forward_agent
                         || expose.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
@@ -3406,6 +3418,7 @@ async fn run_async() -> Result<()> {
                             providers: &providers,
                             policy: policy.as_deref(),
                             forward,
+                            forward_agent,
                             expose,
                             command: &command,
                             tty_override,
@@ -3536,8 +3549,24 @@ async fn run_async() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
-                        SandboxCommands::Connect { name, editor } => {
+                        SandboxCommands::Connect {
+                            name,
+                            editor,
+                            forward_agent,
+                        } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            if forward_agent {
+                                openshell_core::ssh_agent::host_agent_socket_ok()
+                                    .map_err(|err| miette::miette!("{err}"))?;
+                                run::sandbox_prepare_forward_agent(
+                                    endpoint,
+                                    &name,
+                                    &tls,
+                                    &cli.workspace,
+                                    None,
+                                )
+                                .await?;
+                            }
                             if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
                                     endpoint,
@@ -3549,9 +3578,18 @@ async fn run_async() -> Result<()> {
                                 )
                                 .await?;
                             } else {
-                                let exit_code =
+                                let exit_code = if forward_agent {
+                                    run::sandbox_connect_forward_agent(
+                                        endpoint,
+                                        &name,
+                                        &tls,
+                                        &cli.workspace,
+                                    )
+                                    .await?
+                                } else {
                                     run::sandbox_connect(endpoint, &name, &tls, &cli.workspace)
-                                        .await?;
+                                        .await?
+                                };
                                 if exit_code != 0 {
                                     std::process::exit(exit_code);
                                 }

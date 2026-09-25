@@ -5,6 +5,7 @@
 
 #[cfg(target_os = "linux")]
 mod accept_interrupt;
+mod agent_forward;
 pub mod boundary_exec;
 pub mod boundary_io;
 mod boundary_server;
