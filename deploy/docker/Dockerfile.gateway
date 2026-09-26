@@ -16,6 +16,9 @@ ARG TARGETARCH
 WORKDIR /app
 
 COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+# z3-sys builds a shared libz3. Distroless cc does not ship it, and the
+# dynamic loader searches /usr/lib/<triplet> without an ldconfig cache.
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/runtime-libs/ /usr/lib/aarch64-linux-gnu/
 
 USER 1000:1000
 EXPOSE 8080
