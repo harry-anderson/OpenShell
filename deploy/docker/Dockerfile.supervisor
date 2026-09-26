@@ -8,7 +8,7 @@
 #
 # Debian 13 (trixie). Distroless base-nossl has glibc and no libgcc_s.so.1,
 # so the binary exits 127 before main. The pod securityContext sets the uid.
-FROM debian:13-slim
+FROM debian:13-slim AS supervisor
 
 ARG TARGETARCH
 
