@@ -16,7 +16,7 @@ use crate::sandbox_runtime::{
     SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
     boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
-    supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    copy_workload_scheduling, supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
@@ -2341,10 +2341,7 @@ impl KubernetesComputeDriver {
             })?;
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let supervisor = pods
-            .create(
-                &PostParams::default(),
-                &supervisor_pod(
+        let mut supervisor = supervisor_pod(
                     namespace,
                     names,
                     &sandbox.id,
@@ -2377,8 +2374,12 @@ impl KubernetesComputeDriver {
                     ),
                     dependent_owner.clone(),
                 )
-                .map_err(KubernetesDriverError::Message)?,
-            )
+                .map_err(KubernetesDriverError::Message)?;
+        if let Some(workload_spec) = sandbox_cr.data.pointer("/spec/podTemplate/spec") {
+            copy_workload_scheduling(&mut supervisor, workload_spec);
+        }
+        let supervisor = pods
+            .create(&PostParams::default(), &supervisor)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
         let supervisor_uid = supervisor.metadata.uid.ok_or_else(|| {
@@ -3140,10 +3141,7 @@ impl KubernetesComputeDriver {
         })?;
         let (agent_uid, agent_gid, _) =
             self.resolve_sandbox_identity_in_namespace(&namespace).await;
-        let supervisor = pods
-            .create(
-                &PostParams::default(),
-                &supervisor_pod(
+        let mut supervisor = supervisor_pod(
                     &namespace,
                     &names,
                     sandbox_id,
@@ -3181,8 +3179,12 @@ impl KubernetesComputeDriver {
                         false,
                     ),
                 )
-                .map_err(KubernetesDriverError::Message)?,
-            )
+                .map_err(KubernetesDriverError::Message)?;
+        if let Some(workload_spec) = object.data.pointer("/spec/podTemplate/spec") {
+            copy_workload_scheduling(&mut supervisor, workload_spec);
+        }
+        let supervisor = pods
+            .create(&PostParams::default(), &supervisor)
             .await
             .map_err(KubernetesDriverError::from_kube)?;
         let supervisor_uid = supervisor.metadata.uid.ok_or_else(|| {

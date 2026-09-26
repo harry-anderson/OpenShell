@@ -11,7 +11,8 @@ use k8s_openapi::api::core::v1::{
     CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, ExecAction, KeyToPath,
     LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
     ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
-    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Toleration, Volume, VolumeMount,
+    VolumeProjection,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -698,6 +699,38 @@ fn secret_volume(name: &str, secret_name: &str, item: Option<KeyToPath>) -> Volu
     }
 }
 
+/// Copy the sandbox pod's node selector and tolerations onto the supervisor.
+/// `--driver-config-json` is applied only to the workload pod. The supervisor
+/// is a separate Pod and would otherwise schedule onto any node.
+pub fn copy_workload_scheduling(supervisor: &mut Pod, workload_pod_spec: &serde_json::Value) {
+    let Some(spec) = supervisor.spec.as_mut() else {
+        return;
+    };
+    if let Some(selector) = workload_pod_spec
+        .get("nodeSelector")
+        .and_then(serde_json::Value::as_object)
+    {
+        let dest = spec.node_selector.get_or_insert_with(BTreeMap::new);
+        for (key, value) in selector {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            dest.entry(key.clone()).or_insert_with(|| value.to_string());
+        }
+    }
+    if let Some(items) = workload_pod_spec
+        .get("tolerations")
+        .and_then(serde_json::Value::as_array)
+    {
+        let dest = spec.tolerations.get_or_insert_with(Vec::new);
+        for item in items {
+            if let Ok(toleration) = serde_json::from_value::<Toleration>(item.clone()) {
+                dest.push(toleration);
+            }
+        }
+    }
+}
+
 fn empty_dir_volume(name: &str) -> Volume {
     Volume {
         name: name.to_string(),
@@ -712,6 +745,38 @@ mod tests {
 
     fn owner() -> OwnerReference {
         sandbox_owner_reference("demo", "uid-1", "agents.x-k8s.io/v1beta1", false)
+    }
+
+    #[test]
+    fn supervisor_copies_workload_node_selector_and_tolerations() {
+        let mut pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "supervisor".to_string(),
+                    ..Container::default()
+                }],
+                ..PodSpec::default()
+            }),
+            ..Pod::default()
+        };
+        let workload = serde_json::json!({
+            "nodeSelector": {"arch": "arm", "kind": "od"},
+            "tolerations": [{
+                "key": "kind",
+                "operator": "Equal",
+                "value": "od",
+                "effect": "NoSchedule"
+            }]
+        });
+        copy_workload_scheduling(&mut pod, &workload);
+        let spec = pod.spec.expect("spec");
+        let selector = spec.node_selector.expect("selector");
+        assert_eq!(selector.get("arch").map(String::as_str), Some("arm"));
+        assert_eq!(selector.get("kind").map(String::as_str), Some("od"));
+        let tolerations = spec.tolerations.expect("tolerations");
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0].key.as_deref(), Some("kind"));
+        assert_eq!(tolerations[0].value.as_deref(), Some("od"));
     }
 
     #[test]
