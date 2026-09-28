@@ -10,7 +10,7 @@ use crate::events::base_event::BaseEventData;
 
 /// OCSF Device Config State Change Event [5019].
 ///
-/// Policy engine and inference routing configuration changes.
+/// Policy engine and runtime configuration changes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceConfigStateChangeEvent {
     /// Common base event fields.
@@ -73,7 +73,7 @@ mod tests {
             "Log",
             SeverityId::Informational,
             Metadata {
-                version: "1.7.0".to_string(),
+                version: "1.8.0".to_string(),
                 product: Product::openshell_sandbox("0.1.0"),
                 profiles: vec!["security_control".to_string()],
                 uid: Some("sandbox-abc123".to_string()),

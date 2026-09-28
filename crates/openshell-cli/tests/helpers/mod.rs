@@ -8,6 +8,109 @@
 //! mod helpers;
 //! ```
 
+/// The example provider profiles in `providers/`, parsed once per test binary.
+///
+/// Fake gateways serve these the way a real gateway serves what an operator
+/// imported. Nothing is compiled into the CLI, so the fixtures come from the
+/// same files the documentation tells operators to import.
+#[allow(dead_code)]
+pub fn example_profiles() -> &'static [openshell_providers::ProviderTypeProfile] {
+    static CATALOG: std::sync::OnceLock<Vec<openshell_providers::ProviderTypeProfile>> =
+        std::sync::OnceLock::new();
+    CATALOG
+        .get_or_init(openshell_providers::example_profiles::load_all)
+        .as_slice()
+}
+
+#[macro_export]
+macro_rules! unimplemented_sandbox_template_rpcs {
+    () => {
+        fn create_sandbox_template<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::SandboxTemplateResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+
+        fn get_sandbox_template<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::SandboxTemplateResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+
+        fn list_sandbox_templates<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::ListSandboxTemplatesResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+
+        fn delete_sandbox_template<'life0, 'async_trait>(
+            &'life0 self,
+            _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            tonic::Response<openshell_core::proto::DeleteSandboxTemplateResponse>,
+                            tonic::Status,
+                        >,
+                    > + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Err(tonic::Status::unimplemented("unused")) })
+        }
+    };
+}
+
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
@@ -70,14 +173,6 @@ impl Drop for EnvVarGuard {
 }
 
 // ── TLS helpers ──────────────────────────────────────────────────────────────
-
-/// Install the `rustls` ring crypto provider as the process default.
-///
-/// Safe to call multiple times — subsequent calls are no-ops.
-#[allow(dead_code)]
-pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
 
 /// Generate a self-signed CA certificate and its key pair.
 #[allow(dead_code)]

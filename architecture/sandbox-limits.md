@@ -40,6 +40,15 @@ New limits should follow these rules:
   query parameters, or external free-form diagnostics.
 - Test time bounds with simulated time and test shared budgets under saturation.
 
+## Gateway Sandbox Resources
+
+Gateway-owned sandbox resources also carry admission limits before they can
+produce supervisor work. Reusable workload templates are capped at 1000 per
+workspace. Template payloads reuse sandbox spec validation for environment
+entry count and size, image and resource field sizes, driver-config serialized
+size, and GPU count. Template names use the same DNS-style resource-name rules
+as other named gateway resources.
+
 ## Middleware
 
 Middleware limits are process-wide per sandbox. Registry replacement preserves
@@ -63,8 +72,9 @@ budgets as new activity.
 Middleware also validates every non-body envelope component. Important examples
 include 64 KiB service config, 4 KiB request context, 32 KiB target data, 128
 request headers totaling 64 KiB, 64 header mutations, 32 findings per stage,
-and 64 metadata entries. The detailed external contract lives in
-[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx).
+and 64 metadata entries. The external contract lives in
+`proto/supervisor_middleware.proto`, with service-author guidance in the
+[supported middleware operations](../docs/extensibility/supervisor-middleware/operations.mdx).
 
 The work semaphore bounds aggregate buffered middleware input to approximately
 `32 × 4 MiB`, plus bounded envelope and parser overhead. It is a concurrency
@@ -86,6 +96,7 @@ streaming HTTP middleware to use the same process-wide budget.
 |---|---:|---|
 | Initial CONNECT request headers | 8 KiB | Reject the proxy request. |
 | Inspected HTTP/1 request headers | 16 KiB | Reject the request. |
+| Streamed HTTP/1 chunk framing | 16 KiB per chunk-size line; 16 KiB and 128 fields for the complete trailer block | End the relay. Chunk payloads pass through a fixed 8 KiB buffer and do not accumulate to the declared chunk size. |
 | Credential-rewritten HTTP body | 256 KiB | Reject when rewriting requires a larger buffered body. |
 | SigV4 body signing | 10 MiB | Reject when signing requires a larger buffered body. |
 | GraphQL request body | 64 KiB default | Policy can set a positive `graphql_max_body_bytes`; there is no shared platform ceiling yet. |
@@ -112,20 +123,15 @@ middleware. A passed binary logical message still advances the active
 middleware session sequence and emits coverage telemetry, so a later text RPC
 can contain a valid sequence gap.
 
-## Inference and Upstream Proxying
+## Network and Upstream Proxying
 
 | Path | Current bound | Terminal behavior |
 |---|---:|---|
-| `inference.local` request parse buffer | 10 MiB | Return `413` for an oversized request. |
-| Chunked inference request | 10 MiB and 4,096 chunks | Reject an invalid or over-limit request. |
-| Streaming inference response | 32 MiB and 120 s chunk idle | Truncate the stream and attempt a safe SSE error. |
+| Executable identity pins | 4,096 unique paths per supervisor lifetime | Reject an entire identity chain before insertion when its new paths would exceed the bound. Existing pins remain usable and are never evicted. Staged TCP reports resource exhaustion. |
 | Corporate proxy CONNECT response headers | 8 KiB | Fail the tunnel. |
 | Corporate proxy CONNECT handshake | 30 s total | Fail the tunnel; validated-address attempts share the aggregate budget. |
 | Token-grant HTTP request | 30 s request and connect | Fail credential resolution. |
 | Response-derived token cache TTL | 5 min default; 1 h response cap; 30 s expiry margin | A positive profile `cache_ttl_seconds` override replaces the response-derived calculation. |
-
-Streaming response byte limits are integrity-relevant. Protocols whose clients
-require one complete buffered object do not use the truncating SSE path.
 
 ## Sandbox-Local Surfaces
 

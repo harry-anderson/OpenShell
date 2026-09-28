@@ -1,6 +1,8 @@
 ---
 name: watch-github-actions
 description: Watch and monitor GitHub Actions workflow runs using the gh CLI. Use when the user wants to check workflow status, watch a running workflow, view CI/CD jobs, or monitor build progress. Trigger keywords - watch pipeline, pipeline status, CI status, check build, monitor CI, view pipeline, pipeline progress, workflow status, actions status.
+metadata:
+  internal: true
 ---
 
 # Watch GitHub Actions
@@ -122,6 +124,13 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 ```
 
 ## View Job Logs
+
+For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
+SHAs. PR runs compare the tested merge commit with its
+first parent; change detection and scans must use the same pair. On reruns, do
+not substitute the current `main` tip or the event's older PR base SHA. Merge
+groups and manual runs use their explicit baseline. Findings are reported by
+`Reject new high or critical findings`; distinguish those from scanner failures.
 
 View logs for a specific run:
 

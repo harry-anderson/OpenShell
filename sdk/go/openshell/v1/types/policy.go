@@ -3,7 +3,11 @@
 
 package types
 
-import "time"
+import (
+	"time"
+
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
+)
 
 // PolicyLoadStatus represents the load state of a policy revision.
 type PolicyLoadStatus int
@@ -78,6 +82,20 @@ type PolicyChunk struct {
 	ValidationResult string
 	// RejectionReason is the operator-supplied text accompanying a rejection.
 	RejectionReason string
+	// ApplicationError is the complete-candidate preflight/application failure.
+	ApplicationError string
+	// ReviewToken binds an approval to the exact evaluated candidate.
+	ReviewToken                  string
+	CurrentEffectivePolicyHash   string
+	CandidateEffectivePolicyHash string
+	CurrentEffectivePolicy       *SandboxPolicy
+	CandidateEffectivePolicy     *SandboxPolicy
+}
+
+// DraftChunkApproval binds one bulk approval decision to a reviewed chunk.
+type DraftChunkApproval struct {
+	ChunkID     string
+	ReviewToken string
 }
 
 // DraftPolicy contains the full draft policy state returned by GetDraft.
@@ -252,9 +270,7 @@ func WithStatusFilter(status string) GetDraftOption {
 // ApplyGetDraftOptions applies options and returns the config.
 func ApplyGetDraftOptions(opts []GetDraftOption) getDraftConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg getDraftConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
@@ -266,6 +282,14 @@ func (c *getDraftConfig) StatusFilter() string {
 // approveAllConfig holds configuration for ApproveAllDraftChunks calls.
 type approveAllConfig struct {
 	includeSecurityFlagged bool
+	approvals              []DraftChunkApproval
+}
+
+// WithDraftApprovals supplies the exact reviewed chunk tokens for bulk approval.
+func WithDraftApprovals(approvals ...DraftChunkApproval) ApproveAllOption {
+	return func(c *approveAllConfig) {
+		c.approvals = append([]DraftChunkApproval(nil), approvals...)
+	}
 }
 
 // ApproveAllOption configures an ApproveAllDraftChunks call.
@@ -281,15 +305,18 @@ func WithIncludeSecurityFlagged() ApproveAllOption {
 // ApplyApproveAllOptions applies options and returns the config.
 func ApplyApproveAllOptions(opts []ApproveAllOption) approveAllConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg approveAllConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
 // IncludeSecurityFlagged returns whether security-flagged chunks are included.
 func (c *approveAllConfig) IncludeSecurityFlagged() bool {
 	return c.includeSecurityFlagged
+}
+
+// Approvals returns a copy of the configured token-bound approvals.
+func (c *approveAllConfig) Approvals() []DraftChunkApproval {
+	return append([]DraftChunkApproval(nil), c.approvals...)
 }
 
 // getStatusConfig holds configuration for GetStatus calls.
@@ -320,9 +347,7 @@ func WithStatusGlobal(global bool) GetStatusOption {
 // ApplyGetStatusOptions applies options and returns the config.
 func ApplyGetStatusOptions(opts []GetStatusOption) getStatusConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg getStatusConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
@@ -338,25 +363,25 @@ func (c *getStatusConfig) Global() bool {
 
 // listPolicyConfig holds configuration for List calls.
 type listPolicyConfig struct {
-	limit  uint32
-	offset uint32
-	global bool
+	pageSize  int32
+	pageToken string
+	global    bool
 }
 
 // ListPolicyOption configures a List call.
 type ListPolicyOption func(*listPolicyConfig)
 
-// WithLimit sets the maximum number of revisions to return.
-func WithLimit(limit uint32) ListPolicyOption {
+// WithPageSize sets the maximum revisions requested per page.
+func WithPageSize(pageSize int32) ListPolicyOption {
 	return func(c *listPolicyConfig) {
-		c.limit = limit
+		c.pageSize = pageSize
 	}
 }
 
-// WithOffset sets the pagination offset.
-func WithOffset(offset uint32) ListPolicyOption {
+// WithPageToken resumes listing from an opaque token returned by a previous page.
+func WithPageToken(pageToken string) ListPolicyOption {
 	return func(c *listPolicyConfig) {
-		c.offset = offset
+		c.pageToken = pageToken
 	}
 }
 
@@ -372,20 +397,18 @@ func WithListGlobal(global bool) ListPolicyOption {
 // ApplyListPolicyOptions applies options and returns the config.
 func ApplyListPolicyOptions(opts []ListPolicyOption) listPolicyConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg listPolicyConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 
-// Limit returns the configured limit (0 means server default).
-func (c *listPolicyConfig) Limit() uint32 {
-	return c.limit
+// PageSize returns the configured page size (0 means server default).
+func (c *listPolicyConfig) PageSize() int32 {
+	return c.pageSize
 }
 
-// Offset returns the configured offset.
-func (c *listPolicyConfig) Offset() uint32 {
-	return c.offset
+// PageToken returns the configured initial continuation token.
+func (c *listPolicyConfig) PageToken() string {
+	return c.pageToken
 }
 
 // Global returns whether global policy mode is enabled.

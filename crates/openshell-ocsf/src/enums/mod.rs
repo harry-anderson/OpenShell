@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OCSF v1.7.0 enum types.
+//! OCSF v1.8.0 enum types.
 
 mod action;
 mod activity;
 mod auth;
+mod device_type;
 mod disposition;
 mod http_method;
 mod launch;
@@ -16,6 +17,7 @@ mod status;
 pub use action::ActionId;
 pub use activity::ActivityId;
 pub use auth::AuthTypeId;
+pub use device_type::DeviceTypeId;
 pub use disposition::DispositionId;
 pub use http_method::HttpMethod;
 pub use launch::LaunchTypeId;

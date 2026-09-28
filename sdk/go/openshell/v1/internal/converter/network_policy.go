@@ -67,15 +67,17 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 		Host:                         ep.GetHost(),
 		Port:                         ep.GetPort(),
 		Protocol:                     ep.GetProtocol(),
-		TLS:                          ep.GetTls(),
-		Enforcement:                  ep.GetEnforcement(),
-		Access:                       ep.GetAccess(),
+		TLS:                          types.NetworkTLSMode(ep.GetTls()),
+		Enforcement:                  types.NetworkEnforcementMode(ep.GetEnforcement()),
+		Access:                       types.NetworkAccessPreset(ep.GetAccess()),
 		AllowEncodedSlash:            ep.GetAllowEncodedSlash(),
 		PersistedQueries:             ep.GetPersistedQueries(),
 		GraphqlMaxBodyBytes:          ep.GetGraphqlMaxBodyBytes(),
 		Path:                         ep.GetPath(),
 		WebsocketCredentialRewrite:   ep.GetWebsocketCredentialRewrite(),
 		RequestBodyCredentialRewrite: ep.GetRequestBodyCredentialRewrite(),
+		AllowUninspectedCredentials:  ep.GetAllowUninspectedCredentials(),
+		ProviderCredentialed:         ep.GetProviderCredentialed(),
 		AdvisorProposed:              ep.GetAdvisorProposed(),
 		CredentialSigning:            ep.GetCredentialSigning(),
 		SigningService:               ep.GetSigningService(),
@@ -127,15 +129,17 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 		Host:                         ep.Host,
 		Port:                         ep.Port,
 		Protocol:                     ep.Protocol,
-		Tls:                          ep.TLS,
-		Enforcement:                  ep.Enforcement,
-		Access:                       ep.Access,
+		Tls:                          sbv1.NetworkTlsMode(ep.TLS),
+		Enforcement:                  sbv1.NetworkEnforcementMode(ep.Enforcement),
+		Access:                       sbv1.NetworkAccessPreset(ep.Access),
 		AllowEncodedSlash:            ep.AllowEncodedSlash,
 		PersistedQueries:             ep.PersistedQueries,
 		GraphqlMaxBodyBytes:          ep.GraphqlMaxBodyBytes,
 		Path:                         ep.Path,
 		WebsocketCredentialRewrite:   ep.WebsocketCredentialRewrite,
 		RequestBodyCredentialRewrite: ep.RequestBodyCredentialRewrite,
+		AllowUninspectedCredentials:  ep.AllowUninspectedCredentials,
+		ProviderCredentialed:         ep.ProviderCredentialed,
 		AdvisorProposed:              ep.AdvisorProposed,
 		CredentialSigning:            ep.CredentialSigning,
 		SigningService:               ep.SigningService,
@@ -178,6 +182,9 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 
 // --- McpOptions ---
 
+// mcpOptionsFromProto performs a transport conversion only. It leaves an empty
+// version list empty because checked policy and server ingress own default
+// materialization and validation.
 func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
 	if m == nil {
 		return nil
@@ -185,6 +192,7 @@ func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
 	return &types.McpOptions{
 		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
 		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
+		Versions:                CopyStringSlice(m.GetVersions()),
 	}
 }
 
@@ -195,6 +203,7 @@ func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
 	return &sbv1.McpOptions{
 		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
 		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
+		Versions:                CopyStringSlice(m.Versions),
 	}
 }
 

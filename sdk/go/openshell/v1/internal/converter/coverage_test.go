@@ -29,9 +29,16 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"policy":                true,
 		"providers":             true,
 		"resource_requirements": true,
+		"command":               true,
+		"tty":                   true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
+	// The gateway owns this identity. Provider status exposes it through the
+	// raw API; callers must not supply it when constructing a sandbox spec.
+	skipped := fieldSet{
+		"provider_attachment_epoch": true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
@@ -50,30 +57,107 @@ func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
 	assertAllFieldsCovered(t, (&pb.SandboxTemplate{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
-func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
+func TestConverterCoversAllProtoFields_SandboxWorkloadTemplate(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"current_policy_version": true,
+		"metadata": true,
+		"spec":     true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, nil)
+	assertAllFieldsCovered(t, (&pb.SandboxWorkloadTemplate{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxWorkloadTemplateSpec(t *testing.T) {
+	handled := fieldSet{
+		"workload":              true,
+		"driver_config":         true,
+		"desired_service_level": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxWorkloadTemplateSpec{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxWorkloadConfig(t *testing.T) {
+	handled := fieldSet{
+		"image":       true,
+		"environment": true,
+		"resources":   true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxWorkloadConfig{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxResources(t *testing.T) {
+	handled := fieldSet{
+		"cpu":    true,
+		"memory": true,
+		"gpu":    true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxResources{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxServiceLevel(t *testing.T) {
+	handled := fieldSet{
+		"startup": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxServiceLevel{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
+	handled := fieldSet{
+		"ready_within": true,
+		"max_burst":    true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.SandboxStartup{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
+	handled := fieldSet{
+		"agent_pod":               true,
+		"agent_fd":                true,
+		"sandbox_fd":              true,
+		"phase":                   true,
+		"conditions":              true,
+		"endpoint_statuses":       true,
+		"current_policy_version":  true,
+		"exit_code":               true,
+		"configuration_admission": true,
+	}
+	// The instance ID coordinates internal gateway/supervisor lifecycle
+	// fencing. The first-activation marker governs static policy repair.
+	// Provisioning carries gateway-owned attempt, deadline, and cleanup state;
+	// the curated API exposes its outcome through phase and conditions. Detailed
+	// lifecycle bookkeeping remains available through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
+
+	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {
 	handled := fieldSet{
-		"type":                 true,
-		"status":               true,
-		"reason":               true,
-		"message":              true,
-		"last_transition_time": true,
+		"type":            true,
+		"status":          true,
+		"reason":          true,
+		"message":         true,
+		"transition_time": true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxCondition{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_EndpointStatus(t *testing.T) {
+	handled := fieldSet{
+		"endpoint_id":        true,
+		"host":               true,
+		"ports":              true,
+		"path":               true,
+		"last_result":        true,
+		"last_reported_time": true,
+	}
+
+	assertAllFieldsCovered(t, (&pb.EndpointStatus{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
@@ -130,6 +214,8 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"path":                            true,
 		"websocket_credential_rewrite":    true,
 		"request_body_credential_rewrite": true,
+		"allow_uninspected_credentials":   true,
+		"provider_credentialed":           true,
 		"advisor_proposed":                true,
 		"credential_signing":              true,
 		"signing_service":                 true,
@@ -174,13 +260,13 @@ func TestConverterCoversAllProtoFields_L7DenyRule(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_Provider(t *testing.T) {
 	handled := fieldSet{
-		"metadata":                 true,
-		"type":                     true,
-		"credentials":              true,
-		"config":                   true,
-		"credential_expires_at_ms": true,
-		"profile_workspace":        true,
-		"credential_handles":       true,
+		"metadata":                    true,
+		"type":                        true,
+		"credentials":                 true,
+		"config":                      true,
+		"credential_expiration_times": true,
+		"profile_workspace":           true,
+		"credential_handles":          true,
 	}
 
 	assertAllFieldsCovered(t, (&dm.Provider{}).ProtoReflect().Descriptor(), handled, nil)
@@ -198,14 +284,14 @@ func TestConverterCoversAllProtoFields_CredentialHandle(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxPolicyRevision(t *testing.T) {
 	handled := fieldSet{
-		"version":       true,
-		"policy_hash":   true,
-		"status":        true,
-		"load_error":    true,
-		"created_at_ms": true,
-		"loaded_at_ms":  true,
-		"policy":        true,
-		"provenance":    true,
+		"version":      true,
+		"policy_hash":  true,
+		"status":       true,
+		"load_error":   true,
+		"created_time": true,
+		"loaded_time":  true,
+		"policy":       true,
+		"provenance":   true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.SandboxPolicyRevision{}).ProtoReflect().Descriptor(), handled, nil)
@@ -254,9 +340,12 @@ func TestConverterCoversAllProtoFields_ProviderCredentialTokenGrant(t *testing.T
 		"audience":              true,
 		"jwt_svid_audience":     true,
 		"scopes":                true,
-		"cache_ttl_seconds":     true,
+		"cache_ttl":             true,
 		"audience_overrides":    true,
 		"client_assertion_type": true,
+		"grant_type":            true,
+		"subject_token":         true,
+		"requested_token_type":  true,
 	}
 
 	assertAllFieldsCovered(t, (&pb.ProviderCredentialTokenGrant{}).ProtoReflect().Descriptor(), handled, nil)
@@ -278,6 +367,7 @@ func TestConverterCoversAllProtoFields_McpOptions(t *testing.T) {
 	handled := fieldSet{
 		"strict_tool_names":           true,
 		"allow_all_known_mcp_methods": true,
+		"versions":                    true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.McpOptions{}).ProtoReflect().Descriptor(), handled, nil)

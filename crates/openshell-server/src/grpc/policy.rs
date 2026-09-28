@@ -10,19 +10,35 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+mod endpoint_status;
+mod provisioning_clock;
+pub use provisioning_clock::configuration_change;
+
+pub(super) use endpoint_status::{
+    handle_peer_report_endpoint_status, handle_report_endpoint_status,
+};
+pub use endpoint_status::{
+    invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
+    retry_endpoint_status_after_supervisor_disconnect,
+};
+
 use crate::ServerState;
 use crate::auth::principal::Principal;
-use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
-};
+use crate::auth::workspace_authz::{MinWorkspaceRole, require_platform_admin};
+use crate::pagination::Pagination;
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectName, ObjectType, ObjectWorkspace, PolicyRecord, Store,
+    DraftChunkRecord, ObjectId, ObjectListQuery, ObjectName, ObjectType, ObjectWorkspace,
+    PolicyRecord, Store,
 };
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
+use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+#[cfg(test)]
+use crate::storage_proto::StoredProviderProfile;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::policy_identity::{canonical_rule_bytes, deterministic_policy_hash};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -35,12 +51,13 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicyMergeOperation,
-    PolicySource, PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    L7RuleTarget as ProtoL7RuleTarget, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
+    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderReadinessReason,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -50,17 +67,18 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
-    VERSION,
+    GetResourceVersion, VERSION,
     endpoint_path::EndpointPathPattern,
-    host_pattern::host_matches,
+    host_pattern::{host_matches, host_patterns_overlap},
     settings::{self, SettingValueKind},
 };
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId,
 };
 use openshell_policy::{
-    PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
-    serialize_sandbox_policy,
+    L7BinaryScope, L7RuleTarget, PolicyMergeOp, ProviderPolicyLayer, canonicalize_advisor_add_rule,
+    compose_effective_policy, merge_policy, policy_covers_rule, serialize_sandbox_policy,
+    strip_provider_rule_names,
 };
 use openshell_prover::{
     credentials::{Credential, CredentialSet},
@@ -71,7 +89,6 @@ use openshell_prover::{
     registry::load_embedded_binary_registry,
     report::finding_shorthand,
 };
-use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -81,11 +98,11 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, normalize_process_identity_for_driver, source_matches, validate_annotations,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_annotations,
     validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
-use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
+use super::{StoredSettingValue, StoredSettings};
 use crate::persistence::current_time_ms;
 
 // ---------------------------------------------------------------------------
@@ -97,12 +114,100 @@ const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
 const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
 pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
+const PROVIDER_COMPOSITION_VALIDATION_PAGE_SIZE: u32 = 1000;
 /// Reserved settings key used to store global policy payload.
 const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
+/// Stable labels used when stored policy state fails validation.
+const STORED_POLICY_SOURCE_HISTORY: &str = "sandbox policy history";
+const STORED_POLICY_SOURCE_SPEC: &str = "sandbox spec policy";
+const STORED_POLICY_SOURCE_GLOBAL: &str = "global policy setting";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+
+// Private wire-only compatibility types for policy history written before
+// 0.1.0. Public generated bindings intentionally reserve NetworkBinary tag 2,
+// but stored policies still need its former advisor-provenance value migrated
+// before the unknown field is discarded.
+#[derive(Clone, PartialEq, Message)]
+struct LegacyStoredNetworkBinary {
+    #[prost(string, tag = "1")]
+    path: String,
+    #[prost(bool, tag = "2")]
+    advisor_proposed: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyStoredNetworkPolicyRule {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(message, repeated, tag = "2")]
+    endpoints: Vec<NetworkEndpoint>,
+    #[prost(message, repeated, tag = "3")]
+    binaries: Vec<LegacyStoredNetworkBinary>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyStoredSandboxPolicy {
+    #[prost(map = "string, message", tag = "5")]
+    network_policies: HashMap<String, LegacyStoredNetworkPolicyRule>,
+}
+
+fn decode_stored_policy(payload: &[u8]) -> Result<ProtoSandboxPolicy, prost::DecodeError> {
+    let mut policy = ProtoSandboxPolicy::decode(payload)?;
+    let legacy = LegacyStoredSandboxPolicy::decode(payload)?;
+
+    for (rule_key, legacy_rule) in legacy.network_policies {
+        let advisor_paths = legacy_rule
+            .binaries
+            .into_iter()
+            .filter(|binary| binary.advisor_proposed)
+            .map(|binary| binary.path)
+            .collect::<HashSet<_>>();
+        if advisor_paths.is_empty() {
+            continue;
+        }
+
+        let Some(mut explicit_rule) = policy.network_policies.remove(&rule_key) else {
+            continue;
+        };
+        let mut advisor_rule = explicit_rule.clone();
+        advisor_rule
+            .binaries
+            .retain(|binary| advisor_paths.contains(&binary.path));
+        explicit_rule
+            .binaries
+            .retain(|binary| !advisor_paths.contains(&binary.path));
+        if advisor_rule.binaries.is_empty() {
+            policy.network_policies.insert(rule_key, explicit_rule);
+            continue;
+        }
+        for endpoint in &mut advisor_rule.endpoints {
+            endpoint.advisor_proposed = true;
+        }
+
+        if explicit_rule.binaries.is_empty() {
+            policy.network_policies.insert(rule_key, advisor_rule);
+            continue;
+        }
+
+        policy
+            .network_policies
+            .insert(rule_key.clone(), explicit_rule);
+        let key_base = format!("{rule_key}__legacy_advisor");
+        let mut advisor_key = key_base.clone();
+        let mut suffix = 2_u32;
+        while policy.network_policies.contains_key(&advisor_key) {
+            advisor_key = format!("{key_base}_{suffix}");
+            suffix += 1;
+        }
+        advisor_rule.name.clone_from(&advisor_key);
+        policy.network_policies.insert(advisor_key, advisor_rule);
+    }
+
+    Ok(policy)
+}
 
 fn emit_sandbox_policy_update_success() {
     openshell_core::telemetry::emit_lifecycle(
@@ -227,7 +332,7 @@ fn build_gateway_policy_audit_message(
     policy_hash: &str,
     extra_fields: &[(&str, String)],
 ) -> String {
-    let ctx = SandboxContext {
+    let ctx = EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "openshell/gateway".to_string(),
@@ -266,20 +371,18 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
             |rule_name| format!("remove-endpoint {host}:{port} from rule {rule_name}"),
         ),
         PolicyMergeOp::RemoveRule { rule_name } => format!("remove-rule {rule_name}"),
-        PolicyMergeOp::AddDenyRules {
-            host,
-            port,
-            deny_rules,
-        } => format!(
-            "add-deny {host}:{port} [{}]",
+        PolicyMergeOp::AddDenyRules { target, deny_rules } => format!(
+            "add-deny {} [{}]",
+            summarize_l7_target(target),
             deny_rules
                 .iter()
                 .map(summarize_l7_deny_rule)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        PolicyMergeOp::AddAllowRules { host, port, rules } => format!(
-            "add-allow {host}:{port} [{}]",
+        PolicyMergeOp::AddAllowRules { target, rules } => format!(
+            "add-allow {} [{}]",
+            summarize_l7_target(target),
             rules
                 .iter()
                 .map(summarize_l7_rule)
@@ -291,6 +394,29 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
             binary_path,
         } => format!("remove-binary {rule_name} {binary_path}"),
     }
+}
+
+fn summarize_l7_target(target: &L7RuleTarget) -> String {
+    let ports = target
+        .ports
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let binaries = match &target.binaries {
+        L7BinaryScope::Any => "any".to_string(),
+        L7BinaryScope::Restricted(binaries) => binaries
+            .iter()
+            .map(|binary| binary.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    // Preserve optional path presence in the audit trail: None means unique
+    // endpoint selection, while Some("") selects an endpoint with no path scope.
+    format!(
+        "{}:{ports} rule={} endpoint-path={:?} binaries=[{binaries}]",
+        target.host, target.rule_name, target.path,
+    )
 }
 
 fn ensure_chunk_belongs_to_sandbox(
@@ -330,20 +456,33 @@ fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
     if !endpoint.protocol.is_empty() {
         parts.push(format!("protocol={}", endpoint.protocol));
     }
-    if !endpoint.access.is_empty() {
-        parts.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        parts.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
-    if !endpoint.enforcement.is_empty() {
-        parts.push(format!("enforcement={}", endpoint.enforcement));
+    if endpoint.enforcement != 0 {
+        parts.push(format!(
+            "enforcement={}",
+            openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
+                .unwrap_or("unknown")
+        ));
     }
-    if !endpoint.tls.is_empty() {
-        parts.push(format!("tls={}", endpoint.tls));
+    if endpoint.tls != 0 {
+        parts.push(format!(
+            "tls={}",
+            openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
+        ));
     }
     if endpoint.websocket_credential_rewrite {
         parts.push("websocket_credential_rewrite=true".to_string());
     }
     if endpoint.request_body_credential_rewrite {
         parts.push("request_body_credential_rewrite=true".to_string());
+    }
+    if endpoint.allow_uninspected_credentials {
+        parts.push("allow_uninspected_credentials=true".to_string());
     }
     if !endpoint.allowed_ips.is_empty() {
         parts.push(format!("allowed_ips={}", endpoint.allowed_ips.len()));
@@ -446,6 +585,7 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
 /// - `validation unavailable` — gateway-side infrastructure failure (registry
 ///   load, YAML serialize/parse). Internal error detail is logged via
 ///   `warn!`, never exposed to the reviewer.
+#[cfg(test)]
 fn validation_result_for_agent_proposal(
     current_policy: ProtoSandboxPolicy,
     rule_name: &str,
@@ -500,6 +640,298 @@ fn validation_result_for_agent_proposal(
     out
 }
 
+#[derive(Debug)]
+struct ProposalEvaluation {
+    rule_name: String,
+    rule: NetworkPolicyRule,
+    current_effective_policy: ProtoSandboxPolicy,
+    candidate_effective_policy: Option<ProtoSandboxPolicy>,
+    validation_result: String,
+    application_error: String,
+    review_token: String,
+}
+
+impl ProposalEvaluation {
+    fn current_hash(&self) -> String {
+        deterministic_policy_hash(&self.current_effective_policy)
+    }
+
+    fn candidate_hash(&self) -> String {
+        self.candidate_effective_policy
+            .as_ref()
+            .map(deterministic_policy_hash)
+            .unwrap_or_default()
+    }
+}
+
+fn proposal_prover_result(
+    current_effective_policy: &ProtoSandboxPolicy,
+    candidate_effective_policy: &ProtoSandboxPolicy,
+    credentials: &CredentialSet,
+) -> String {
+    let candidate_findings = match run_prover_findings(candidate_effective_policy, credentials) {
+        Ok(findings) => findings,
+        Err(error) => {
+            warn!(error = %error, "prover validation unavailable for candidate policy");
+            return "validation unavailable".to_string();
+        }
+    };
+    let base_findings = match run_prover_findings(current_effective_policy, credentials) {
+        Ok(findings) => findings,
+        Err(error) => {
+            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
+            Vec::new()
+        }
+    };
+    let new_findings = finding_delta(&base_findings, &candidate_findings);
+    if new_findings.is_empty() {
+        return "prover: no new findings".to_string();
+    }
+    let mut out = format!(
+        "prover: {} new finding{}",
+        new_findings.len(),
+        if new_findings.len() == 1 { "" } else { "s" }
+    );
+    for finding in &new_findings {
+        out.push_str("\n  ");
+        out.push_str(&finding_shorthand(finding));
+    }
+    out
+}
+
+fn compute_proposal_review_token(
+    rule_name: &str,
+    rule: &NetworkPolicyRule,
+    current_effective_policy: &ProtoSandboxPolicy,
+    candidate_effective_policy: &ProtoSandboxPolicy,
+    credentials: &CredentialSet,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-proposal-evaluator-v2\0");
+    hasher.update(rule_name.as_bytes());
+    hasher.update(canonical_rule_bytes(rule));
+    hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
+    hasher.update(deterministic_policy_hash(candidate_effective_policy).as_bytes());
+
+    let mut credential_fingerprints = credentials
+        .credentials
+        .iter()
+        .map(|credential| {
+            let mut scopes = credential.scopes.clone();
+            scopes.sort();
+            let mut hosts = credential.target_hosts.clone();
+            hosts.sort();
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                credential.name,
+                credential.cred_type,
+                credential.injected_via,
+                scopes.join("\0"),
+                hosts.join("\0")
+            )
+        })
+        .collect::<Vec<_>>();
+    credential_fingerprints.sort();
+    for fingerprint in credential_fingerprints {
+        hasher.update(fingerprint.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn compute_failed_proposal_evaluation_hash(
+    rule_name: &str,
+    rule: &NetworkPolicyRule,
+    current_effective_policy: &ProtoSandboxPolicy,
+    application_error: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-proposal-evaluator-v2-failed\0");
+    hasher.update(rule_name.as_bytes());
+    hasher.update(canonical_rule_bytes(rule));
+    hasher.update(deterministic_policy_hash(current_effective_policy).as_bytes());
+    hasher.update(application_error.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn available_proposal_rule_name(
+    base_policy: &ProtoSandboxPolicy,
+    current_effective_policy: &ProtoSandboxPolicy,
+    requested_rule_name: &str,
+) -> String {
+    let mut candidate = requested_rule_name.to_string();
+    let mut suffix = 2_u32;
+    while base_policy.network_policies.contains_key(&candidate)
+        || current_effective_policy
+            .network_policies
+            .contains_key(&candidate)
+    {
+        candidate = format!("{requested_rule_name}_{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_proposal_candidate(
+    base_policy: &ProtoSandboxPolicy,
+    current_effective_policy: &ProtoSandboxPolicy,
+    requested_rule_name: &str,
+    proposed_rule: &NetworkPolicyRule,
+    analysis_mode: &str,
+    credentials: &CredentialSet,
+    validation_context: PolicyMergeValidationContext<'_>,
+    reuse_validation_result: Option<&str>,
+) -> ProposalEvaluation {
+    // The gateway owns advisor provenance. Do not rely on a supervisor or an
+    // agent-authored proposal to set this internal marker correctly: every
+    // proposed endpoint must remain ineligible for exact-host private-address
+    // trust until an explicit declaration or allowed_ips grants that trust.
+    let mut proposed_rule = proposed_rule.clone();
+    for endpoint in &mut proposed_rule.endpoints {
+        endpoint.advisor_proposed = true;
+    }
+
+    let canonical = if analysis_mode == "mechanistic" {
+        canonicalize_advisor_add_rule(
+            base_policy,
+            current_effective_policy,
+            requested_rule_name,
+            &proposed_rule,
+        )
+    } else {
+        let rule_name = available_proposal_rule_name(
+            base_policy,
+            current_effective_policy,
+            requested_rule_name,
+        );
+        proposed_rule.name.clone_from(&rule_name);
+        Ok((rule_name, proposed_rule.clone()))
+    };
+    let (rule_name, rule) = match canonical {
+        Ok(value) => value,
+        Err(error) => {
+            let application_error = format!("candidate canonicalization failed: {error}");
+            return ProposalEvaluation {
+                rule_name: requested_rule_name.to_string(),
+                rule: proposed_rule.clone(),
+                current_effective_policy: current_effective_policy.clone(),
+                candidate_effective_policy: None,
+                validation_result: String::new(),
+                review_token: compute_failed_proposal_evaluation_hash(
+                    requested_rule_name,
+                    &proposed_rule,
+                    current_effective_policy,
+                    &application_error,
+                ),
+                application_error,
+            };
+        }
+    };
+
+    let operations = [PolicyMergeOp::AddRule {
+        rule_name: rule_name.clone(),
+        rule: rule.clone(),
+    }];
+    let candidate_base = match merge_policy(base_policy.clone(), &operations) {
+        Ok(result) => result.policy,
+        Err(error) => {
+            let application_error = format!("merge failed: {}", one_line(&error.to_string()));
+            let review_token = compute_failed_proposal_evaluation_hash(
+                &rule_name,
+                &rule,
+                current_effective_policy,
+                &application_error,
+            );
+            return ProposalEvaluation {
+                rule_name,
+                rule,
+                current_effective_policy: current_effective_policy.clone(),
+                candidate_effective_policy: None,
+                validation_result: String::new(),
+                review_token,
+                application_error,
+            };
+        }
+    };
+
+    let validation = (|| -> Result<ProtoSandboxPolicy, Status> {
+        validate_policy_safety(&candidate_base)?;
+        validate_candidate_effective_policy(&candidate_base, validation_context.provider_layers)?;
+        let mut effective = if validation_context.provider_layers.is_empty() {
+            candidate_base.clone()
+        } else {
+            compose_effective_policy(&candidate_base, validation_context.provider_layers)
+        };
+        let bindings = policy_static_credential_endpoint_bindings(Some(&effective))?;
+        if let Some(context) = validation_context.credential_binding {
+            validate_operator_merged_credential_policy(&mut effective, &bindings, context)?;
+        }
+        Ok(effective)
+    })();
+
+    let candidate_effective_policy = match validation {
+        Ok(policy) => policy,
+        Err(error) => {
+            let application_error = format!("candidate invalid: {}", one_line(error.message()));
+            let review_token = compute_failed_proposal_evaluation_hash(
+                &rule_name,
+                &rule,
+                current_effective_policy,
+                &application_error,
+            );
+            return ProposalEvaluation {
+                rule_name,
+                rule,
+                current_effective_policy: current_effective_policy.clone(),
+                candidate_effective_policy: None,
+                validation_result: String::new(),
+                review_token,
+                application_error,
+            };
+        }
+    };
+    let validation_result = reuse_validation_result.map_or_else(
+        || {
+            proposal_prover_result(
+                current_effective_policy,
+                &candidate_effective_policy,
+                credentials,
+            )
+        },
+        ToString::to_string,
+    );
+    let application_error = if validation_result == "validation unavailable" {
+        "prover validation unavailable; proposal cannot be reviewed".to_string()
+    } else {
+        String::new()
+    };
+    let review_token = if application_error.is_empty() {
+        compute_proposal_review_token(
+            &rule_name,
+            &rule,
+            current_effective_policy,
+            &candidate_effective_policy,
+            credentials,
+        )
+    } else {
+        compute_failed_proposal_evaluation_hash(
+            &rule_name,
+            &rule,
+            current_effective_policy,
+            &application_error,
+        )
+    };
+    ProposalEvaluation {
+        rule_name,
+        rule,
+        current_effective_policy: current_effective_policy.clone(),
+        candidate_effective_policy: Some(candidate_effective_policy),
+        validation_result,
+        application_error,
+        review_token,
+    }
+}
+
 /// Run the prover end-to-end against a single policy with the given
 /// credential set. Returns the raw finding list, or a short error string
 /// identifying which infrastructure step failed.
@@ -547,10 +979,9 @@ async fn build_credential_set_for_sandbox_with_catalog(
         };
 
         let provider_type = provider.r#type.trim();
-        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
             catalog,
-            profile_id,
+            provider_type,
             &provider.profile_workspace,
         ) else {
             warn!(
@@ -678,6 +1109,68 @@ fn one_line(s: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+async fn reconcile_pending_chunks_covered_by_policy(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    effective_policy: &ProtoSandboxPolicy,
+    policy_version: i64,
+) -> Result<u32, Status> {
+    let pending = state
+        .store
+        .list_draft_chunks(sandbox_id, Some("pending"))
+        .await
+        .map_err(|error| Status::internal(format!("list pending chunks failed: {error}")))?;
+    let mut reconciled = 0;
+    for chunk in pending {
+        let Some(rule) = decode_draft_chunk_rule(&chunk)? else {
+            continue;
+        };
+        if !policy_covers_rule(effective_policy, &rule) {
+            continue;
+        }
+        let reason = format!("covered by active policy revision {policy_version}");
+        if state
+            .store
+            .conditionally_reject_draft_chunk(&chunk.id, current_time_ms(), &reason)
+            .await
+            .map_err(|error| Status::internal(format!("reconcile covered chunk failed: {error}")))?
+        {
+            reconciled += 1;
+        }
+    }
+    if reconciled > 0 {
+        state.sandbox_watch_bus.notify(sandbox_id);
+    }
+    Ok(reconciled)
+}
+
+async fn reconcile_pending_chunks_after_policy_change(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+) -> Result<u32, Status> {
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let effective = current_effective_policy_for_sandbox(
+        state,
+        &catalog,
+        workspace,
+        sandbox,
+        sandbox.object_id(),
+    )
+    .await?;
+    let version = state
+        .store
+        .get_latest_policy(sandbox.object_id())
+        .await
+        .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
+        .map_or(0, |record| record.version);
+    reconcile_pending_chunks_covered_by_policy(state, sandbox.object_id(), &effective, version)
+        .await
 }
 
 /// Auto-reject any pending chunks for the same sandbox that share the
@@ -912,13 +1405,198 @@ async fn resolve_proposal_approval_mode(
     Ok((false, "default"))
 }
 
+fn apply_evaluation_to_chunk(chunk: &mut DraftChunkRecord, evaluation: &ProposalEvaluation) {
+    chunk.rule_name.clone_from(&evaluation.rule_name);
+    chunk.proposed_rule = evaluation.rule.encode_to_vec();
+    chunk
+        .validation_result
+        .clone_from(&evaluation.validation_result);
+    chunk
+        .application_error
+        .clone_from(&evaluation.application_error);
+    chunk.review_token.clone_from(&evaluation.review_token);
+    chunk.current_effective_policy_hash = evaluation.current_hash();
+    chunk.candidate_effective_policy_hash = evaluation.candidate_hash();
+    chunk.current_effective_policy = Some(evaluation.current_effective_policy.clone());
+    chunk
+        .candidate_effective_policy
+        .clone_from(&evaluation.candidate_effective_policy);
+    chunk.last_seen_ms = current_time_ms();
+}
+
+async fn evaluate_stored_chunk_against_live_inputs(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+    chunk: &DraftChunkRecord,
+    reuse_validation_result: Option<&str>,
+) -> Result<ProposalEvaluation, Status> {
+    let rule = decode_draft_chunk_rule(chunk)?
+        .ok_or_else(|| Status::failed_precondition("draft chunk has no proposed rule"))?;
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let current_effective = current_effective_policy_for_sandbox(
+        state,
+        &catalog,
+        workspace,
+        sandbox,
+        sandbox.object_id(),
+    )
+    .await?;
+    let current_base = current_base_policy_for_sandbox(state.store.as_ref(), sandbox).await?;
+    let credentials = build_credential_set_for_sandbox_with_catalog(
+        state.store.as_ref(),
+        &catalog,
+        workspace,
+        &provider_names,
+    )
+    .await?;
+    let merge_validation = sandbox_policy_merge_validation_data_with_catalog(
+        state,
+        workspace,
+        sandbox,
+        &provider_names,
+        &catalog,
+    )
+    .await?;
+    let credential_binding_context = merge_validation.credential_binding_context();
+    Ok(evaluate_proposal_candidate(
+        &current_base,
+        &current_effective,
+        &chunk.rule_name,
+        &rule,
+        "stored",
+        &credentials,
+        PolicyMergeValidationContext {
+            provider_layers: &merge_validation.provider_layers,
+            credential_binding: Some(&credential_binding_context),
+        },
+        reuse_validation_result,
+    ))
+}
+
+async fn persist_refreshed_evaluation(
+    state: &Arc<ServerState>,
+    chunk: &DraftChunkRecord,
+    evaluation: &ProposalEvaluation,
+) -> Result<DraftChunkRecord, Status> {
+    let mut refreshed = chunk.clone();
+    apply_evaluation_to_chunk(&mut refreshed, evaluation);
+    let updated = state
+        .store
+        .update_draft_chunk_evaluation(&refreshed)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("persist proposal evaluation failed: {error}"))
+        })?;
+    if !updated {
+        return Err(Status::failed_precondition(
+            "proposal is no longer pending; refetch before deciding",
+        ));
+    }
+    state.sandbox_watch_bus.notify(&chunk.sandbox_id);
+    Ok(refreshed)
+}
+
+async fn persist_pending_application_error(
+    state: &Arc<ServerState>,
+    chunk_id: &str,
+    error: &Status,
+) {
+    let Ok(Some(mut chunk)) = state.store.get_draft_chunk(chunk_id).await else {
+        return;
+    };
+    if chunk.status != "pending" {
+        return;
+    }
+    chunk.application_error = one_line(error.message());
+    chunk.last_seen_ms = current_time_ms();
+    if let Err(persist_error) = state.store.update_draft_chunk_evaluation(&chunk).await {
+        warn!(
+            chunk_id,
+            error = %persist_error,
+            "failed to persist proposal application error"
+        );
+        return;
+    }
+    state.sandbox_watch_bus.notify(&chunk.sandbox_id);
+}
+
+async fn clear_pending_application_error(state: &Arc<ServerState>, chunk_id: &str) {
+    let Ok(Some(mut chunk)) = state.store.get_draft_chunk(chunk_id).await else {
+        return;
+    };
+    if chunk.status != "pending" || chunk.application_error.is_empty() {
+        return;
+    }
+    chunk.application_error.clear();
+    chunk.last_seen_ms = current_time_ms();
+    if let Err(error) = state.store.update_draft_chunk_evaluation(&chunk).await {
+        warn!(chunk_id, error = %error, "failed to clear proposal application error");
+    }
+}
+
+async fn require_current_proposal_evaluation(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    sandbox: &Sandbox,
+    chunk: &DraftChunkRecord,
+    supplied_review_token: Option<&str>,
+) -> Result<ProposalEvaluation, Status> {
+    if !chunk.review_token.is_empty()
+        && supplied_review_token.is_some_and(|token| token != chunk.review_token)
+    {
+        return Err(Status::failed_precondition(
+            "review token does not match the fetched proposal; refetch and review again",
+        ));
+    }
+
+    let reuse = (!chunk.review_token.is_empty()).then_some(chunk.validation_result.as_str());
+    let live =
+        evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, reuse).await?;
+    if !live.application_error.is_empty() {
+        persist_refreshed_evaluation(state, chunk, &live).await?;
+        return Err(Status::failed_precondition(format!(
+            "proposal is not applicable: {}",
+            live.application_error
+        )));
+    }
+
+    if chunk.review_token.is_empty() {
+        // Compatibility path for proposals stored before review tokens were
+        // introduced. Evaluate once, persist the token, and allow the legacy
+        // approval request to proceed against that exact live candidate.
+        let evaluated =
+            evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, None)
+                .await?;
+        persist_refreshed_evaluation(state, chunk, &evaluated).await?;
+        return Ok(evaluated);
+    }
+
+    if live.review_token != chunk.review_token {
+        let refreshed =
+            evaluate_stored_chunk_against_live_inputs(state, workspace, sandbox, chunk, None)
+                .await?;
+        persist_refreshed_evaluation(state, chunk, &refreshed).await?;
+        return Err(Status::failed_precondition(
+            "proposal inputs changed; evaluation refreshed, refetch and review again",
+        ));
+    }
+    Ok(live)
+}
+
 struct AutoApproveChunkContext<'a> {
     sandbox: &'a Sandbox,
     workspace: &'a str,
     source: &'a str,
     resolved_from: &'a str,
-    current_policy: &'a ProtoSandboxPolicy,
-    credential_set: &'a CredentialSet,
 }
 
 async fn auto_approve_chunk(
@@ -951,17 +1629,15 @@ async fn auto_approve_chunk(
         return Ok(());
     }
 
-    // Mechanistic dedup may return an existing row whose proposed rule was
-    // edited after its original validation. Re-run the prover against that
-    // stored rule instead of trusting the incoming proposal's verdict.
-    let rule = decode_draft_chunk_rule(&chunk)?
-        .ok_or_else(|| Status::failed_precondition("draft chunk has no proposed rule"))?;
-    let validation_result = validation_result_for_agent_proposal(
-        context.current_policy.clone(),
-        &chunk.rule_name,
-        &rule,
-        context.credential_set,
-    );
+    let live_evaluation = require_current_proposal_evaluation(
+        state,
+        context.workspace,
+        context.sandbox,
+        &chunk,
+        None,
+    )
+    .await?;
+    let validation_result = live_evaluation.validation_result;
     if validation_result != "prover: no new findings" {
         info!(
             sandbox_id = %sandbox_id,
@@ -995,24 +1671,36 @@ async fn auto_approve_chunk(
         .as_ref()
         .map(|spec| spec.providers.as_slice())
         .unwrap_or_default();
-    let provider_layers = provider_policy_layers_for_sandbox(
+    let merge_validation = sandbox_policy_merge_validation_data(
         state,
         context.workspace,
         context.sandbox,
         provider_names,
     )
     .await?;
-    let (version, hash) = merge_chunk_into_policy(
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let merge_result = merge_chunk_into_policy_with_validation(
         state.store.as_ref(),
         sandbox_id,
         context.workspace,
         &chunk,
-        &provider_layers,
+        PolicyMergeValidationContext {
+            provider_layers: &merge_validation.provider_layers,
+            credential_binding: Some(&credential_binding_context),
+        },
     )
-    .await?;
+    .await;
+    let (version, hash) = match merge_result {
+        Ok(result) => result,
+        Err(status) => {
+            persist_pending_application_error(state, chunk_id, &status).await;
+            return Err(status);
+        }
+    };
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
+    clear_pending_application_error(state, chunk_id).await;
     state
         .store
         .update_draft_chunk_status(chunk_id, "approved", Some(now_ms), None)
@@ -1020,6 +1708,16 @@ async fn auto_approve_chunk(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(sandbox_id);
+    if let Err(error) =
+        reconcile_pending_chunks_after_policy_change(state, context.workspace, context.sandbox)
+            .await
+    {
+        warn!(
+            sandbox_id,
+            error = %error,
+            "failed to reconcile pending policy proposals after auto-approval"
+        );
+    }
 
     let source_label = if context.source.is_empty() {
         "unspecified"
@@ -1053,8 +1751,8 @@ async fn auto_approve_chunk(
 }
 
 // TODO: share effective-policy lookup with `load_sandbox_policy` /
-// `GetSandboxConfig`. They re-implement very similar global-settings +
-// providers_v2 + compose logic; consolidating them is out of scope for the
+// `GetSandboxConfig`. They re-implement very similar global-settings and
+// profile-composition logic; consolidating them is out of scope for the
 // agent-authored proposal validation slice.
 async fn current_effective_policy_for_sandbox(
     state: &ServerState,
@@ -1063,22 +1761,69 @@ async fn current_effective_policy_for_sandbox(
     sandbox: &Sandbox,
     sandbox_id: &str,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    let mut policy = if let Some(record) = state
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        &provider_names,
+    )
+    .await?;
+    current_effective_policy_from_records(state, catalog, sandbox, sandbox_id, &records).await
+}
+
+async fn current_effective_policy_from_records(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<ProtoSandboxPolicy, Status> {
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
+        // A global policy is the complete effective policy. Dormant sandbox
+        // history and specs may predate the current schema, but they must not
+        // prevent the valid global policy from being served.
+        return apply_captured_policy_context(
+            provider_policy_context_from_records(catalog, records),
+            global_policy,
+            PolicySource::Global,
+        );
+    }
+
+    let policy = if let Some(record) = state
         .store
         .get_latest_policy(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
     {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+        canonical_policy_record_identity(&record)?.0
     } else {
-        sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.policy.clone())
-            .unwrap_or_default()
+        match sandbox.spec.as_ref().and_then(|spec| spec.policy.clone()) {
+            Some(policy) => {
+                validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_SPEC)?
+            }
+            None => ProtoSandboxPolicy::default(),
+        }
     };
 
+    apply_captured_policy_context(
+        provider_policy_context_from_records(catalog, records),
+        policy,
+        PolicySource::Sandbox,
+    )
+}
+
+async fn effective_policy_for_source(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+    mut policy: ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
         PolicySource::Sandbox,
@@ -1088,25 +1833,51 @@ async fn current_effective_policy_for_sandbox(
         },
     );
 
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
-    if providers_v2_enabled && !matches!(policy_source, PolicySource::Global) {
-        let provider_names = sandbox
-            .spec
-            .as_ref()
-            .map(|spec| spec.providers.clone())
-            .unwrap_or_default();
-        let provider_layers = profile_provider_policy_layers_with_catalog(
-            state.store.as_ref(),
-            catalog,
-            workspace,
-            &provider_names,
-        )
-        .await?;
-        if !provider_layers.is_empty() {
-            policy = compose_effective_policy(&policy, &provider_layers);
-        }
+    apply_effective_policy_context(
+        state,
+        catalog,
+        workspace,
+        provider_names,
+        policy,
+        policy_source,
+    )
+    .await
+}
+
+async fn apply_effective_policy_context(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+    policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
+    let provider_context = provider_policy_context_with_catalog(
+        state.store.as_ref(),
+        catalog,
+        workspace,
+        provider_names,
+    )
+    .await?;
+    apply_captured_policy_context(provider_context, policy, policy_source)
+}
+
+fn apply_captured_policy_context(
+    mut provider_context: ProviderPolicyContext,
+    mut policy: ProtoSandboxPolicy,
+    policy_source: PolicySource,
+) -> Result<ProtoSandboxPolicy, Status> {
+    clear_provider_credentialed_markers(&mut policy);
+    if !matches!(policy_source, PolicySource::Global) && !provider_context.layers.is_empty() {
+        policy = compose_effective_policy(&policy, &provider_context.layers);
     }
+    let policy_credential_bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
+    extend_credentialed_scopes_from_policy_bindings(
+        &mut provider_context.credentialed_scopes,
+        &policy_credential_bindings,
+        &provider_context.endpointless_provider_names,
+    );
+    stamp_provider_credentialed_endpoints(&mut policy, &provider_context.credentialed_scopes);
 
     Ok(policy)
 }
@@ -1234,11 +2005,9 @@ fn validate_policy_credential_binding_context(
                     "credential_binding references provider '{provider_name}', but that provider is not attached to the sandbox"
                 ))
             })?;
-        let profile_id = normalize_provider_type(&record.provider.r#type)
-            .unwrap_or(record.provider.r#type.as_str());
         let profile = super::provider::get_provider_type_profile_for_scope(
             catalog,
-            profile_id,
+            &record.provider.r#type,
             &record.provider.profile_workspace,
         )
         .ok_or_else(|| {
@@ -1311,11 +2080,9 @@ fn signing_profile_for_record(
     catalog: &EffectiveProviderProfileCatalog,
     record: &super::provider::ProviderEnvironmentRecord,
 ) -> Option<openshell_providers::ProviderTypeProfile> {
-    let profile_id =
-        normalize_provider_type(&record.provider.r#type).unwrap_or(record.provider.r#type.as_str());
     super::provider::get_provider_type_profile_for_scope(
         catalog,
-        profile_id,
+        &record.provider.r#type,
         &record.provider.profile_workspace,
     )
 }
@@ -1418,22 +2185,21 @@ async fn provider_policy_layers_for_sandbox(
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    if decode_policy_from_global_settings(&global_settings)?.is_some()
-        || !bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?
-    {
+    if decode_policy_from_global_settings(&global_settings)?.is_some() {
         return Ok(Vec::new());
     }
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), workspace)
         .await?;
-    let layers = profile_provider_policy_layers_with_catalog(
+    let layers = provider_policy_context_with_catalog(
         state.store.as_ref(),
         &catalog,
         workspace,
         provider_names,
     )
-    .await?;
+    .await?
+    .layers;
     debug!(
         sandbox_id = %sandbox.object_id(),
         provider_layer_count = layers.len(),
@@ -1451,14 +2217,17 @@ pub(super) async fn current_base_policy_for_sandbox(
         .await
         .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
     {
-        return ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")));
+        let (policy, _) = canonical_policy_record_identity(&record)?;
+        return Ok(policy);
     }
-    Ok(sandbox
+    sandbox
         .spec
         .as_ref()
         .and_then(|spec| spec.policy.clone())
-        .unwrap_or_default())
+        .map_or_else(
+            || Ok(ProtoSandboxPolicy::default()),
+            |policy| validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_SPEC),
+        )
 }
 
 pub(super) async fn validate_candidate_provider_attachments(
@@ -1497,25 +2266,26 @@ pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result
 }
 
 fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<bool, Status> {
-    Ok(decode_policy_from_global_settings(settings)?.is_none()
-        && bool_setting_enabled(settings, settings::PROVIDERS_V2_ENABLED_KEY)?)
+    Ok(decode_policy_from_global_settings(settings)?.is_none())
 }
 
 async fn validate_provider_composition_for_existing_sandboxes(
     state: &ServerState,
 ) -> Result<(), Status> {
-    let mut offset = 0;
     let mut catalogs = HashMap::<String, EffectiveProviderProfileCatalog>::new();
-
+    let mut cursor = None;
     loop {
-        let sandboxes = state
+        let page = state
             .store
-            .list_all_messages::<Sandbox>(MAX_PAGE_SIZE, offset)
+            .list_message_page::<Sandbox>(
+                ObjectListQuery::AllWorkspaces,
+                cursor.as_ref(),
+                PROVIDER_COMPOSITION_VALIDATION_PAGE_SIZE,
+            )
             .await
             .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        let page_len = sandboxes.len();
 
-        for sandbox in sandboxes {
+        for sandbox in page.messages {
             let provider_names = sandbox
                 .spec
                 .as_ref()
@@ -1538,13 +2308,14 @@ async fn validate_provider_composition_for_existing_sandboxes(
                 .expect("catalog was inserted for sandbox workspace");
             let base_policy =
                 current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
-            let provider_layers = profile_provider_policy_layers_with_catalog(
+            let provider_layers = provider_policy_context_with_catalog(
                 state.store.as_ref(),
                 catalog,
                 &workspace,
                 provider_names,
             )
-            .await?;
+            .await?
+            .layers;
             validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
                 Status::failed_precondition(format!(
                     "cannot activate provider policy composition: sandbox '{}/{}' has an invalid effective policy: {}",
@@ -1555,13 +2326,41 @@ async fn validate_provider_composition_for_existing_sandboxes(
             })?;
         }
 
-        if page_len < MAX_PAGE_SIZE as usize {
-            break;
-        }
-        offset = offset.saturating_add(MAX_PAGE_SIZE);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(());
+        };
+        cursor = Some(next_cursor);
     }
+}
 
+pub async fn validate_provider_composition_startup_preflight(
+    state: &ServerState,
+) -> Result<(), Status> {
+    if provider_policy_composition_enabled(state.store.as_ref()).await? {
+        validate_provider_composition_for_existing_sandboxes(state).await?;
+    }
     Ok(())
+}
+
+pub(super) async fn validate_candidate_sandbox_credential_policy(
+    state: &ServerState,
+    workspace: &str,
+    provider_names: &[String],
+    policy: Option<&ProtoSandboxPolicy>,
+) -> Result<(), Status> {
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let effective = effective_policy_for_source(
+        state,
+        &catalog,
+        workspace,
+        provider_names,
+        policy.cloned().unwrap_or_default(),
+    )
+    .await?;
+    validate_uninspected_credentialed_endpoints(&effective)
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1595,7 +2394,7 @@ fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Statu
             "sandbox callers cannot delete settings",
         ));
     }
-    if req.name.trim().is_empty() {
+    if req.sandbox.is_empty() {
         return Err(Status::permission_denied(
             "sandbox callers may only perform sandbox policy sync",
         ));
@@ -1683,9 +2482,11 @@ async fn persist_existing_policy_projection(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+            let startup_blocked =
+                crate::policy_store::permits_initial_static_policy_repair(sandbox);
             if let Some(policy) = backfill_policy.as_ref()
                 && let Some(spec) = sandbox.spec.as_mut()
-                && spec.policy.is_none()
+                && (spec.policy.is_none() || startup_blocked)
             {
                 spec.policy = Some(policy.clone());
             }
@@ -1729,6 +2530,9 @@ async fn resolve_sandbox_by_name_for_principal(
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
+        Principal::Peer(_) => Err(Status::permission_denied(
+            "gateway peer principals may not resolve sandbox configuration",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",
         )),
@@ -1744,12 +2548,77 @@ pub(super) async fn handle_get_sandbox_config(
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
     let principal = super::extract_principal(&request)?;
-    let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
-    drop(request);
+    let sandbox_name = request.get_ref().name.clone();
+    let workspace = match (&principal, request.get_ref().workspace_scope.as_ref()) {
+        (Principal::Sandbox(_), None) => String::new(),
+        (_, selector) => {
+            crate::auth::workspace_authz::selected_workspace_name(selector)?.to_string()
+        }
+    };
+    let result = handle_get_sandbox_config_inner(state, request).await;
+    match result {
+        Err(error)
+            if matches!(principal, Principal::Sandbox(_))
+                && matches!(
+                    error.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+                ) =>
+        {
+            // A malformed stored candidate must not prevent a supervisor
+            // from registering its startup fence and waiting for repair.
+            // Do not expose parser payloads or copy malformed policy history.
+            let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+                state,
+                &principal,
+                &sandbox_name,
+                &workspace,
+                MinWorkspaceRole::User,
+            )
+            .await?;
+            Ok(Response::new(GetSandboxConfigResponse {
+                configuration_admitted: false,
+                configuration_error: configuration_failure_diagnostic(&error).to_string(),
+                configuration_instance_id: sandbox
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.configuration_admission.as_ref())
+                    .map_or_else(String::new, |admission| admission.instance_id.clone()),
+                workspace: sandbox.object_workspace().to_string(),
+                ..Default::default()
+            }))
+        }
+        result => result,
+    }
+}
 
-    let sandbox =
-        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
+async fn handle_get_sandbox_config_inner(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxConfigRequest>,
+) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let workspace = match &principal {
+        Principal::Sandbox(_) if req.workspace_scope.is_none() => "",
+        _ => crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+    };
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+}
+
+/// Resolve the same effective configuration for authenticated RPCs and trusted
+/// readiness snapshots. Callers must authorize external access before entering.
+pub(super) async fn load_sandbox_config(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+) -> Result<GetSandboxConfigResponse, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
     let sandbox_provider_names = sandbox
         .spec
@@ -1761,26 +2630,41 @@ pub(super) async fn handle_get_sandbox_config(
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
 
-    // Try to get the latest policy from the policy history table.
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let global_policy = decode_policy_from_global_settings(&global_settings)?;
+    let mut global_policy_version: u32 = 0;
+
+    // Try to get the latest policy from the policy history table. Under a
+    // global override, only the sandbox version metadata is observed; the
+    // dormant payload is neither decoded nor validated.
     let latest = state
         .store
         .get_latest_policy(&sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-    let mut policy_source = PolicySource::Sandbox;
-    let (mut policy, mut version, mut policy_hash) = if let Some(record) = latest {
-        let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
+    let (mut policy, version, mut policy_hash, policy_source) = if let Some(global_policy) =
+        global_policy
+    {
+        let version = latest
+            .as_ref()
+            .map(|record| u32::try_from(record.version).unwrap_or(0))
+            .filter(|version| *version > 0)
+            .unwrap_or(1);
+        let hash = deterministic_policy_hash(&global_policy);
+        (Some(global_policy), version, hash, PolicySource::Global)
+    } else if let Some(record) = latest {
+        let (policy, hash) = canonical_policy_record_identity(&record)?;
         debug!(
             sandbox_id = %sandbox_id,
             version = record.version,
             "GetSandboxConfig served from policy history"
         );
         (
-            Some(decoded),
+            Some(policy),
             u32::try_from(record.version).unwrap_or(0),
-            record.policy_hash,
+            hash,
+            PolicySource::Sandbox,
         )
     } else {
         // Lazy backfill: no policy history exists yet.
@@ -1795,9 +2679,16 @@ pub(super) async fn handle_get_sandbox_config(
                     sandbox_id = %sandbox_id,
                     "GetSandboxConfig: no policy configured, returning empty response"
                 );
-                (None, 0, String::new())
+                (None, 0, String::new(), PolicySource::Sandbox)
             }
             Some(spec_policy) => {
+                // Stored specs may predate the current schema. Validate before
+                // creating policy history so malformed state is never copied or
+                // marked loaded, and hash the canonical representation.
+                let spec_policy = validate_and_canonicalize_stored_policy(
+                    spec_policy,
+                    STORED_POLICY_SOURCE_SPEC,
+                )?;
                 let hash = deterministic_policy_hash(&spec_policy);
                 let payload = spec_policy.encode_to_vec();
                 let policy_id = uuid::Uuid::new_v4().to_string();
@@ -1829,7 +2720,7 @@ pub(super) async fn handle_get_sandbox_config(
                     "GetSandboxConfig served from spec (backfilled version 1)"
                 );
 
-                (Some(spec_policy), 1, hash)
+                (Some(spec_policy), 1, hash, PolicySource::Sandbox)
             }
         }
     };
@@ -1837,49 +2728,69 @@ pub(super) async fn handle_get_sandbox_config(
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+    let provider_records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        &workspace,
+        &sandbox_provider_names,
+    )
+    .await?;
+    let mut provider_policy_context =
+        provider_policy_context_from_records(&provider_profile_catalog, &provider_records);
 
-    let mut global_policy_version: u32 = 0;
-
-    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
-        policy = Some(global_policy.clone());
-        policy_hash = deterministic_policy_hash(&global_policy);
-        policy_source = PolicySource::Global;
-        if version == 0 {
-            version = 1;
-        }
-        if let Ok(Some(global_rev)) = state
+    if matches!(policy_source, PolicySource::Global)
+        && let Ok(Some(global_rev)) = state
             .store
             .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
             .await
-        {
-            global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
-        }
+    {
+        global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
     }
 
-    if providers_v2_enabled
-        && !matches!(policy_source, PolicySource::Global)
+    if let Some(source_policy) = policy.as_mut() {
+        // Never trust provenance supplied by a persisted/user-authored policy.
+        // The gateway derives it from the attached provider catalog below.
+        clear_provider_credentialed_markers(source_policy);
+    }
+
+    if !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
+        && !provider_policy_context.layers.is_empty()
     {
-        let provider_layers = profile_provider_policy_layers_with_catalog(
-            state.store.as_ref(),
-            &provider_profile_catalog,
-            &workspace,
-            &sandbox_provider_names,
-        )
-        .await?;
-        if !provider_layers.is_empty() {
-            let effective_policy = compose_effective_policy(source_policy, &provider_layers);
-            validate_policy_safety(&effective_policy).map_err(|error| {
+        let effective_policy =
+            compose_effective_policy(source_policy, &provider_policy_context.layers);
+        let effective_policy =
+            validate_and_canonicalize_policy(effective_policy).map_err(|error| {
                 Status::failed_precondition(format!(
                     "provider composition produced an invalid effective policy: {}",
                     error.message()
                 ))
             })?;
-            policy_hash = deterministic_policy_hash(&effective_policy);
-            policy = Some(effective_policy);
+        validate_policy_safety(&effective_policy).map_err(|error| {
+            Status::failed_precondition(format!(
+                "provider composition produced an invalid effective policy: {}",
+                error.message()
+            ))
+        })?;
+        policy_hash = deterministic_policy_hash(&effective_policy);
+        policy = Some(effective_policy);
+    }
+
+    let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
+    extend_credentialed_scopes_from_policy_bindings(
+        &mut provider_policy_context.credentialed_scopes,
+        &policy_credential_bindings,
+        &provider_policy_context.endpointless_provider_names,
+    );
+    let mut configuration_error = String::new();
+    if let Some(effective_policy) = policy.as_mut() {
+        stamp_provider_credentialed_endpoints(
+            effective_policy,
+            &provider_policy_context.credentialed_scopes,
+        );
+        if let Err(error) = validate_uninspected_credentialed_endpoints(effective_policy) {
+            configuration_error = bounded_configuration_diagnostic(error.message());
         }
+        policy_hash = deterministic_policy_hash(effective_policy);
     }
 
     if let Some(policy) = policy.as_ref() {
@@ -1902,29 +2813,30 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source,
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
-        state.sandbox_jwt_issuer.is_some(),
+        state.extension_jwt_issuer.is_some(),
     );
-    let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
     if let Some(policy) = policy.as_ref() {
-        validate_policy_credential_bindings_for_sandbox(
-            state.as_ref(),
+        validate_policy_credential_binding_context(
             &provider_profile_catalog,
-            &workspace,
-            &sandbox_provider_names,
+            &provider_records,
             policy,
-        )
-        .await?;
+            &policy_credential_bindings,
+        )?;
     }
-    let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
-        state.store.as_ref(),
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
         &provider_profile_catalog,
-        &workspace,
-        &sandbox_provider_names,
+        &provider_records,
         &policy_credential_bindings,
-    )
-    .await?;
+    )?;
 
-    Ok(Response::new(GetSandboxConfigResponse {
+    Ok(GetSandboxConfigResponse {
+        configuration_instance_id: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+            .map_or_else(String::new, |admission| admission.instance_id.clone()),
+        configuration_admitted: policy.is_some() && configuration_error.is_empty(),
+        configuration_error,
         policy,
         version,
         policy_hash,
@@ -1940,8 +2852,13 @@ pub(super) async fn handle_get_sandbox_config(
             .policy_validation_failure_mode
             .as_str()
             .to_string(),
-        extension_authentication_enabled: state.sandbox_jwt_issuer.is_some(),
-    }))
+        extension_authentication_enabled: state.extension_jwt_issuer.is_some(),
+        provider_attachment_epoch: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.provider_attachment_epoch.clone())
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -1981,7 +2898,7 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v3");
+    hasher.update(b"openshell-provider-env-revision-v4");
 
     for provider_name in provider_names {
         hasher.update(provider_name.as_bytes());
@@ -1998,6 +2915,10 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
+                let refresh_states =
+                    crate::provider_refresh::list_refresh_states_for_provider(store, &record.id)
+                        .await?;
+                hash_provider_refresh_states(&refresh_states, &mut hasher)?;
                 hasher.update(provider.r#type.as_bytes());
                 hash_provider_profile_revision(
                     catalog,
@@ -2011,11 +2932,13 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
                 for key in credential_keys {
                     hasher.update(key.as_bytes());
                 }
-                let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+                let mut expiry_keys: Vec<_> = provider.credential_expiration_times.keys().collect();
                 expiry_keys.sort();
                 for key in expiry_keys {
                     hasher.update(key.as_bytes());
-                    hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+                    let value = &provider.credential_expiration_times[key];
+                    hasher.update(value.seconds.to_le_bytes());
+                    hasher.update(value.nanos.to_le_bytes());
                 }
             }
             None => {
@@ -2050,7 +2973,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v3");
+    hasher.update(b"openshell-provider-env-revision-v4");
 
     for record in records {
         hasher.update(record.name.as_bytes());
@@ -2058,6 +2981,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
         hasher.update(record.resource_version.to_le_bytes());
 
         let provider = &record.provider;
+        hash_provider_refresh_states(&record.refresh_states, &mut hasher)?;
         hasher.update(provider.r#type.as_bytes());
         hash_provider_profile_revision(
             catalog,
@@ -2071,11 +2995,13 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
         for key in credential_keys {
             hasher.update(key.as_bytes());
         }
-        let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+        let mut expiry_keys: Vec<_> = provider.credential_expiration_times.keys().collect();
         expiry_keys.sort();
         for key in expiry_keys {
             hasher.update(key.as_bytes());
-            hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+            let value = &provider.credential_expiration_times[key];
+            hasher.update(value.seconds.to_le_bytes());
+            hasher.update(value.nanos.to_le_bytes());
         }
     }
 
@@ -2085,6 +3011,40 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
         |_| Status::internal("provider env revision digest too short"),
     )?))
+}
+
+fn hash_provider_refresh_states(
+    states: &[StoredProviderCredentialRefreshState],
+    hasher: &mut Sha256,
+) -> Result<(), Status> {
+    let mut states = states.iter().collect::<Vec<_>>();
+    states.sort_by(|left, right| {
+        left.credential_key
+            .cmp(&right.credential_key)
+            .then_with(|| {
+                left.metadata
+                    .as_ref()
+                    .map(|metadata| metadata.id.as_str())
+                    .cmp(&right.metadata.as_ref().map(|metadata| metadata.id.as_str()))
+            })
+    });
+    for state in states {
+        hasher.update(b"provider-refresh-state");
+        hasher.update(state.credential_key.as_bytes());
+        hasher.update(state.strategy.to_le_bytes());
+        hasher.update(crate::provider_refresh::effective_authorization_epoch(state)?.as_bytes());
+        if let Some(metadata) = &state.metadata {
+            hasher.update(metadata.id.as_bytes());
+            hasher.update(metadata.resource_version.to_le_bytes());
+        }
+        let mut outputs = state.additional_output_keys.iter().collect::<Vec<_>>();
+        outputs.sort();
+        for (output, key) in outputs {
+            hasher.update(output.as_bytes());
+            hasher.update(key.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn hash_policy_credential_bindings(
@@ -2113,8 +3073,7 @@ fn hash_provider_profile_revision(
     profile_workspace: &str,
     hasher: &mut Sha256,
 ) {
-    let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-    catalog.hash_type_profile_revision_for_scope(profile_id, profile_workspace, hasher);
+    catalog.hash_type_profile_revision_for_scope(provider_type, profile_workspace, hasher);
 }
 
 #[cfg(test)]
@@ -2129,26 +3088,62 @@ async fn profile_provider_policy_layers(
     profile_provider_policy_layers_with_catalog(store, &catalog, workspace, provider_names).await
 }
 
+#[cfg(test)]
 async fn profile_provider_policy_layers_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
-    let mut layers = Vec::new();
+    Ok(
+        provider_policy_context_with_catalog(store, catalog, workspace, provider_names)
+            .await?
+            .layers,
+    )
+}
 
-    for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CredentialedEndpointScope {
+    host: String,
+    ports: Vec<u32>,
+    path: String,
+}
+
+#[derive(Debug, Default)]
+struct ProviderPolicyContext {
+    layers: Vec<ProviderPolicyLayer>,
+    credentialed_scopes: Vec<CredentialedEndpointScope>,
+    endpointless_provider_names: HashSet<String>,
+}
+
+async fn provider_policy_context_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<ProviderPolicyContext, Status> {
+    let records =
+        super::provider::load_provider_environment_records(store, workspace, provider_names)
+            .await?;
+    Ok(provider_policy_context_from_records(catalog, &records))
+}
+
+fn provider_policy_context_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> ProviderPolicyContext {
+    let mut layers = Vec::new();
+    let mut credentialed_scopes = Vec::new();
+    let mut endpointless_provider_names = HashSet::new();
+
+    for record in records {
+        let name = &record.name;
+        let provider = &record.provider;
 
         let provider_type = provider.r#type.trim();
-        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
         let Some(profile) = super::provider::get_provider_type_profile_for_scope(
             catalog,
-            profile_id,
+            provider_type,
             &provider.profile_workspace,
         ) else {
             warn!(
@@ -2159,24 +3154,190 @@ async fn profile_provider_policy_layers_with_catalog(
             continue;
         };
 
+        if !super::provider::provider_profile_endpoints_are_active(&profile, provider) {
+            endpointless_provider_names.insert(name.clone());
+            continue;
+        }
+
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+        let mut rule = profile.network_policy_rule(&rule_name);
+        if rule.endpoints.is_empty() {
+            endpointless_provider_names.insert(name.clone());
+        }
+        if profile.has_credentialed_endpoints() {
+            for endpoint in &mut rule.endpoints {
+                endpoint.provider_credentialed = true;
+                let scope = CredentialedEndpointScope {
+                    host: endpoint.host.to_ascii_lowercase(),
+                    ports: endpoint_ports(endpoint),
+                    path: canonical_endpoint_path(&endpoint.path),
+                };
+                if !credentialed_scopes.contains(&scope) {
+                    credentialed_scopes.push(scope);
+                }
+            }
+        }
         layers.push(ProviderPolicyLayer {
             rule_name: rule_name.clone(),
-            rule: profile.network_policy_rule(&rule_name),
+            rule,
         });
     }
 
-    Ok(layers)
+    ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    }
 }
 
-pub(super) fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
-    match settings.settings.get(key) {
-        None => Ok(false),
-        Some(StoredSettingValue::Bool(value)) => Ok(*value),
-        Some(_) => Err(Status::internal(format!(
-            "setting '{key}' has invalid value type; expected bool"
-        ))),
+fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
+    if endpoint.ports.is_empty() {
+        (endpoint.port > 0)
+            .then_some(endpoint.port)
+            .into_iter()
+            .collect()
+    } else {
+        endpoint.ports.clone()
     }
+}
+
+fn extend_credentialed_scopes_from_policy_bindings(
+    scopes: &mut Vec<CredentialedEndpointScope>,
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    endpointless_provider_names: &HashSet<String>,
+) {
+    for (provider_name, provider_bindings) in bindings {
+        if !endpointless_provider_names.contains(provider_name) {
+            continue;
+        }
+        for binding in provider_bindings {
+            let scope = CredentialedEndpointScope {
+                host: binding.host.to_ascii_lowercase(),
+                ports: vec![binding.port],
+                path: canonical_endpoint_path(&binding.path),
+            };
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+    }
+}
+
+fn endpoint_matches_credentialed_scope(
+    endpoint: &NetworkEndpoint,
+    scope: &CredentialedEndpointScope,
+) -> bool {
+    if !host_patterns_overlap(&endpoint.host, &scope.host).unwrap_or(false) {
+        return false;
+    }
+    let endpoint_ports = endpoint_ports(endpoint);
+    let port_matches = endpoint_ports.is_empty()
+        || scope.ports.is_empty()
+        || endpoint_ports.iter().any(|port| scope.ports.contains(port));
+    port_matches && path_pattern_covers(&scope.path, &canonical_endpoint_path(&endpoint.path))
+}
+
+fn canonical_endpoint_path(path: &str) -> String {
+    match path.trim() {
+        "" | "**" | "/**" => "/**".to_string(),
+        path => path.to_string(),
+    }
+}
+
+pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.provider_credentialed = false;
+        }
+    }
+}
+
+fn stamp_provider_credentialed_endpoints(
+    policy: &mut ProtoSandboxPolicy,
+    scopes: &[CredentialedEndpointScope],
+) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.provider_credentialed = scopes
+                .iter()
+                .any(|scope| endpoint_matches_credentialed_scope(endpoint, scope));
+        }
+    }
+}
+
+/// A credentialed endpoint whose configured mode disables the L7 inspection a
+/// reviewer would expect, without an explicit `allow_uninspected_credentials`.
+struct UninspectedCredentialedEndpoint {
+    rule_name: String,
+    host: String,
+    port: u32,
+    mode: &'static str,
+}
+
+/// Scan the effective policy for credentialed endpoints on uninspected modes.
+///
+/// Explicit opt-ins are logged and skipped. Never logs credential names,
+/// placeholders, or secret values.
+fn find_uninspected_credentialed_endpoint(
+    policy: &ProtoSandboxPolicy,
+) -> Option<UninspectedCredentialedEndpoint> {
+    for (rule_name, rule) in &policy.network_policies {
+        for endpoint in &rule.endpoints {
+            if !endpoint.provider_credentialed {
+                continue;
+            }
+
+            let mode = if endpoint.protocol.trim().is_empty() {
+                "L4-only"
+            } else if openshell_policy::network_tls_mode_to_str(endpoint.tls) == Some("skip") {
+                "tls: skip"
+            } else {
+                continue;
+            };
+
+            if endpoint.allow_uninspected_credentials {
+                warn!(
+                    rule_name,
+                    host = %endpoint.host,
+                    ports = ?endpoint_ports(endpoint),
+                    mode,
+                    "credentialed endpoint explicitly allows uninspected traffic"
+                );
+                continue;
+            }
+
+            return Some(UninspectedCredentialedEndpoint {
+                rule_name: rule_name.clone(),
+                host: endpoint.host.clone(),
+                port: endpoint_ports(endpoint)
+                    .first()
+                    .copied()
+                    .unwrap_or(endpoint.port),
+                mode,
+            });
+        }
+    }
+    None
+}
+
+/// Admission gate for policy-authoring paths (create, attach, operator config
+/// update). Rejects credentialed endpoints that would lose L7 inspection.
+fn validate_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    let Some(violation) = find_uninspected_credentialed_endpoint(policy) else {
+        return Ok(());
+    };
+
+    warn!(
+        rule_name = %violation.rule_name,
+        host = %violation.host,
+        port = violation.port,
+        mode = violation.mode,
+        "rejecting uninspected credentialed endpoint"
+    );
+    Err(Status::failed_precondition(format!(
+        "credentialed endpoint '{}:{}' in rule '{}' uses {}; configure L7 inspection or explicitly set allow_uninspected_credentials: true",
+        violation.host, violation.port, violation.rule_name, violation.mode
+    )))
 }
 
 pub(super) async fn handle_get_gateway_config(
@@ -2206,6 +3367,20 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    Ok(Response::new(
+        load_sandbox_provider_environment(state, &sandbox, supports_static_credential_bindings)
+            .await?,
+    ))
+}
+
+/// Materialize a privileged provider snapshot after the caller has authorized
+/// access. Omission reasons remain separate from a legitimately empty snapshot.
+pub(super) async fn load_sandbox_provider_environment(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    supports_static_credential_bindings: bool,
+) -> Result<GetSandboxProviderEnvironmentResponse, Status> {
+    let sandbox_id = sandbox.object_id().to_string();
     let workspace = sandbox.object_workspace().to_string();
 
     let spec = sandbox
@@ -2224,12 +3399,12 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_for_sandbox(
+    let effective_policy = current_effective_policy_from_records(
         state.as_ref(),
         &provider_profile_catalog,
-        &workspace,
-        &sandbox,
+        sandbox,
         &sandbox_id,
+        &provider_records,
     )
     .await?;
     let policy_credential_bindings =
@@ -2252,13 +3427,45 @@ pub(super) async fn handle_get_sandbox_provider_environment(
             &provider_records,
             &policy_credential_bindings,
             &state.credentials,
+            Some(&sandbox_id),
         )
         .await?;
 
-    if !supports_static_credential_bindings {
+    let mut readiness_reason = provider_environment.readiness_reason;
+
+    if supports_static_credential_bindings {
+        let unbound_static_keys = provider_environment
+            .static_credential_keys
+            .iter()
+            .filter(|key| {
+                !provider_environment
+                    .static_credential_bindings
+                    .contains_key(*key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unbound_static_keys.is_empty() {
+            readiness_reason = ProviderReadinessReason::CredentialsWithheld;
+        }
+        for key in unbound_static_keys {
+            warn!(
+                sandbox_id = %sandbox_id,
+                key = %key,
+                "withholding unbound static provider credential from binding-capable supervisor"
+            );
+            provider_environment.environment.remove(&key);
+            provider_environment
+                .credential_expiration_times
+                .remove(&key);
+            provider_environment.static_credential_keys.remove(&key);
+        }
+    } else {
+        if !provider_environment.static_credential_keys.is_empty() {
+            readiness_reason = ProviderReadinessReason::UnsupportedSupervisor;
+        }
         for key in &provider_environment.static_credential_keys {
             provider_environment.environment.remove(key);
-            provider_environment.credential_expires_at_ms.remove(key);
+            provider_environment.credential_expiration_times.remove(key);
         }
         provider_environment.static_credential_bindings.clear();
     }
@@ -2278,14 +3485,27 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .cloned()
         .collect();
 
-    Ok(Response::new(GetSandboxProviderEnvironmentResponse {
+    let credential_expiration_times = provider_environment
+        .credential_expiration_times
+        .into_iter()
+        .filter_map(|(key, value)| {
+            openshell_core::time::optional_timestamp_from_legacy_millis(value)
+                .ok()
+                .flatten()
+                .map(|timestamp| (key, timestamp))
+        })
+        .collect();
+    Ok(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
         provider_env_revision,
-        credential_expires_at_ms: provider_environment.credential_expires_at_ms,
+        credential_expiration_times,
         dynamic_credentials: provider_environment.dynamic_credentials,
         static_credential_bindings: provider_environment.static_credential_bindings,
         non_secret_environment_keys,
-    }))
+        provider_attachment_epoch: spec.provider_attachment_epoch.clone(),
+        policy_hash: deterministic_policy_hash(&effective_policy),
+        readiness_reason: readiness_reason.into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2301,7 +3521,13 @@ pub(super) async fn handle_update_config(
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
+    let result = Box::pin(handle_update_config_inner(
+        state,
+        request,
+        &principal,
+        sandbox_caller,
+    ))
+    .await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -2314,38 +3540,42 @@ async fn handle_update_config_inner(
     principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
-    let workspace = if req.global {
+    let sandbox = if req.global {
+        if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
+            return Err(Status::invalid_argument(
+                "sandbox and workspace must be omitted when global is true",
+            ));
+        }
         require_platform_admin(&state.admin_role, principal)?;
-        String::new()
+        replay_facts.global()?;
+        None
     } else {
         let min_role = if sandbox_caller {
             MinWorkspaceRole::User
         } else {
             MinWorkspaceRole::Admin
         };
-        authorize_sandbox_workspace(
-            &state.store,
-            &state.admin_role,
-            principal,
-            &req.workspace,
-            min_role,
+        Some(
+            super::sandbox::resolve_and_authorize_sandbox_name(
+                state,
+                principal,
+                &req.sandbox,
+                crate::auth::workspace_authz::selected_workspace_name(
+                    req.workspace_scope.as_ref(),
+                )?,
+                min_role,
+            )
+            .await?,
         )
-        .await?;
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name
     };
+    let workspace = sandbox.as_ref().map_or_else(String::new, |sandbox| {
+        sandbox.object_workspace().to_string()
+    });
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
-        resolve_sandbox_by_name_for_principal(
-            state.store.as_ref(),
-            &workspace,
-            principal,
-            &req.name,
-        )
-        .await?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -2373,6 +3603,9 @@ async fn handle_update_config_inner(
             ));
         }
         let _settings_guard = state.settings_mutex.lock().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -2389,8 +3622,9 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
-            normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
+            clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
+            new_policy = validate_and_canonicalize_policy(new_policy)?;
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
@@ -2404,6 +3638,9 @@ async fn handle_update_config_inner(
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
 
+            // Global policy determines the report's effective configuration.
+            // Serialize its writes after validation so a report cannot commit
+            // evidence derived from the policy this update has replaced.
             let latest = state
                 .store
                 .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
@@ -2411,7 +3648,7 @@ async fn handle_update_config_inner(
                 .map_err(|e| Status::internal(format!("fetch latest global policy failed: {e}")))?;
 
             if let Some(ref current) = latest
-                && current.policy_hash == hash
+                && canonical_policy_record_matches_for_deduplication(current, &hash)
                 && current.status == "loaded"
             {
                 let mut global_settings = load_global_settings(state.store.as_ref()).await?;
@@ -2501,6 +3738,8 @@ async fn handle_update_config_inner(
             validate_registered_setting_key(key)?;
         }
 
+        // Deleting global policy changes the report's effective configuration.
+        // Keep settings -> sandbox lock order for all global policy mutations.
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let provider_composition_was_enabled =
             provider_policy_composition_enabled_in(&global_settings)?;
@@ -2548,24 +3787,16 @@ async fn handle_update_config_inner(
         ));
     }
 
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument(
-            "name is required for sandbox-scoped updates",
-        ));
-    }
-
-    // Resolve sandbox by name.
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox = sandbox.expect("non-global config update resolves a sandbox");
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
 
         if key == POLICY_SETTING_KEY {
             return Err(Status::invalid_argument(
@@ -2660,6 +3891,9 @@ async fn handle_update_config_inner(
         ));
     }
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire policy mutation lock")
+    })?;
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -2674,32 +3908,16 @@ async fn handle_update_config_inner(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
-        let provider_layers =
-            provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers)
+        let merge_validation =
+            sandbox_policy_merge_validation_data(state, &workspace, &sandbox, &spec.providers)
                 .await?;
-        let provider_profile_catalog = state
-            .provider_profile_sources
-            .snapshot_catalog(state.store.as_ref(), &workspace)
-            .await?;
-        let provider_records = super::provider::load_provider_environment_records(
-            state.store.as_ref(),
-            &workspace,
-            &spec.providers,
-        )
-        .await?;
-        let credential_binding_context = PolicyCredentialBindingValidationContext {
-            catalog: &provider_profile_catalog,
-            records: &provider_records,
-        };
+        let credential_binding_context = merge_validation.credential_binding_context();
         let atomic_context = AtomicPolicyWriteContext {
             expected_resource_version: req.expected_resource_version,
             provenance: &req.annotations,
             annotations: &req.annotations,
         };
-        let mut baseline_policy = spec.policy.clone();
-        if let Some(policy) = baseline_policy.as_mut() {
-            normalize_process_identity_for_driver(policy, state.compute.driver_kind());
-        }
+        let baseline_policy = spec.policy.clone();
         let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
@@ -2707,9 +3925,10 @@ async fn handle_update_config_inner(
             baseline_policy.as_ref(),
             &merge_ops,
             PolicyMergeValidationContext {
-                provider_layers: &provider_layers,
+                provider_layers: &merge_validation.provider_layers,
                 credential_binding: Some(&credential_binding_context),
             },
+            None,
             Some(&atomic_context),
         )
         .await?;
@@ -2774,8 +3993,7 @@ async fn handle_update_config_inner(
     let mut new_policy = req
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
-    normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
-
+    clear_provider_credentialed_markers(&mut new_policy);
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
         return Err(Status::failed_precondition(
@@ -2789,7 +4007,7 @@ async fn handle_update_config_inner(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
     if sandbox_caller {
-        if openshell_policy::strip_provider_rule_names(&mut new_policy) {
+        if strip_provider_rule_names(&mut new_policy) {
             debug!(
                 sandbox_id = %sandbox_id,
                 "UpdateConfig: stripped provider-derived policy entries from sandbox sync"
@@ -2799,18 +4017,21 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
-        let mut comparable_baseline = baseline_policy.clone();
-        normalize_process_identity_for_driver(
-            &mut comparable_baseline,
-            state.compute.driver_kind(),
-        );
+    let startup_blocked = crate::policy_store::permits_initial_static_policy_repair(&sandbox);
+    let should_backfill_policy = if startup_blocked && !sandbox_caller {
+        // No child has consumed static restrictions yet. A complete replacement
+        // must be able to repair every field before the first activation.
+        true
+    } else if let Some(baseline_policy) = spec.policy.as_ref() {
+        let comparable_baseline = baseline_policy.clone();
         validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
-        None
+        false
     } else {
-        Some(new_policy.clone())
+        true
     };
 
+    new_policy = validate_and_canonicalize_policy(new_policy)?;
+    let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
     let provider_layers =
@@ -2833,12 +4054,18 @@ async fn handle_update_config_inner(
         &effective_policy,
     )
     .await?;
-
-    let _sandbox_sync_guard = if backfill_policy.is_some() {
-        Some(state.compute.sandbox_sync_guard().await)
-    } else {
-        None
-    };
+    // Image discovery persists the desired candidate for management repair.
+    // It never admits workload activation: GetSandboxConfig applies the complete
+    // composition gate and ReportSandboxConfiguration checks the exact result.
+    if !sandbox_caller {
+        validate_candidate_sandbox_credential_policy(
+            state,
+            &workspace,
+            &spec.providers,
+            Some(&new_policy),
+        )
+        .await?;
+    }
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
@@ -2852,7 +4079,7 @@ async fn handle_update_config_inner(
                 .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
             if let Some(ref current) = latest
-                && current.policy_hash == hash
+                && canonical_policy_record_matches_for_deduplication(current, &hash)
                 && current.provenance == req.annotations
             {
                 response_annotations = persist_existing_policy_projection(
@@ -2942,7 +4169,7 @@ async fn handle_update_config_inner(
     let hash = deterministic_policy_hash(&new_policy);
 
     if let Some(ref current) = latest
-        && current.policy_hash == hash
+        && canonical_policy_record_matches_for_deduplication(current, &hash)
     {
         return Ok(Response::new(UpdateConfigResponse {
             version: u32::try_from(current.version).unwrap_or(0),
@@ -3003,35 +4230,33 @@ pub(super) async fn handle_get_sandbox_policy_status(
 ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = if req.global {
+    let sandbox = if req.global {
+        if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
+            return Err(Status::invalid_argument(
+                "sandbox and workspace must be omitted when global is true",
+            ));
+        }
         require_platform_admin(&state.admin_role, &principal)?;
-        String::new()
+        None
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::User,
+        Some(
+            super::sandbox::resolve_and_authorize_sandbox_name(
+                state,
+                &principal,
+                &req.sandbox,
+                crate::auth::workspace_authz::selected_workspace_name(
+                    req.workspace_scope.as_ref(),
+                )?,
+                MinWorkspaceRole::User,
+            )
+            .await?,
         )
-        .await?;
-        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-            .await?
-            .name
     };
 
     let (policy_id, active_version) = if req.global {
         (GLOBAL_POLICY_SANDBOX_ID.to_string(), 0_u32)
     } else {
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
-        let sandbox = state
-            .store
-            .get_message_by_name::<Sandbox>(&workspace, &req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox = sandbox.as_ref().expect("sandbox query resolved a sandbox");
         (
             sandbox.object_id().to_string(),
             sandbox.current_policy_version(),
@@ -3060,7 +4285,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
 
     Ok(Response::new(GetSandboxPolicyStatusResponse {
-        revision: Some(policy_record_to_revision(&record, true)),
+        revision: Some(policy_record_to_revision(&record, true)?),
         active_version,
     }))
 }
@@ -3071,51 +4296,279 @@ pub(super) async fn handle_list_sandbox_policies(
 ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = if req.global {
+    let sandbox = if req.global {
+        if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
+            return Err(Status::invalid_argument(
+                "sandbox and workspace must be omitted when global is true",
+            ));
+        }
         require_platform_admin(&state.admin_role, &principal)?;
-        String::new()
+        None
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::User,
+        Some(
+            super::sandbox::resolve_and_authorize_sandbox_name(
+                state,
+                &principal,
+                &req.sandbox,
+                crate::auth::workspace_authz::selected_workspace_name(
+                    req.workspace_scope.as_ref(),
+                )?,
+                MinWorkspaceRole::User,
+            )
+            .await?,
         )
-        .await?;
-        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-            .await?
-            .name
     };
 
     let policy_id = if req.global {
         GLOBAL_POLICY_SANDBOX_ID.to_string()
     } else {
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
-        let sandbox = state
-            .store
-            .get_message_by_name::<Sandbox>(&workspace, &req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox = sandbox.as_ref().expect("sandbox query resolved a sandbox");
         sandbox.object_id().to_string()
     };
 
-    let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
-    let records = state
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListSandboxPolicies",
+        &[
+            &req.sandbox,
+            if req.global { "true" } else { "false" },
+            sandbox
+                .as_ref()
+                .map_or("", |sandbox| sandbox.object_workspace()),
+        ],
+    )?;
+    let mut records = state
         .store
-        .list_policies(&policy_id, limit, req.offset)
+        .list_policies_before(
+            &policy_id,
+            pagination.page_size() + 1,
+            pagination.policy_cursor()?,
+        )
         .await
         .map_err(|e| Status::internal(format!("list policies failed: {e}")))?;
+    let page_size = usize::try_from(pagination.page_size())
+        .map_err(|_| Status::internal("page size does not fit usize"))?;
+    let has_more = records.len() > page_size;
+    records.truncate(page_size);
+    let next_page_token = pagination.next_policy_token(
+        has_more
+            .then(|| records.last().map(|record| record.version))
+            .flatten(),
+    );
 
     let revisions = records
         .iter()
         .map(|r| policy_record_to_revision(r, false))
-        .collect();
+        .collect::<Result<Vec<_>, Status>>()?;
 
-    Ok(Response::new(ListSandboxPoliciesResponse { revisions }))
+    Ok(Response::new(ListSandboxPoliciesResponse {
+        revisions,
+        next_page_token,
+    }))
+}
+
+fn bounded_configuration_diagnostic(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
+}
+
+fn configuration_failure_diagnostic(error: &Status) -> &'static str {
+    let message = error.message();
+    if message.contains("middleware") {
+        "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
+    } else if message.contains("credential") || message.contains("provider") {
+        "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
+    } else {
+        "Stored policy structure or safety validation failed; submit a complete valid replacement policy"
+    }
+}
+
+fn configuration_generation_matches(
+    admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    config: &GetSandboxConfigResponse,
+) -> bool {
+    (
+        admission.policy_version,
+        &admission.policy_hash,
+        admission.config_revision,
+        admission.provider_env_revision,
+    ) == (
+        config.version,
+        &config.policy_hash,
+        config.config_revision,
+        config.provider_env_revision,
+    )
+}
+
+pub(super) async fn handle_report_sandbox_configuration(
+    state: &Arc<ServerState>,
+    request: Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+    use openshell_core::proto::ConfigurationAdmissionState;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let mut admission = request
+        .get_ref()
+        .admission
+        .clone()
+        .ok_or_else(|| Status::invalid_argument("admission is required"))?;
+    if uuid::Uuid::parse_str(&admission.instance_id).is_err() {
+        return Err(Status::invalid_argument("instance_id must be a UUID"));
+    }
+    let reported = ConfigurationAdmissionState::try_from(admission.state)
+        .map_err(|_| Status::invalid_argument("invalid admission state"))?;
+    if reported == ConfigurationAdmissionState::Unspecified {
+        return Err(Status::invalid_argument("admission state is required"));
+    }
+    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire configuration admission lock")
+    })?;
+    let mut sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_name = sandbox.object_name().to_string();
+    let workspace = sandbox.object_workspace().to_string();
+    crate::compute::provisioning_deadline::refresh_configuration(
+        &state.store,
+        &mut sandbox,
+        current_time_ms(),
+    )
+    .await
+    .map_err(Status::internal)?;
+    if crate::compute::provisioning_deadline::timed_out(&sandbox) {
+        return Err(Status::failed_precondition(
+            "provisioning repair window expired; explicitly start the sandbox after cleanup",
+        ));
+    }
+    let current = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref());
+    if reported == ConfigurationAdmissionState::Pending
+        && current.is_some_and(|current| current.instance_id != admission.instance_id)
+        && current.map_or("", |current| current.instance_id.as_str())
+            != request.get_ref().expected_instance_id
+    {
+        return Err(Status::failed_precondition(
+            "supervisor registration fence has changed",
+        ));
+    }
+    if reported != ConfigurationAdmissionState::Pending
+        && current.is_none_or(|current| current.instance_id != admission.instance_id)
+    {
+        return Err(Status::failed_precondition(
+            "supervisor configuration instance has changed",
+        ));
+    }
+    if reported == ConfigurationAdmissionState::Accepted {
+        let mut config_request = Request::new(GetSandboxConfigRequest {
+            name: sandbox_name.clone(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
+        });
+        *config_request.extensions_mut() = request.extensions().clone();
+        let config = handle_get_sandbox_config(state, config_request)
+            .await?
+            .into_inner();
+        if !config.configuration_admitted || !configuration_generation_matches(&admission, &config)
+        {
+            return Err(Status::aborted(
+                "configuration changed or is not admitted; fetch and validate again",
+            ));
+        }
+        admission.error.clear();
+    } else if reported == ConfigurationAdmissionState::Rejected {
+        // Runtime error strings may contain parser payloads. Only gateway-authored
+        // diagnostics may be exposed verbatim through public sandbox status.
+        let mut config_request = Request::new(GetSandboxConfigRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            name: sandbox_name,
+        });
+        *config_request.extensions_mut() = request.extensions().clone();
+        admission.error = match handle_get_sandbox_config(state, config_request).await {
+            Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
+                return Err(Status::aborted("rejected configuration generation has changed"));
+            }
+            Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
+            _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
+        };
+        if let Some(current) = current
+            && current.state == i32::from(ConfigurationAdmissionState::Accepted)
+        {
+            // A rejected desired update does not invalidate an accepted runtime.
+            let error = admission.error;
+            admission = current.clone();
+            admission.error = error;
+        }
+    } else {
+        admission.error.clear();
+        if let Some(current) = current
+            && current.instance_id == admission.instance_id
+        {
+            admission = current.clone();
+        }
+    }
+    let expected_version = sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    let now_ms = current_time_ms();
+    let mut provisioning = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.clone());
+    if let Some(record) = provisioning.as_mut() {
+        if !crate::compute::provisioning_deadline::allows_admission(record, now_ms) {
+            state
+                .compute
+                .claim_provisioning_timeout(&sandbox, now_ms)
+                .await
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                "provisioning repair window expired",
+            ));
+        }
+        if reported == ConfigurationAdmissionState::Rejected {
+            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
+                .map_err(Status::internal)?;
+        }
+    }
+    let updated = state
+        .store
+        .update_message_cas::<Sandbox, _>(&sandbox_id, expected_version, |sandbox| {
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .provisioning
+                .clone_from(&provisioning);
+            sandbox
+                .status
+                .get_or_insert_with(Default::default)
+                .configuration_admission = Some(admission.clone());
+            if reported == ConfigurationAdmissionState::Accepted {
+                sandbox
+                    .status
+                    .as_mut()
+                    .expect("status initialized")
+                    .configuration_activated = Some(true);
+            }
+            crate::compute::apply_configuration_readiness(sandbox);
+        })
+        .await
+        .map_err(|error| {
+            super::persistence_error_to_status(error, "report configuration admission")
+        })?;
+    state.sandbox_index.update_from_sandbox(&updated);
+    state.sandbox_watch_bus.notify(&sandbox_id);
+    Ok(Response::new(
+        openshell_core::proto::ReportSandboxConfigurationResponse {},
+    ))
 }
 
 pub(super) async fn handle_report_policy_status(
@@ -3173,18 +4626,44 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        // Update current_policy_version using CAS
-        // TODO: Accept expected_version from UpdateConfigRequest for proper client-driven CAS
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let version_to_set = req.version;
-        state
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+            super::persistence_error_to_status(error, "acquire policy mutation lock")
+        })?;
+        let sandbox = state
             .store
-            .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
-                sandbox.set_current_policy_version(version_to_set);
-            })
+            .get_message::<Sandbox>(&req.sandbox_id)
+            .await
+            .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let endpoint_reset = endpoint_status::endpoint_status_reset_for_loaded_policy(
+            state.as_ref(),
+            &sandbox,
+            version,
+        )
+        .await?;
+        let expected_resource_version = sandbox.get_resource_version();
+        let version_to_set = req.version;
+        let updated = state
+            .store
+            .update_message_cas::<Sandbox, _>(
+                &req.sandbox_id,
+                expected_resource_version,
+                |sandbox| {
+                    sandbox.set_current_policy_version(version_to_set);
+                    if let Some(endpoints) = &endpoint_reset {
+                        endpoint_status::reconcile_endpoint_statuses(
+                            sandbox,
+                            endpoints,
+                            &HashSet::new(),
+                            &prost_types::Timestamp::default(),
+                        );
+                    }
+                },
+            )
             .await
             .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
 
+        state.sandbox_index.update_from_sandbox(&updated);
         state.sandbox_watch_bus.notify(&req.sandbox_id);
     }
 
@@ -3208,25 +4687,40 @@ pub(super) async fn handle_get_sandbox_logs(
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-    let _sandbox =
-        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let sandbox_id = sandbox.object_id();
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
-    let tail = state.tracing_log_bus.tail(&req.sandbox_id, lines as usize);
+    let tail = state.tracing_log_bus.tail(sandbox_id, lines as usize);
 
     let buffer_total = tail.len() as u32;
+
+    if let Some(since_time) = req.since_time.as_ref() {
+        openshell_core::time::validate_timestamp(since_time)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    let since_time = req.since_time;
 
     let logs: Vec<SandboxLogLine> = tail
         .into_iter()
         .filter_map(|evt| {
             if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                evt.payload
+                evt.event.payload
             {
-                if req.since_ms > 0 && log.timestamp_ms < req.since_ms {
-                    return None;
+                if let Some(since_time) = since_time.as_ref() {
+                    let event_time = log.event_time.as_ref()?;
+                    if openshell_core::time::compare_timestamps(event_time, since_time).ok()?
+                        == std::cmp::Ordering::Less
+                    {
+                        return None;
+                    }
                 }
                 if !req.sources.is_empty() && !source_matches(&log.source, &req.sources) {
                     return None;
@@ -3273,7 +4767,10 @@ pub(super) async fn handle_push_sandbox_logs(
         )
         .await?;
 
-        for log in batch.logs.into_iter().take(100) {
+        let logs: Vec<_> = batch.logs.into_iter().take(100).collect();
+        validate_sandbox_log_timestamps(&logs)?;
+
+        for log in logs {
             let mut log = log;
             log.source = "sandbox".to_string();
             log.sandbox_id.clone_from(&batch.sandbox_id);
@@ -3282,6 +4779,17 @@ pub(super) async fn handle_push_sandbox_logs(
     }
 
     Ok(Response::new(PushSandboxLogsResponse {}))
+}
+
+fn validate_sandbox_log_timestamps(logs: &[SandboxLogLine]) -> Result<(), Status> {
+    for (index, log) in logs.iter().enumerate() {
+        if let Some(event_time) = log.event_time.as_ref() {
+            openshell_core::time::validate_timestamp(event_time).map_err(|error| {
+                Status::invalid_argument(format!("logs[{index}].event_time: {error}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 async fn ensure_log_stream_sandbox_scope(
@@ -3324,9 +4832,12 @@ pub(super) async fn handle_submit_policy_analysis(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
+    let workspace = super::workspace::resolve_workspace(
+        state.store.as_ref(),
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+    )
+    .await?
+    .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3376,6 +4887,21 @@ pub(super) async fn handle_submit_policy_analysis(
         &sandbox_id,
     )
     .await?;
+    let active_policy_version = state
+        .store
+        .get_latest_policy(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
+        .map_or(0, |record| record.version);
+    reconcile_pending_chunks_covered_by_policy(
+        state,
+        &sandbox_id,
+        &current_policy,
+        active_policy_version,
+    )
+    .await?;
+    let current_base_policy =
+        current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
 
     // Auto-approval is an opt-in behavior, sourced from the settings model
     // (sandbox or gateway scope) so it can be flipped on a running sandbox
@@ -3402,6 +4928,19 @@ pub(super) async fn handle_submit_policy_analysis(
         &provider_names_for_creds,
     )
     .await?;
+    let merge_validation = sandbox_policy_merge_validation_data_with_catalog(
+        state,
+        &workspace,
+        &sandbox,
+        &provider_names_for_creds,
+        &provider_profile_catalog,
+    )
+    .await?;
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let proposal_validation_context = PolicyMergeValidationContext {
+        provider_layers: &merge_validation.provider_layers,
+        credential_binding: Some(&credential_binding_context),
+    };
 
     let current_version = state
         .store
@@ -3441,15 +4980,143 @@ pub(super) async fn handle_submit_policy_analysis(
             rejection_reasons.push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
             continue;
         }
-
-        let now_ms = current_time_ms();
-        let proposed_rule_bytes = chunk
-            .proposed_rule
+        let first_seen_ms = match chunk
+            .first_seen_time
             .as_ref()
-            .map(Message::encode_to_vec)
-            .unwrap_or_default();
+            .map(openshell_core::time::timestamp_to_millis)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                rejected += 1;
+                rejection_reasons.push(format!(
+                    "chunk '{}' has invalid first_seen_time: {error}",
+                    chunk.rule_name
+                ));
+                continue;
+            }
+        };
+        let last_seen_ms = match chunk
+            .last_seen_time
+            .as_ref()
+            .map(openshell_core::time::timestamp_to_millis)
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                rejected += 1;
+                rejection_reasons.push(format!(
+                    "chunk '{}' has invalid last_seen_time: {error}",
+                    chunk.rule_name
+                ));
+                continue;
+            }
+        };
 
         let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
+        if req.analysis_mode == "agent_authored"
+            && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
+                openshell_policy::agent_authored_transport_rejection(
+                    &endpoint.protocol,
+                    openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or(""),
+                )
+            })
+        {
+            rejected += 1;
+            rejection_reasons.push(format!("chunk '{}': {reason}", chunk.rule_name));
+            continue;
+        }
+        let incoming_observation_key = rule_ref.endpoints.first().and_then(|endpoint| {
+            rule_ref.binaries.first().map(|binary| {
+                (
+                    endpoint.host.to_lowercase(),
+                    endpoint.port as i32,
+                    binary.path.clone(),
+                )
+            })
+        });
+        let existing_mechanistic = if req.analysis_mode == "mechanistic" {
+            let chunks = state
+                .store
+                .list_draft_chunks(&sandbox_id, None)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("list draft chunks for dedup failed: {error}"))
+                })?;
+            incoming_observation_key
+                .as_ref()
+                .and_then(|(host, port, binary)| {
+                    chunks.into_iter().find(|existing| {
+                        existing.host == *host
+                            && existing.port == *port
+                            && existing.binary == *binary
+                    })
+                })
+        } else {
+            None
+        };
+        // A duplicate observation updates the existing pending decision; it
+        // must not replace an edited rule with the new mapper payload. Build
+        // and hash the candidate from the stored rule, while retaining the
+        // incoming observation key for the persistence-layer dedup lookup.
+        let existing_pending_rule = existing_mechanistic
+            .as_ref()
+            .filter(|existing| existing.status == "pending")
+            .map(decode_draft_chunk_rule)
+            .transpose()?
+            .flatten();
+        let evaluation_rule = existing_pending_rule.as_ref().unwrap_or(rule_ref);
+        let evaluation_rule_name = existing_mechanistic
+            .as_ref()
+            .filter(|existing| existing.status == "pending")
+            .map_or(chunk.rule_name.as_str(), |existing| {
+                existing.rule_name.as_str()
+            });
+        let evaluation_mode = if existing_pending_rule.is_some() {
+            "stored"
+        } else {
+            req.analysis_mode.as_str()
+        };
+        let reusable_validation = existing_mechanistic
+            .as_ref()
+            .filter(|existing| existing.status == "pending" && !existing.review_token.is_empty())
+            .map(|existing| existing.validation_result.as_str());
+        let mut evaluation = evaluate_proposal_candidate(
+            &current_base_policy,
+            &current_policy,
+            evaluation_rule_name,
+            evaluation_rule,
+            evaluation_mode,
+            &credential_set,
+            proposal_validation_context,
+            reusable_validation,
+        );
+        if let Some(existing) = &existing_mechanistic
+            && !existing.review_token.is_empty()
+            && evaluation.review_token != existing.review_token
+        {
+            evaluation = evaluate_proposal_candidate(
+                &current_base_policy,
+                &current_policy,
+                evaluation_rule_name,
+                evaluation_rule,
+                evaluation_mode,
+                &credential_set,
+                proposal_validation_context,
+                None,
+            );
+        }
+        if req.analysis_mode != "mechanistic" && !evaluation.application_error.is_empty() {
+            rejected += 1;
+            rejection_reasons.push(format!(
+                "chunk '{}': {}",
+                chunk.rule_name, evaluation.application_error
+            ));
+            continue;
+        }
+
+        let now_ms = current_time_ms();
+        let proposed_rule_bytes = evaluation.rule.encode_to_vec();
         let (ep_host, ep_port) = rule_ref
             .endpoints
             .first()
@@ -3461,17 +5128,6 @@ pub(super) async fn handle_submit_policy_analysis(
             .map(|b| b.path.clone())
             .unwrap_or_default();
 
-        // The prover runs on every proposal regardless of `analysis_mode`.
-        // Source provenance (mechanistic vs agent_authored) is preserved in
-        // OCSF audit fields, but the safety decision is grounded in the
-        // merged-policy consequence, not the author — proposer-agnostic.
-        let validation_result = validation_result_for_agent_proposal(
-            current_policy.clone(),
-            &chunk.rule_name,
-            rule_ref,
-            &credential_set,
-        );
-
         let record = DraftChunkRecord {
             // The handler proposes an id; the store may swap it for an
             // existing row's id on dedup. Always trust `effective_id` for
@@ -3480,10 +5136,10 @@ pub(super) async fn handle_submit_policy_analysis(
             sandbox_id: sandbox_id.clone(),
             draft_version,
             status: "pending".to_string(),
-            rule_name: chunk.rule_name.clone(),
+            rule_name: evaluation.rule_name.clone(),
             proposed_rule: proposed_rule_bytes,
             rationale: chunk.rationale.clone(),
-            security_notes: generate_security_notes(rule_ref),
+            security_notes: generate_security_notes(&evaluation.rule),
             confidence: f64::from(chunk.confidence.clamp(0.0, 1.0)),
             created_at_ms: now_ms,
             decided_at_ms: None,
@@ -3491,18 +5147,16 @@ pub(super) async fn handle_submit_policy_analysis(
             port: ep_port,
             binary: ep_binary,
             hit_count: chunk.hit_count.clamp(1, 100),
-            first_seen_ms: if chunk.first_seen_ms > 0 {
-                chunk.first_seen_ms
-            } else {
-                now_ms
-            },
-            last_seen_ms: if chunk.last_seen_ms > 0 {
-                chunk.last_seen_ms
-            } else {
-                now_ms
-            },
-            validation_result: validation_result.clone(),
+            first_seen_ms: first_seen_ms.unwrap_or(now_ms),
+            last_seen_ms: last_seen_ms.unwrap_or(now_ms),
+            validation_result: evaluation.validation_result.clone(),
             rejection_reason: String::new(),
+            application_error: evaluation.application_error.clone(),
+            review_token: evaluation.review_token.clone(),
+            current_effective_policy_hash: evaluation.current_hash(),
+            candidate_effective_policy_hash: evaluation.candidate_hash(),
+            current_effective_policy: Some(evaluation.current_effective_policy.clone()),
+            candidate_effective_policy: evaluation.candidate_effective_policy.clone(),
         };
         // Mechanistic mode dedups N denials targeting the same endpoint
         // into one chunk. All other modes (agent-authored proposals, future
@@ -3516,6 +5170,14 @@ pub(super) async fn handle_submit_policy_analysis(
             .put_draft_chunk(&record, dedup_key.as_deref(), &workspace)
             .await
             .map_err(|e| Status::internal(format!("persist draft chunk failed: {e}")))?;
+        if effective_id != record.id
+            && existing_mechanistic.as_ref().is_some_and(|existing| {
+                existing.status == "pending" && existing.review_token != evaluation.review_token
+            })
+            && let Some(existing) = existing_mechanistic.as_ref()
+        {
+            persist_refreshed_evaluation(state, existing, &evaluation).await?;
+        }
         accepted += 1;
 
         // Implicit supersede: any other pending chunk for the same
@@ -3563,7 +5225,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
-            && let Err(err) = auto_approve_chunk(
+            && let Err(err) = Box::pin(auto_approve_chunk(
                 state,
                 &effective_id,
                 AutoApproveChunkContext {
@@ -3571,12 +5233,11 @@ pub(super) async fn handle_submit_policy_analysis(
                     workspace: &workspace,
                     source: &req.analysis_mode,
                     resolved_from,
-                    current_policy: &current_policy,
-                    credential_set: &credential_set,
                 },
-            )
+            ))
             .await
         {
+            persist_pending_application_error(state, &effective_id, &err).await;
             warn!(
                 chunk_id = %effective_id,
                 sandbox_id = %sandbox_id,
@@ -3617,26 +5278,12 @@ pub(super) async fn handle_get_draft_policy(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-
-    let sandbox = resolve_sandbox_by_name_for_principal(
-        state.store.as_ref(),
-        &workspace,
-        &principal,
-        &req.name,
     )
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
@@ -3664,7 +5311,10 @@ pub(super) async fn handle_get_draft_policy(
         .map(|r| draft_chunk_record_to_proto(&r))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let last_analyzed_at_ms = chunks.iter().map(|c| c.created_at_ms).max().unwrap_or(0);
+    let last_analyzed_time = chunks
+        .iter()
+        .filter_map(|chunk| chunk.created_time)
+        .max_by_key(|value| (value.seconds, value.nanos));
 
     debug!(
         sandbox_id = %sandbox_id,
@@ -3677,7 +5327,7 @@ pub(super) async fn handle_get_draft_policy(
         chunks,
         rolling_summary: String::new(),
         draft_version: u64::try_from(draft_version).unwrap_or(0),
-        last_analyzed_at_ms,
+        last_analyzed_time,
     }))
 }
 
@@ -3697,34 +5347,25 @@ async fn handle_approve_draft_chunk_inner(
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
+    let workspace = sandbox.object_workspace().to_string();
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
     require_no_global_policy(state).await?;
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -3740,6 +5381,15 @@ async fn handle_approve_draft_chunk_inner(
             chunk.status
         )));
     }
+
+    require_current_proposal_evaluation(
+        state,
+        &workspace,
+        &sandbox,
+        &chunk,
+        Some(&req.review_token),
+    )
+    .await?;
 
     info!(
         sandbox_id = %sandbox_id,
@@ -3757,19 +5407,31 @@ async fn handle_approve_draft_chunk_inner(
         .as_ref()
         .map(|spec| spec.providers.as_slice())
         .unwrap_or_default();
-    let provider_layers =
-        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, provider_names).await?;
-    let (version, hash) = merge_chunk_into_policy(
+    let merge_validation =
+        sandbox_policy_merge_validation_data(state, &workspace, &sandbox, provider_names).await?;
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let merge_result = merge_chunk_into_policy_with_validation(
         state.store.as_ref(),
         &sandbox_id,
         &workspace,
         &chunk,
-        &provider_layers,
+        PolicyMergeValidationContext {
+            provider_layers: &merge_validation.provider_layers,
+            credential_binding: Some(&credential_binding_context),
+        },
     )
-    .await?;
+    .await;
+    let (version, hash) = match merge_result {
+        Ok(result) => result,
+        Err(status) => {
+            persist_pending_application_error(state, &req.chunk_id, &status).await;
+            return Err(status);
+        }
+    };
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
+    clear_pending_application_error(state, &req.chunk_id).await;
     state
         .store
         .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
@@ -3777,6 +5439,15 @@ async fn handle_approve_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    if let Err(error) =
+        reconcile_pending_chunks_after_policy_change(state, &workspace, &sandbox).await
+    {
+        warn!(
+            sandbox_id,
+            error = %error,
+            "failed to reconcile pending policy proposals after approval"
+        );
+    }
     emit_gateway_policy_audit_log(
         &sandbox_id,
         sandbox.object_name(),
@@ -3822,32 +5493,23 @@ async fn handle_reject_draft_chunk_inner(
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
+    let workspace = sandbox.object_workspace().to_string();
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -3932,31 +5594,22 @@ async fn handle_approve_all_draft_chunks_inner(
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
+    let workspace = sandbox.object_workspace().to_string();
 
     require_no_global_policy(state).await?;
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let pending_chunks = state
         .store
@@ -3968,6 +5621,31 @@ async fn handle_approve_all_draft_chunks_inner(
         return Err(Status::failed_precondition("no pending chunks to approve"));
     }
 
+    let chunks_to_approve = if req.approvals.is_empty() {
+        pending_chunks.clone()
+    } else {
+        let by_id = pending_chunks
+            .iter()
+            .map(|chunk| (chunk.id.as_str(), chunk))
+            .collect::<HashMap<_, _>>();
+        let mut selected = Vec::with_capacity(req.approvals.len());
+        for approval in &req.approvals {
+            let chunk = by_id.get(approval.chunk_id.as_str()).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "chunk '{}' is not pending; refetch before bulk approval",
+                    approval.chunk_id
+                ))
+            })?;
+            selected.push((*chunk).clone());
+        }
+        selected
+    };
+    let review_tokens = req
+        .approvals
+        .iter()
+        .map(|approval| (approval.chunk_id.as_str(), approval.review_token.as_str()))
+        .collect::<HashMap<_, _>>();
+
     info!(
         sandbox_id = %sandbox_id,
         pending_count = pending_chunks.len(),
@@ -3975,39 +5653,23 @@ async fn handle_approve_all_draft_chunks_inner(
         "ApproveAllDraftChunks: starting bulk approval"
     );
 
-    let mut chunks_approved: u32 = 0;
     let mut chunks_skipped: u32 = 0;
-    let mut last_version: i64 = 0;
-    let mut last_hash = String::new();
     let provider_names = sandbox
         .spec
         .as_ref()
         .map(|spec| spec.providers.as_slice())
         .unwrap_or_default();
-    let provider_layers =
-        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, provider_names).await?;
-    let mut bulk_candidate =
-        current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
-    for chunk in &pending_chunks {
-        let security_notes = current_draft_chunk_security_notes(chunk)?;
-        if !req.include_security_flagged && !security_notes.is_empty() {
-            continue;
-        }
-        let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
-            .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
-        let operations = [PolicyMergeOp::AddRule {
-            rule_name: chunk.rule_name.clone(),
-            rule,
-        }];
-        validate_merge_operations_for_server(&operations)?;
-        bulk_candidate = merge_policy(bulk_candidate, &operations)
-            .map_err(map_policy_merge_error)?
-            .policy;
-    }
-    validate_policy_safety(&bulk_candidate)?;
-    validate_candidate_effective_policy(&bulk_candidate, &provider_layers)?;
-
-    for chunk in &pending_chunks {
+    let merge_validation =
+        sandbox_policy_merge_validation_data(state, &workspace, &sandbox, provider_names).await?;
+    let credential_binding_context = merge_validation.credential_binding_context();
+    let merge_validation_context = PolicyMergeValidationContext {
+        provider_layers: &merge_validation.provider_layers,
+        credential_binding: Some(&credential_binding_context),
+    };
+    let mut staged_policy = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+    let mut expected_effective_hash: Option<String> = None;
+    let mut accepted = Vec::<(DraftChunkRecord, PolicyMergeOp, String)>::new();
+    for chunk in &chunks_to_approve {
         let security_notes = current_draft_chunk_security_notes(chunk)?;
         if !req.include_security_flagged && !security_notes.is_empty() {
             info!(
@@ -4021,28 +5683,151 @@ async fn handle_approve_all_draft_chunks_inner(
             continue;
         }
 
+        let supplied_token = review_tokens.get(chunk.id.as_str()).copied().unwrap_or("");
+        let evaluation = match require_current_proposal_evaluation(
+            state,
+            &workspace,
+            &sandbox,
+            chunk,
+            Some(supplied_token),
+        )
+        .await
+        {
+            Ok(evaluation) => evaluation,
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                info!(
+                    sandbox_id = %sandbox_id,
+                    chunk_id = %chunk.id,
+                    reason = %status.message(),
+                    "ApproveAllDraftChunks: skipping stale or invalid candidate"
+                );
+                chunks_skipped += 1;
+                continue;
+            }
+            Err(status) => return Err(status),
+        };
+
+        let current_hash = evaluation.current_hash();
+        if let Some(expected_hash) = expected_effective_hash.as_deref()
+            && current_hash != expected_hash
+        {
+            return Err(Status::failed_precondition(
+                "proposal inputs changed during bulk review; refetch and review again",
+            ));
+        }
+
         info!(
             sandbox_id = %sandbox_id,
             chunk_id = %chunk.id,
             rule_name = %chunk.rule_name,
             host = %chunk.host,
             port = chunk.port,
-            "ApproveAllDraftChunks: merging chunk"
+            "ApproveAllDraftChunks: staging chunk"
         );
 
-        let (version, hash) = merge_chunk_into_policy(
+        let operation = PolicyMergeOp::AddRule {
+            rule_name: evaluation.rule_name,
+            rule: evaluation.rule,
+        };
+        let candidate = match stage_validated_merge_operation(
+            &staged_policy,
+            &operation,
+            merge_validation_context,
+        ) {
+            Ok(candidate) => candidate,
+            Err(status) => {
+                persist_pending_application_error(state, &chunk.id, &status).await;
+                info!(
+                    sandbox_id = %sandbox_id,
+                    chunk_id = %chunk.id,
+                    reason = %status.message(),
+                    "ApproveAllDraftChunks: skipping chunk that conflicts with the staged batch"
+                );
+                chunks_skipped += 1;
+                continue;
+            }
+        };
+        let chunk_summary = summarize_draft_chunk_rule(chunk)?;
+        if expected_effective_hash.is_none() {
+            expected_effective_hash = Some(current_hash);
+        }
+        staged_policy = candidate;
+        accepted.push((chunk.clone(), operation, chunk_summary));
+    }
+
+    let (last_version, last_hash) = if accepted.is_empty() {
+        (0, String::new())
+    } else {
+        // Rebuild the staged candidate from fresh live inputs immediately before
+        // persistence. This reuses each unchanged chunk's cached prover result;
+        // it does not silently bind the request to a newly refreshed token.
+        for (chunk, _, _) in &accepted {
+            let supplied_token = review_tokens.get(chunk.id.as_str()).copied().unwrap_or("");
+            require_current_proposal_evaluation(
+                state,
+                &workspace,
+                &sandbox,
+                chunk,
+                Some(supplied_token),
+            )
+            .await?;
+        }
+
+        let final_merge_validation =
+            sandbox_policy_merge_validation_data(state, &workspace, &sandbox, provider_names)
+                .await?;
+        let final_credential_binding_context = final_merge_validation.credential_binding_context();
+        let final_validation_context = PolicyMergeValidationContext {
+            provider_layers: &final_merge_validation.provider_layers,
+            credential_binding: Some(&final_credential_binding_context),
+        };
+        let final_base = current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+        let mut rebuilt_policy = final_base.clone();
+        for (_, operation, _) in &accepted {
+            rebuilt_policy = stage_validated_merge_operation(
+                &rebuilt_policy,
+                operation,
+                final_validation_context,
+            )?;
+        }
+        if deterministic_policy_hash(&rebuilt_policy) != deterministic_policy_hash(&staged_policy) {
+            return Err(Status::failed_precondition(
+                "proposal inputs changed during bulk review; refetch and review again",
+            ));
+        }
+
+        let operations = accepted
+            .iter()
+            .map(|(_, operation, _)| operation.clone())
+            .collect::<Vec<_>>();
+        let expected_hash = expected_effective_hash.as_deref().ok_or_else(|| {
+            Status::failed_precondition("bulk approval has no reviewed policy snapshot")
+        })?;
+        match apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
             &workspace,
-            chunk,
-            &provider_layers,
+            Some(&final_base),
+            &operations,
+            final_validation_context,
+            Some(expected_hash),
+            None,
         )
-        .await?;
-        last_version = version;
-        last_hash = hash;
-        let chunk_summary = summarize_draft_chunk_rule(chunk)?;
+        .await
+        {
+            Ok((version, hash, _)) => (version, hash),
+            Err(status) => {
+                for (chunk, _, _) in &accepted {
+                    persist_pending_application_error(state, &chunk.id, &status).await;
+                }
+                return Err(status);
+            }
+        }
+    };
 
+    for (chunk, _, chunk_summary) in &accepted {
         let now_ms = current_time_ms();
+        clear_pending_application_error(state, &chunk.id).await;
         state
             .store
             .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
@@ -4054,14 +5839,23 @@ async fn handle_approve_all_draft_chunks_inner(
             sandbox.object_name(),
             "approved",
             format!("gateway approved draft chunk {}: {chunk_summary}", chunk.id),
-            version,
+            last_version,
             &last_hash,
         );
-        chunks_approved += 1;
         emit_sandbox_policy_update_success();
     }
+    let chunks_approved = u32::try_from(accepted.len()).unwrap_or(u32::MAX);
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    if let Err(error) =
+        reconcile_pending_chunks_after_policy_change(state, &workspace, &sandbox).await
+    {
+        warn!(
+            sandbox_id,
+            error = %error,
+            "failed to reconcile pending policy proposals after bulk approval"
+        );
+    }
     emit_gateway_policy_audit_log(
         &sandbox_id,
         sandbox.object_name(),
@@ -4099,21 +5893,17 @@ pub(super) async fn handle_edit_draft_chunk(
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
+    let workspace = sandbox.object_workspace().to_string();
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
@@ -4121,13 +5911,8 @@ pub(super) async fn handle_edit_draft_chunk(
         .proposed_rule
         .ok_or_else(|| Status::invalid_argument("proposed_rule is required"))?;
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -4144,12 +5929,17 @@ pub(super) async fn handle_edit_draft_chunk(
         )));
     }
 
-    let rule_bytes = proposed_rule.encode_to_vec();
-    state
-        .store
-        .update_draft_chunk_rule(&req.chunk_id, &rule_bytes)
-        .await
-        .map_err(|e| Status::internal(format!("update chunk rule failed: {e}")))?;
+    let mut edited_chunk = chunk.clone();
+    edited_chunk.proposed_rule = proposed_rule.encode_to_vec();
+    edited_chunk.review_token.clear();
+    edited_chunk.validation_result.clear();
+    edited_chunk.application_error.clear();
+    edited_chunk.current_effective_policy = None;
+    edited_chunk.candidate_effective_policy = None;
+    let evaluation =
+        evaluate_stored_chunk_against_live_inputs(state, &workspace, &sandbox, &edited_chunk, None)
+            .await?;
+    persist_refreshed_evaluation(state, &edited_chunk, &evaluation).await?;
 
     info!(
         chunk_id = %req.chunk_id,
@@ -4175,32 +5965,23 @@ async fn handle_undo_draft_chunk_inner(
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
+    let workspace = sandbox.object_workspace().to_string();
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let chunk = state
         .store
@@ -4272,29 +6053,18 @@ pub(super) async fn handle_clear_draft_chunks(
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::Admin,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    replay_facts.resource(&sandbox)?;
 
     let deleted = state
         .store
@@ -4321,27 +6091,14 @@ pub(super) async fn handle_get_draft_history(
 ) -> Result<Response<GetDraftHistoryResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
+    let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
+        state,
         &principal,
-        &req.workspace,
+        &req.sandbox,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
         MinWorkspaceRole::User,
     )
     .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    if req.name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&workspace, &req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
 
     let all_chunks = state
@@ -4354,7 +6111,11 @@ pub(super) async fn handle_get_draft_history(
 
     for chunk in &all_chunks {
         entries.push(DraftHistoryEntry {
-            timestamp_ms: chunk.created_at_ms,
+            event_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+                chunk.created_at_ms,
+            )
+            .ok()
+            .flatten(),
             event_type: "proposed".to_string(),
             description: format!(
                 "Rule '{}' proposed (confidence: {:.0}%)",
@@ -4366,7 +6127,9 @@ pub(super) async fn handle_get_draft_history(
 
         if let Some(decided_at) = chunk.decided_at_ms {
             entries.push(DraftHistoryEntry {
-                timestamp_ms: decided_at,
+                event_time: openshell_core::time::optional_timestamp_from_legacy_millis(decided_at)
+                    .ok()
+                    .flatten(),
                 event_type: chunk.status.clone(),
                 description: format!("Rule '{}' {}", chunk.rule_name, chunk.status),
                 chunk_id: chunk.id.clone(),
@@ -4374,7 +6137,12 @@ pub(super) async fn handle_get_draft_history(
         }
     }
 
-    entries.sort_by_key(|e| e.timestamp_ms);
+    entries.sort_by_key(|entry| {
+        entry
+            .event_time
+            .as_ref()
+            .map_or((0, 0), |value| (value.seconds, value.nanos))
+    });
 
     debug!(
         sandbox_id = %sandbox_id,
@@ -4389,41 +6157,44 @@ pub(super) async fn handle_get_draft_history(
 // Policy helper functions
 // ---------------------------------------------------------------------------
 
-/// Compute a deterministic SHA-256 hash of a `SandboxPolicy`.
-fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(policy.version.to_le_bytes());
-    if let Some(fs) = &policy.filesystem {
-        hasher.update(fs.encode_to_vec());
-    }
-    if let Some(ll) = &policy.landlock {
-        hasher.update(ll.encode_to_vec());
-    }
-    if let Some(p) = &policy.process {
-        hasher.update(p.encode_to_vec());
-    }
-    let mut entries: Vec<_> = policy.network_policies.iter().collect();
-    entries.sort_by_key(|(k, _)| k.as_str());
-    for (key, value) in entries {
-        hasher.update(key.as_bytes());
-        hasher.update(value.encode_to_vec());
-    }
-    if !policy.network_middlewares.is_empty() {
-        hasher.update(b"network_middlewares");
-        let mut entries: Vec<_> = policy.network_middlewares.iter().collect();
-        entries.sort_by_key(|(name, _)| name.as_str());
-        for (name, middleware) in entries {
-            hasher.update(name.as_bytes());
-            let encoded = middleware.encode_to_vec();
-            hasher.update(
-                u64::try_from(encoded.len())
-                    .expect("protobuf payload length fits in u64")
-                    .to_le_bytes(),
+/// Rebuilds a policy revision's identity from its checked canonical payload.
+///
+/// `PolicyRecord::policy_hash` is persisted metadata and cannot prove what the
+/// payload contains. Decode and validate every record before using its identity
+/// so legacy encodings deduplicate semantically and damaged rows fail closed.
+fn canonical_policy_record_identity(
+    record: &PolicyRecord,
+) -> Result<(ProtoSandboxPolicy, String), Status> {
+    let decoded = decode_stored_policy(record.policy_payload.as_slice())
+        .map_err(|error| Status::internal(format!("decode policy revision failed: {error}")))?;
+    let policy = validate_and_canonicalize_stored_policy(decoded, STORED_POLICY_SOURCE_HISTORY)?;
+    let hash = deterministic_policy_hash(&policy);
+    Ok((policy, hash))
+}
+
+/// Compare a stored revision during no-op detection without blocking repair.
+///
+/// Invalid durable state remains unusable everywhere that loads or serves a
+/// policy. A full, already-validated replacement is different: treating an
+/// unreadable current row as non-matching lets the write path append a good
+/// revision instead of making the corrupt or legacy row permanently terminal.
+fn canonical_policy_record_matches_for_deduplication(
+    record: &PolicyRecord,
+    expected_hash: &str,
+) -> bool {
+    match canonical_policy_record_identity(record) {
+        Ok((_, hash)) => hash == expected_hash,
+        Err(error) => {
+            warn!(
+                policy_id = %record.id,
+                sandbox_id = %record.sandbox_id,
+                version = record.version,
+                error = %error,
+                "Invalid stored policy revision cannot satisfy deduplication; a valid replacement may proceed"
             );
-            hasher.update(encoded);
+            false
         }
     }
-    hex::encode(hasher.finalize())
 }
 
 /// Compute a fingerprint for the effective sandbox configuration.
@@ -4527,20 +6298,43 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         rationale: record.rationale.clone(),
         security_notes,
         confidence: record.confidence as f32,
-        created_at_ms: record.created_at_ms,
-        decided_at_ms: record.decided_at_ms.unwrap_or(0),
+        created_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            record.created_at_ms,
+        )
+        .ok()
+        .flatten(),
+        decided_time: record
+            .decided_at_ms
+            .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
         hit_count: record.hit_count,
-        first_seen_ms: record.first_seen_ms,
-        last_seen_ms: record.last_seen_ms,
+        first_seen_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            record.first_seen_ms,
+        )
+        .ok()
+        .flatten(),
+        last_seen_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            record.last_seen_ms,
+        )
+        .ok()
+        .flatten(),
         binary: record.binary.clone(),
         validation_result: record.validation_result.clone(),
         rejection_reason: record.rejection_reason.clone(),
+        application_error: record.application_error.clone(),
+        review_token: record.review_token.clone(),
+        current_effective_policy_hash: record.current_effective_policy_hash.clone(),
+        candidate_effective_policy_hash: record.candidate_effective_policy_hash.clone(),
+        current_effective_policy: record.current_effective_policy.clone(),
+        candidate_effective_policy: record.candidate_effective_policy.clone(),
         ..Default::default()
     })
 }
 
-fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> SandboxPolicyRevision {
-    let status = match record.status.as_str() {
+fn policy_record_to_revision(
+    record: &PolicyRecord,
+    include_policy: bool,
+) -> Result<SandboxPolicyRevision, Status> {
+    let stored_status = match record.status.as_str() {
         "pending" => PolicyStatus::Pending,
         "loaded" => PolicyStatus::Loaded,
         "failed" => PolicyStatus::Failed,
@@ -4548,21 +6342,54 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
         _ => PolicyStatus::Unspecified,
     };
 
-    let policy = if include_policy {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice()).ok()
-    } else {
-        None
-    };
-
-    SandboxPolicyRevision {
-        version: u32::try_from(record.version).unwrap_or(0),
-        policy_hash: record.policy_hash.clone(),
-        status: status.into(),
-        load_error: record.load_error.clone().unwrap_or_default(),
-        created_at_ms: record.created_at_ms,
-        loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
-        policy,
-        provenance: record.provenance.clone(),
+    match canonical_policy_record_identity(record) {
+        Ok((policy, policy_hash)) => Ok(SandboxPolicyRevision {
+            version: u32::try_from(record.version).unwrap_or(0),
+            policy_hash,
+            status: stored_status.into(),
+            load_error: record.load_error.clone().unwrap_or_default(),
+            created_time: openshell_core::time::timestamp_from_millis(record.created_at_ms).ok(),
+            loaded_time: record
+                .loaded_at_ms
+                .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
+            policy: include_policy.then_some(policy),
+            provenance: record.provenance.clone(),
+        }),
+        Err(error) if !include_policy => {
+            // History listing is a recovery surface, not an enforcement path.
+            // Preserve row metadata so one legacy or damaged payload cannot
+            // hide every usable revision in the page, but blank the untrusted
+            // hash and mark the projection failed. Detail and runtime callers
+            // still receive the hard error through the branch below.
+            let identity_error = format!(
+                "policy revision is invalid under the current schema: {}",
+                error.message()
+            );
+            let load_error = record.load_error.as_deref().map_or_else(
+                || identity_error.clone(),
+                |stored_error| {
+                    if stored_error.is_empty() {
+                        identity_error.clone()
+                    } else {
+                        format!("{stored_error}; {identity_error}")
+                    }
+                },
+            );
+            Ok(SandboxPolicyRevision {
+                version: u32::try_from(record.version).unwrap_or(0),
+                policy_hash: String::new(),
+                status: PolicyStatus::Failed.into(),
+                load_error,
+                created_time: openshell_core::time::timestamp_from_millis(record.created_at_ms)
+                    .ok(),
+                loaded_time: record
+                    .loaded_at_ms
+                    .and_then(|value| openshell_core::time::timestamp_from_millis(value).ok()),
+                policy: None,
+                provenance: record.provenance.clone(),
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -4593,6 +6420,12 @@ fn generate_security_notes(rule: &NetworkPolicyRule) -> String {
 
     for endpoint in &rule.endpoints {
         let host = endpoint.host.to_lowercase();
+
+        if endpoint.allow_uninspected_credentials {
+            notes.push(format!(
+                "Endpoint '{host}' explicitly allows credentials on traffic OpenShell cannot inspect or rewrite."
+            ));
+        }
 
         // Flag destinations that are an internal/private address. Parse the host as
         // an IP literal and defer to the canonical RFC-accurate classifier
@@ -4821,18 +6654,14 @@ fn parse_proto_add_deny_rules(
     index: usize,
     add_deny_rules: &ProtoAddDenyRules,
 ) -> Result<PolicyMergeOp, Status> {
-    if add_deny_rules.host.trim().is_empty()
-        || add_deny_rules.port == 0
-        || add_deny_rules.deny_rules.is_empty()
-    {
+    if add_deny_rules.deny_rules.is_empty() {
         return Err(Status::invalid_argument(format!(
-            "merge_operations[{index}].add_deny_rules requires host, non-zero port, and at least one deny rule"
+            "merge_operations[{index}].add_deny_rules requires at least one deny rule"
         )));
     }
 
     Ok(PolicyMergeOp::AddDenyRules {
-        host: add_deny_rules.host.trim().to_string(),
-        port: add_deny_rules.port,
+        target: parse_proto_l7_target(index, add_deny_rules.target.as_ref())?,
         deny_rules: add_deny_rules.deny_rules.clone(),
     })
 }
@@ -4841,12 +6670,9 @@ fn parse_proto_add_allow_rules(
     index: usize,
     add_allow_rules: &ProtoAddAllowRules,
 ) -> Result<PolicyMergeOp, Status> {
-    if add_allow_rules.host.trim().is_empty()
-        || add_allow_rules.port == 0
-        || add_allow_rules.rules.is_empty()
-    {
+    if add_allow_rules.rules.is_empty() {
         return Err(Status::invalid_argument(format!(
-            "merge_operations[{index}].add_allow_rules requires host, non-zero port, and at least one allow rule"
+            "merge_operations[{index}].add_allow_rules requires at least one allow rule"
         )));
     }
     if add_allow_rules
@@ -4860,10 +6686,38 @@ fn parse_proto_add_allow_rules(
     }
 
     Ok(PolicyMergeOp::AddAllowRules {
-        host: add_allow_rules.host.trim().to_string(),
-        port: add_allow_rules.port,
+        target: parse_proto_l7_target(index, add_allow_rules.target.as_ref())?,
         rules: add_allow_rules.rules.clone(),
     })
+}
+
+fn parse_proto_l7_target(
+    index: usize,
+    target: Option<&ProtoL7RuleTarget>,
+) -> Result<L7RuleTarget, Status> {
+    let target = target.ok_or_else(|| {
+        Status::invalid_argument(format!("merge_operations[{index}] requires an L7 target"))
+    })?;
+    // An omitted binary declaration must never become any-binary authority.
+    // The wire format permits both fields, so enforce the exclusive choice here.
+    let binaries = match (target.any_binary, target.binaries.is_empty()) {
+        (true, true) => L7BinaryScope::Any,
+        (false, false) => L7BinaryScope::Restricted(target.binaries.clone()),
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "merge_operations[{index}].target requires exactly one of any_binary=true or nonempty binaries"
+            )));
+        }
+    };
+    let target = L7RuleTarget {
+        rule_name: target.rule_name.clone(),
+        host: target.host.clone(),
+        ports: target.ports.clone(),
+        path: target.path.clone(),
+        binaries,
+    };
+    target.validate(index).map_err(map_policy_merge_error)?;
+    Ok(target)
 }
 
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
@@ -4877,7 +6731,9 @@ fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<
                 }
                 validate_rule_not_always_blocked(rule)?;
             }
-            PolicyMergeOp::AddAllowRules { host, .. } => validate_host_not_always_blocked(host)?,
+            PolicyMergeOp::AddAllowRules { target, .. } => {
+                validate_host_not_always_blocked(&target.host)?;
+            }
             _ => {}
         }
     }
@@ -4886,26 +6742,37 @@ fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<
 
 fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     match error {
-        openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
+        openshell_policy::PolicyMergeError::InvalidOperationPolicy { .. }
+        | openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
         | openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints { .. }
         | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
+        | openshell_policy::PolicyMergeError::InvalidL7Target { .. }
         | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
             Status::invalid_argument(error.to_string())
         }
-        openshell_policy::PolicyMergeError::McpContractConflict { .. }
+        openshell_policy::PolicyMergeError::InvalidInputPolicy { .. }
+        | openshell_policy::PolicyMergeError::McpContractConflict { .. }
         | openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
         | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
             ..
         }
         | openshell_policy::PolicyMergeError::UndeclaredPortWouldChange { .. }
         | openshell_policy::PolicyMergeError::ConflictingInspectionContracts { .. }
-        | openshell_policy::PolicyMergeError::AmbiguousEndpointRule { .. }
+        | openshell_policy::PolicyMergeError::AmbiguousL7Target { .. }
+        | openshell_policy::PolicyMergeError::L7BinaryScopeMismatch { .. }
+        | openshell_policy::PolicyMergeError::L7PortScopeMismatch { .. }
         | openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. }
         | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoL7Inspection { .. }
         | openshell_policy::PolicyMergeError::UnsupportedEndpointProtocol { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoAllowBase { .. } => {
             Status::failed_precondition(error.to_string())
+        }
+        openshell_policy::PolicyMergeError::InvalidMergedPolicy { .. } => {
+            Status::internal(error.to_string())
+        }
+        openshell_policy::PolicyMergeError::L7TargetNotFound { .. } => {
+            Status::not_found(error.to_string())
         }
     }
 }
@@ -4919,13 +6786,146 @@ struct AtomicPolicyWriteContext<'a> {
 struct PolicyCredentialBindingValidationContext<'a> {
     catalog: &'a EffectiveProviderProfileCatalog,
     records: &'a [super::provider::ProviderEnvironmentRecord],
+    credentialed_scopes: &'a [CredentialedEndpointScope],
+    endpointless_provider_names: &'a HashSet<String>,
 }
 
+struct SandboxPolicyMergeValidationData {
+    provider_layers: Vec<ProviderPolicyLayer>,
+    catalog: EffectiveProviderProfileCatalog,
+    records: Vec<super::provider::ProviderEnvironmentRecord>,
+    credentialed_scopes: Vec<CredentialedEndpointScope>,
+    endpointless_provider_names: HashSet<String>,
+}
+
+impl SandboxPolicyMergeValidationData {
+    fn credential_binding_context(&self) -> PolicyCredentialBindingValidationContext<'_> {
+        PolicyCredentialBindingValidationContext {
+            catalog: &self.catalog,
+            records: &self.records,
+            credentialed_scopes: &self.credentialed_scopes,
+            endpointless_provider_names: &self.endpointless_provider_names,
+        }
+    }
+}
+
+async fn sandbox_policy_merge_validation_data(
+    state: &ServerState,
+    workspace: &str,
+    sandbox: &Sandbox,
+    provider_names: &[String],
+) -> Result<SandboxPolicyMergeValidationData, Status> {
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    sandbox_policy_merge_validation_data_with_catalog(
+        state,
+        workspace,
+        sandbox,
+        provider_names,
+        &catalog,
+    )
+    .await
+}
+
+async fn sandbox_policy_merge_validation_data_with_catalog(
+    state: &ServerState,
+    workspace: &str,
+    sandbox: &Sandbox,
+    provider_names: &[String],
+    catalog: &EffectiveProviderProfileCatalog,
+) -> Result<SandboxPolicyMergeValidationData, Status> {
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let composition_enabled = provider_policy_composition_enabled_in(&global_settings)?;
+    let ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+        endpointless_provider_names,
+    } = provider_policy_context_with_catalog(
+        state.store.as_ref(),
+        catalog,
+        workspace,
+        provider_names,
+    )
+    .await?;
+    let provider_layers = if composition_enabled {
+        layers
+    } else {
+        Vec::new()
+    };
+    debug!(
+        sandbox_id = %sandbox.object_id(),
+        provider_layer_count = provider_layers.len(),
+        "Composed provider policy and credential context for merge validation"
+    );
+    let records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    Ok(SandboxPolicyMergeValidationData {
+        provider_layers,
+        catalog: catalog.clone(),
+        records,
+        credentialed_scopes,
+        endpointless_provider_names,
+    })
+}
+
+#[derive(Clone, Copy)]
 struct PolicyMergeValidationContext<'a> {
     provider_layers: &'a [ProviderPolicyLayer],
     credential_binding: Option<&'a PolicyCredentialBindingValidationContext<'a>>,
 }
 
+fn validate_operator_merged_credential_policy(
+    effective_policy: &mut ProtoSandboxPolicy,
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    context: &PolicyCredentialBindingValidationContext<'_>,
+) -> Result<(), Status> {
+    validate_policy_credential_binding_context(
+        context.catalog,
+        context.records,
+        effective_policy,
+        bindings,
+    )?;
+    let mut credentialed_scopes = context.credentialed_scopes.to_vec();
+    extend_credentialed_scopes_from_policy_bindings(
+        &mut credentialed_scopes,
+        bindings,
+        context.endpointless_provider_names,
+    );
+    clear_provider_credentialed_markers(effective_policy);
+    stamp_provider_credentialed_endpoints(effective_policy, &credentialed_scopes);
+    validate_uninspected_credentialed_endpoints(effective_policy)
+}
+
+fn stage_validated_merge_operation(
+    current_policy: &ProtoSandboxPolicy,
+    operation: &PolicyMergeOp,
+    validation_context: PolicyMergeValidationContext<'_>,
+) -> Result<ProtoSandboxPolicy, Status> {
+    validate_merge_operations_for_server(std::slice::from_ref(operation))?;
+    let merged = merge_policy(current_policy.clone(), std::slice::from_ref(operation))
+        .map_err(map_policy_merge_error)?;
+    let candidate = merged.policy;
+    validate_policy_safety(&candidate)?;
+    validate_candidate_effective_policy(&candidate, validation_context.provider_layers)?;
+    let mut effective = if validation_context.provider_layers.is_empty() {
+        candidate.clone()
+    } else {
+        compose_effective_policy(&candidate, validation_context.provider_layers)
+    };
+    let bindings = policy_static_credential_endpoint_bindings(Some(&effective))?;
+    if let Some(context) = validation_context.credential_binding {
+        validate_operator_merged_credential_policy(&mut effective, &bindings, context)?;
+    }
+    Ok(candidate)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
@@ -4933,6 +6933,7 @@ async fn apply_merge_operations_with_retry(
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
     validation_context: PolicyMergeValidationContext<'_>,
+    expected_current_effective_hash: Option<&str>,
     atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
 ) -> Result<(i64, String, Option<Sandbox>), Status> {
     let provider_layers = validation_context.provider_layers;
@@ -4942,12 +6943,33 @@ async fn apply_merge_operations_with_retry(
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-        let current_policy = if let Some(ref record) = latest {
-            ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+        let (current_policy, current_hash) = if let Some(ref record) = latest {
+            let (policy, hash) = canonical_policy_record_identity(record)?;
+            (policy, Some(hash))
         } else {
-            baseline_policy.cloned().unwrap_or_default()
+            (baseline_policy.cloned().unwrap_or_default(), None)
         };
+
+        if let Some(expected_hash) = expected_current_effective_hash {
+            let mut current_effective = if provider_layers.is_empty() {
+                current_policy.clone()
+            } else {
+                compose_effective_policy(&current_policy, provider_layers)
+            };
+            let bindings = policy_static_credential_endpoint_bindings(Some(&current_effective))?;
+            if let Some(context) = validation_context.credential_binding {
+                validate_operator_merged_credential_policy(
+                    &mut current_effective,
+                    &bindings,
+                    context,
+                )?;
+            }
+            if deterministic_policy_hash(&current_effective) != expected_hash {
+                return Err(Status::failed_precondition(
+                    "proposal inputs changed before persistence; refetch and review again",
+                ));
+            }
+        }
 
         let merged = merge_policy(current_policy, operations).map_err(map_policy_merge_error)?;
         let new_policy = merged.policy;
@@ -4958,23 +6980,18 @@ async fn apply_merge_operations_with_retry(
         }
         validate_policy_safety(&new_policy)?;
         validate_candidate_effective_policy(&new_policy, provider_layers)?;
-        let effective_policy = if provider_layers.is_empty() {
+        let mut effective_policy = if provider_layers.is_empty() {
             new_policy.clone()
         } else {
             compose_effective_policy(&new_policy, provider_layers)
         };
         let bindings = policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
         if let Some(context) = validation_context.credential_binding {
-            validate_policy_credential_binding_context(
-                context.catalog,
-                context.records,
-                &effective_policy,
-                &bindings,
-            )?;
+            validate_operator_merged_credential_policy(&mut effective_policy, &bindings, context)?;
         }
 
         if let Some(ref current) = latest
-            && current.policy_hash == hash
+            && current_hash.as_deref() == Some(hash.as_str())
             && atomic_context.is_none_or(|context| current.provenance == *context.provenance)
         {
             return Ok((current.version, hash, None));
@@ -5040,6 +7057,11 @@ async fn apply_merge_operations_with_retry(
             }
             Err(e) => {
                 if e.is_unique_violation_on("objects_version_uq") {
+                    if expected_current_effective_hash.is_some() {
+                        return Err(Status::failed_precondition(
+                            "policy changed while applying reviewed proposal; refetch and review again",
+                        ));
+                    }
                     warn!(
                         sandbox_id = %sandbox_id,
                         attempt,
@@ -5062,12 +7084,12 @@ async fn apply_merge_operations_with_retry(
     )))
 }
 
-pub(super) async fn merge_chunk_into_policy(
+async fn merge_chunk_into_policy_with_validation(
     store: &Store,
     sandbox_id: &str,
     workspace: &str,
     chunk: &DraftChunkRecord,
-    provider_layers: &[ProviderPolicyLayer],
+    validation_context: PolicyMergeValidationContext<'_>,
 ) -> Result<(i64, String), Status> {
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
@@ -5076,20 +7098,45 @@ pub(super) async fn merge_chunk_into_policy(
         rule,
     }];
     validate_merge_operations_for_server(&operations)?;
+    let mut baseline_policy = chunk.current_effective_policy.clone();
+    if let Some(policy) = &mut baseline_policy {
+        strip_provider_rule_names(policy);
+        clear_provider_credentialed_markers(policy);
+    }
     apply_merge_operations_with_retry(
         store,
         sandbox_id,
         workspace,
-        None,
+        baseline_policy.as_ref(),
         &operations,
-        PolicyMergeValidationContext {
-            provider_layers,
-            credential_binding: None,
-        },
+        validation_context,
+        (!chunk.current_effective_policy_hash.is_empty())
+            .then_some(chunk.current_effective_policy_hash.as_str()),
         None,
     )
     .await
     .map(|(version, hash, _)| (version, hash))
+}
+
+#[cfg(test)]
+async fn merge_chunk_into_policy(
+    store: &Store,
+    sandbox_id: &str,
+    workspace: &str,
+    chunk: &DraftChunkRecord,
+    provider_layers: &[ProviderPolicyLayer],
+) -> Result<(i64, String), Status> {
+    merge_chunk_into_policy_with_validation(
+        store,
+        sandbox_id,
+        workspace,
+        chunk,
+        PolicyMergeValidationContext {
+            provider_layers,
+            credential_binding: None,
+        },
+    )
+    .await
 }
 
 async fn remove_chunk_from_policy(
@@ -5111,6 +7158,7 @@ async fn remove_chunk_from_policy(
             provider_layers: &[],
             credential_binding: None,
         },
+        None,
         None,
     )
     .await
@@ -5213,30 +7261,6 @@ pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, "", GLOBAL_SETTINGS_NAME).await
 }
 
-/// Whether a boolean global setting is enabled, loading global settings from the
-/// store. Exposed to sibling modules that need a gate check without depending on
-/// the private `StoredSettings` type.
-pub async fn global_bool_setting_enabled(store: &Store, key: &str) -> Result<bool, Status> {
-    let global_settings = load_global_settings(store).await?;
-    bool_setting_enabled(&global_settings, key)
-}
-
-/// Test helper: set a boolean global setting, loading current settings first so
-/// the CAS write succeeds whether the record already exists or not. Available to
-/// sibling test modules without exposing the private `StoredSettings` type.
-#[cfg(test)]
-pub async fn set_global_bool_setting_for_test(
-    store: &Store,
-    key: &str,
-    value: bool,
-) -> Result<(), Status> {
-    let mut settings = load_global_settings(store).await?;
-    settings
-        .settings
-        .insert(key.to_string(), StoredSettingValue::Bool(value));
-    save_global_settings(store, &settings).await
-}
-
 pub(super) async fn save_global_settings(
     store: &Store,
     settings: &StoredSettings,
@@ -5289,6 +7313,15 @@ async fn load_settings_record(
         let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
             .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
         settings.resource_version = record.resource_version;
+        for key in settings.settings.keys() {
+            settings
+                .change_clocks
+                .entry(key.clone())
+                .or_insert_with(|| super::SettingChangeClock {
+                    id: format!("{}:{}:{key}", record.id, record.resource_version),
+                    committed_at_ms: record.updated_at_ms,
+                });
+        }
         Ok(settings)
     } else {
         Ok(StoredSettings::default())
@@ -5304,7 +7337,22 @@ async fn save_settings_record(
 ) -> Result<(), Status> {
     use crate::persistence::WriteCondition;
 
-    let payload = serde_json::to_vec(settings)
+    let previous = load_settings_record(store, object_type, workspace, name).await?;
+    let mut persisted = settings.clone();
+    persisted.change_clocks = previous.change_clocks.clone();
+    let now_ms = current_time_ms();
+    for key in previous.settings.keys().chain(settings.settings.keys()) {
+        if previous.settings.get(key) != settings.settings.get(key) {
+            persisted.change_clocks.insert(
+                key.clone(),
+                super::SettingChangeClock {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    committed_at_ms: now_ms,
+                },
+            );
+        }
+    }
+    let payload = serde_json::to_vec(&persisted)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
 
     let (id, condition) = if settings.resource_version == 0 {
@@ -5353,9 +7401,25 @@ fn decode_policy_from_global_settings(
 
     let raw = hex::decode(encoded)
         .map_err(|e| Status::internal(format!("global policy decode failed: {e}")))?;
-    let policy = ProtoSandboxPolicy::decode(raw.as_slice())
+    let policy = decode_stored_policy(raw.as_slice())
         .map_err(|e| Status::internal(format!("global policy protobuf decode failed: {e}")))?;
-    Ok(Some(policy))
+    validate_and_canonicalize_stored_policy(policy, STORED_POLICY_SOURCE_GLOBAL).map(Some)
+}
+
+/// Validate a decoded stored policy before it is trusted, hashed, or copied.
+///
+/// Stored rows may have been written by an older schema or damaged outside the
+/// normal request path. Treat invalid durable state as a failed precondition and
+/// return the canonical value so callers cannot accidentally reuse raw bytes.
+fn validate_and_canonicalize_stored_policy(
+    policy: ProtoSandboxPolicy,
+    source: &'static str,
+) -> Result<ProtoSandboxPolicy, Status> {
+    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        Status::failed_precondition(format!(
+            "stored policy source '{source}' is invalid: {error}"
+        ))
+    })
 }
 
 fn merge_effective_settings(
@@ -5436,7 +7500,24 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::test_support::{authed_request, test_server_state};
-    use crate::persistence::test_store;
+
+    /// An in-memory store with the example profiles imported at platform scope.
+    ///
+    /// Provider profiles are import-only, so a gateway resolves only what an
+    /// operator imported. Tests that expect `github`, `openai` or
+    /// `google-cloud` to resolve have to import them first.
+    async fn test_store() -> Store {
+        let store = crate::persistence::test_store().await;
+        for profile in openshell_providers::example_profiles::load_all() {
+            store
+                .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                    profile.to_proto(),
+                ))
+                .await
+                .expect("store example provider profile");
+        }
+        store
+    }
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5460,10 +7541,191 @@ mod tests {
         request
     }
 
+    #[test]
+    fn sandbox_log_timestamp_validation_rejects_malformed_batches_atomically() {
+        let logs = vec![
+            SandboxLogLine {
+                event_time: openshell_core::time::timestamp_from_millis(0).ok(),
+                ..Default::default()
+            },
+            SandboxLogLine {
+                event_time: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: -1,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let error = validate_sandbox_log_timestamps(&logs).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("logs[1].event_time"));
+    }
+
+    #[test]
+    fn stored_policy_decode_migrates_legacy_provenance_and_preserves_unknown_fields() {
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredNetworkBinary {
+            #[prost(string, tag = "1")]
+            path: String,
+            #[prost(bool, tag = "2")]
+            advisor_proposed: bool,
+            #[prost(string, tag = "99")]
+            future_metadata: String,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredNetworkPolicyRule {
+            #[prost(string, tag = "1")]
+            name: String,
+            #[prost(message, repeated, tag = "2")]
+            endpoints: Vec<NetworkEndpoint>,
+            #[prost(message, repeated, tag = "3")]
+            binaries: Vec<FutureStoredNetworkBinary>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStoredSandboxPolicy {
+            #[prost(map = "string, message", tag = "5")]
+            network_policies: HashMap<String, FutureStoredNetworkPolicyRule>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyStoredPolicyRevisionPayload {
+            #[prost(message, optional, tag = "1")]
+            policy: Option<FutureStoredSandboxPolicy>,
+        }
+
+        let legacy = FutureStoredSandboxPolicy {
+            network_policies: HashMap::from([(
+                "cargo_registry".to_string(),
+                FutureStoredNetworkPolicyRule {
+                    name: "cargo-registry".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "index.crates.io".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![
+                        FutureStoredNetworkBinary {
+                            path: "/usr/bin/cargo".to_string(),
+                            advisor_proposed: false,
+                            future_metadata: "keep-explicit".to_string(),
+                        },
+                        FutureStoredNetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                            advisor_proposed: true,
+                            future_metadata: "keep-advisor".to_string(),
+                        },
+                    ],
+                },
+            )]),
+        };
+
+        let wrapped = LegacyStoredPolicyRevisionPayload {
+            policy: Some(legacy),
+        }
+        .encode_to_vec();
+        let record = crate::policy_store::policy_record_from_parts(
+            "revision-1".to_string(),
+            "sandbox-1".to_string(),
+            1,
+            "loaded".to_string(),
+            &wrapped,
+            1,
+        )
+        .unwrap();
+        let rewrapped = crate::policy_store::policy_payload_from_record(&record).unwrap();
+        let future_payload = LegacyStoredPolicyRevisionPayload::decode(rewrapped.as_slice())
+            .expect("rewrapped policy should retain unknown nested fields");
+        let future_rule = &future_payload.policy.unwrap().network_policies["cargo_registry"];
+        assert!(!future_rule.binaries[0].advisor_proposed);
+        assert_eq!(future_rule.binaries[0].future_metadata, "keep-explicit");
+        assert!(future_rule.binaries[1].advisor_proposed);
+        assert_eq!(future_rule.binaries[1].future_metadata, "keep-advisor");
+
+        let record = crate::policy_store::policy_record_from_parts(
+            "revision-2".to_string(),
+            "sandbox-1".to_string(),
+            1,
+            "loaded".to_string(),
+            &rewrapped,
+            1,
+        )
+        .unwrap();
+        let decoded = decode_stored_policy(&record.policy_payload).unwrap();
+        let explicit = &decoded.network_policies["cargo_registry"];
+        assert_eq!(explicit.binaries[0].path, "/usr/bin/cargo");
+        assert!(!explicit.endpoints[0].advisor_proposed);
+
+        let advisor = &decoded.network_policies["cargo_registry__legacy_advisor"];
+        assert_eq!(advisor.binaries[0].path, "/usr/bin/curl");
+        assert!(advisor.endpoints[0].advisor_proposed);
+
+        let round_tripped = decode_stored_policy(&decoded.encode_to_vec()).unwrap();
+        assert_eq!(round_tripped, decoded);
+    }
+
+    #[test]
+    fn agent_authored_candidate_avoids_explicit_rule_name_collision() {
+        let mut base = ProtoSandboxPolicy::default();
+        base.network_policies.insert(
+            "allow_index_crates_io_443".to_string(),
+            NetworkPolicyRule {
+                name: "explicit-index".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "index.crates.io".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/cargo".to_string(),
+                }],
+            },
+        );
+        let proposal = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }],
+        };
+
+        let evaluation = evaluate_proposal_candidate(
+            &base,
+            &base,
+            "allow_index_crates_io_443",
+            &proposal,
+            "agent_authored",
+            &CredentialSet::default(),
+            PolicyMergeValidationContext {
+                provider_layers: &[],
+                credential_binding: None,
+            },
+            None,
+        );
+
+        assert!(evaluation.application_error.is_empty());
+        assert_eq!(evaluation.rule_name, "allow_index_crates_io_443_2");
+        assert!(evaluation.rule.endpoints[0].advisor_proposed);
+        let candidate = evaluation.candidate_effective_policy.unwrap();
+        assert_eq!(
+            candidate.network_policies["allow_index_crates_io_443"].binaries[0].path,
+            "/usr/bin/cargo"
+        );
+        assert!(
+            candidate.network_policies["allow_index_crates_io_443_2"].endpoints[0].advisor_proposed
+        );
+    }
+
     /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
     /// Use for tests that exercise sandbox-caller code paths.
     #[allow(dead_code)]
-    fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
+    pub(super) fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
         request
             .extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
@@ -5476,6 +7738,327 @@ mod tests {
         request
     }
 
+    #[tokio::test]
+    async fn provisioning_timeout_rejects_supervisor_registration() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase, SandboxProvisioning,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-timeout-registration";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "timeout-registration",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Error.into());
+        sandbox.status.as_mut().unwrap().provisioning = Some(SandboxProvisioning {
+            timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+            ..Default::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        let error = handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.into(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id: uuid::Uuid::new_v4().to_string(),
+                        state: ConfigurationAdmissionState::Pending.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("repair window expired"));
+    }
+
+    #[tokio::test]
+    async fn configuration_admission_rejects_stale_generation_and_instance() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-admission";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "admission",
+                openshell_policy::restrictive_default_policy(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let report = |admission| {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    admission: Some(admission),
+                    expected_instance_id: String::new(),
+                }),
+                sandbox_id,
+            )
+        };
+        handle_report_sandbox_configuration(
+            &state,
+            report(SandboxConfigurationAdmission {
+                instance_id: instance_id.clone(),
+                state: Admission::Pending.into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let config = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(config.configuration_admitted);
+        let accepted = SandboxConfigurationAdmission {
+            instance_id: instance_id.clone(),
+            state: Admission::Accepted.into(),
+            policy_version: config.version,
+            policy_hash: config.policy_hash,
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            error: String::new(),
+        };
+        let mut outdated_admission = accepted.clone();
+        outdated_admission.provider_env_revision =
+            outdated_admission.provider_env_revision.wrapping_add(1);
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(outdated_admission))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Aborted
+        );
+        handle_report_sandbox_configuration(&state, report(accepted.clone()))
+            .await
+            .unwrap();
+        let mut stale_rejection = accepted.clone();
+        stale_rejection.state = Admission::Rejected.into();
+        stale_rejection.policy_version += 1;
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(stale_rejection))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Aborted,
+            "a delayed rejection must not mark the accepted current generation invalid"
+        );
+        let restart_instance = uuid::Uuid::new_v4().to_string();
+        let mut restart = report(SandboxConfigurationAdmission {
+            instance_id: restart_instance.clone(),
+            state: Admission::Pending.into(),
+            ..Default::default()
+        });
+        restart.get_mut().expected_instance_id = instance_id.clone();
+        handle_report_sandbox_configuration(&state, restart)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_report_sandbox_configuration(
+                &state,
+                report(SandboxConfigurationAdmission {
+                    instance_id,
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                })
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            Code::FailedPrecondition,
+            "delayed old Pending must not reclaim registration"
+        );
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(accepted.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        for admission_state in [Admission::Pending, Admission::Rejected] {
+            if admission_state == Admission::Rejected {
+                let mut rejected = accepted.clone();
+                rejected.instance_id = restart_instance.clone();
+                rejected.state = Admission::Rejected.into();
+                handle_report_sandbox_configuration(&state, report(rejected))
+                    .await
+                    .unwrap();
+            }
+            let persisted = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                persisted.status.as_ref().unwrap().configuration_activated,
+                Some(true)
+            );
+            assert!(!crate::policy_store::permits_initial_static_policy_repair(
+                &persisted
+            ));
+            let mut replacement = persisted.spec.as_ref().unwrap().policy.clone().unwrap();
+            replacement.filesystem.as_mut().unwrap().read_only.clear();
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: "admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    policy: Some(replacement),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(error.message().contains("filesystem"), "{error}");
+        }
+    }
+
+    #[test]
+    fn configuration_diagnostic_is_bounded_and_removes_control_characters() {
+        let diagnostic = bounded_configuration_diagnostic(&format!("rule\n{}", "é".repeat(1000)));
+        assert_eq!(diagnostic.chars().count(), 512);
+        assert!(!diagnostic.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn configuration_admission_retains_invalid_image_composition_for_repair() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-image-admission";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "image-admission",
+            ProtoSandboxPolicy::default(),
+            vec!["work-github".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        sandbox.status.as_mut().unwrap().configuration_activated = Some(false);
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        handle_report_sandbox_configuration(
+            &state,
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    expected_instance_id: String::new(),
+                    admission: Some(SandboxConfigurationAdmission {
+                        instance_id,
+                        state: Admission::Pending.into(),
+                        ..Default::default()
+                    }),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap();
+        let image = test_policy_with_rule("image_github", "api.github.com");
+        handle_update_config(
+            &state,
+            with_sandbox(
+                Request::new(UpdateConfigRequest {
+                    sandbox: "image-admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    policy: Some(image),
+                    ..Default::default()
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("image candidate remains available for repair");
+        let rejected = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "image-admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!rejected.configuration_admitted);
+        assert!(rejected.configuration_error.contains("image_github"));
+        assert!(!rejected.configuration_error.contains("ghp-test"));
+        assert!(rejected.policy.is_some());
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "image-admission".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("operator can replace static sections before first launch");
+        let repaired = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "image-admission".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            repaired.configuration_admitted,
+            "{}",
+            repaired.configuration_error
+        );
+    }
+
     fn security_notes_for_host(host: &str) -> String {
         generate_security_notes(&NetworkPolicyRule {
             endpoints: vec![NetworkEndpoint {
@@ -5485,6 +8068,1277 @@ mod tests {
             }],
             ..Default::default()
         })
+    }
+
+    pub(super) fn mcp_policy_with_versions(versions: &[&str]) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    mcp: Some(openshell_core::proto::McpOptions {
+                        versions: versions.iter().map(ToString::to_string).collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_policy_without_options() -> ProtoSandboxPolicy {
+        let mut policy = mcp_policy_with_versions(&[]);
+        policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .endpoints
+            .first_mut()
+            .expect("MCP test endpoint")
+            .mcp = None;
+        policy
+    }
+
+    fn legacy_non_mcp_policy_with_mcp_options() -> ProtoSandboxPolicy {
+        let mut policy = mcp_policy_with_versions(&[]);
+        let endpoint = policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .endpoints
+            .first_mut()
+            .expect("MCP test endpoint");
+        endpoint.protocol = "rest".to_string();
+        endpoint.mcp = Some(openshell_core::proto::McpOptions {
+            strict_tool_names: Some(true),
+            ..Default::default()
+        });
+        policy
+    }
+
+    fn mcp_versions(policy: &ProtoSandboxPolicy) -> &[String] {
+        policy
+            .network_policies
+            .get("mcp")
+            .and_then(|rule| rule.endpoints.first())
+            .and_then(|endpoint| endpoint.mcp.as_ref())
+            .map(|mcp| mcp.versions.as_slice())
+            .expect("canonical MCP test endpoint options")
+    }
+
+    fn defaulted_mcp_policy_cases() -> [(&'static str, ProtoSandboxPolicy); 3] {
+        [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ]
+    }
+
+    /// Install a global policy through the normal write path and return the
+    /// canonical value that subsequent read paths must serve.
+    async fn install_test_global_policy(state: &Arc<ServerState>) -> ProtoSandboxPolicy {
+        handle_update_config(
+            state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(mcp_policy_with_versions(&[])),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("test global policy update must succeed");
+
+        let settings = load_global_settings(state.store.as_ref())
+            .await
+            .expect("test global settings lookup");
+        decode_policy_from_global_settings(&settings)
+            .expect("test global policy must decode")
+            .expect("test global policy must be present")
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_policies_traverses_multiple_pages_exactly_once() {
+        let state = test_server_state().await;
+        let policy = ProtoSandboxPolicy::default();
+        let payload = policy.encode_to_vec();
+        for version in 1..=7 {
+            state
+                .store
+                .put_policy_revision(
+                    &format!("global-policy-{version}"),
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    "",
+                    version,
+                    &payload,
+                    &format!("hash-{version}"),
+                )
+                .await
+                .expect("store policy revision");
+        }
+
+        let mut versions = Vec::new();
+        let mut page_token = String::new();
+        let mut page_size = 2;
+        loop {
+            let page = handle_list_sandbox_policies(
+                &state,
+                authed_request(ListSandboxPoliciesRequest {
+                    page_size,
+                    page_token,
+                    global: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            versions.extend(page.revisions.into_iter().map(|revision| revision.version));
+            if page.next_page_token.is_empty() {
+                break;
+            }
+            page_token = page.next_page_token;
+            page_size = 3;
+        }
+
+        assert_eq!(versions, vec![7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn list_global_policies_rejects_sandbox_name() {
+        let state = test_server_state().await;
+        let policy = ProtoSandboxPolicy::default();
+        let payload = policy.encode_to_vec();
+        for version in 1..=2 {
+            state
+                .store
+                .put_policy_revision(
+                    &format!("global-policy-{version}"),
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    "",
+                    version,
+                    &payload,
+                    &format!("hash-{version}"),
+                )
+                .await
+                .expect("store policy revision");
+        }
+        let first = handle_list_sandbox_policies(
+            &state,
+            authed_request(ListSandboxPoliciesRequest {
+                page_size: 1,
+                global: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!first.next_page_token.is_empty());
+
+        let error = handle_list_sandbox_policies(
+            &state,
+            authed_request(ListSandboxPoliciesRequest {
+                page_size: 1,
+                page_token: first.next_page_token,
+                global: true,
+                sandbox: "different".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_config_rejects_invalid_spec_policy_before_history_backfill() {
+        let state = test_server_state().await;
+        let cases = [
+            (
+                "duplicate",
+                mcp_policy_with_versions(&["2025-11-25", "2025-11-25"]),
+            ),
+            ("unsupported", mcp_policy_with_versions(&["latest"])),
+        ];
+
+        for (case, policy) in cases {
+            let sandbox_id = format!("stored-invalid-{case}");
+            state
+                .store
+                .put_message(&test_sandbox(
+                    &sandbox_id,
+                    &format!("stored-invalid-{case}"),
+                    policy,
+                    Vec::new(),
+                ))
+                .await
+                .expect("store legacy sandbox spec");
+
+            let error = handle_get_sandbox_config_inner(
+                &state,
+                with_sandbox(
+                    Request::new(GetSandboxConfigRequest {
+                        name: sandbox_id.clone(),
+                        workspace_scope: None,
+                    }),
+                    &sandbox_id,
+                ),
+            )
+            .await
+            .expect_err("invalid stored spec must fail before history backfill");
+
+            assert_eq!(error.code(), Code::FailedPrecondition, "{case}");
+            assert!(
+                error.message().contains(STORED_POLICY_SOURCE_SPEC),
+                "{case}"
+            );
+            assert!(
+                state
+                    .store
+                    .get_latest_policy(&sandbox_id)
+                    .await
+                    .expect("policy history lookup")
+                    .is_none(),
+                "{case} must not create policy history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_config_backfills_canonical_spec_policy_bytes_and_hash() {
+        let state = test_server_state().await;
+        let sandbox_id = "stored-canonical-backfill";
+        let raw = mcp_policy_with_versions(&["2025-11-25", "2025-03-26", "2025-06-18"]);
+        let canonical = validate_and_canonicalize_policy(raw.clone())
+            .expect("supported stored MCP policy must canonicalize");
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "stored-canonical-backfill",
+                raw,
+                Vec::new(),
+            ))
+            .await
+            .expect("store legacy sandbox spec");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: sandbox_id.to_string(),
+                    workspace_scope: None,
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("valid stored spec must backfill")
+        .into_inner();
+
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        assert_eq!(response.policy.as_ref(), Some(&canonical));
+        assert_eq!(response.policy_hash, canonical_hash);
+        assert_eq!(response.version, 1);
+
+        let persisted = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("policy history lookup")
+            .expect("canonical history revision");
+        assert_eq!(persisted.policy_payload, canonical.encode_to_vec());
+        assert_eq!(persisted.policy_hash, canonical_hash);
+        assert_eq!(persisted.status, "loaded");
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_config_backfills_defaulted_mcp_policy_as_canonical_bytes_and_hash() {
+        let state = test_server_state().await;
+        let canonical = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("explicit default MCP policy must canonicalize");
+        assert_eq!(mcp_versions(&canonical), &["2025-11-25".to_string()]);
+        let canonical_payload = canonical.encode_to_vec();
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, raw) in cases {
+            let sandbox_id = format!("stored-default-{case}");
+            state
+                .store
+                .put_message(&test_sandbox(&sandbox_id, &sandbox_id, raw, Vec::new()))
+                .await
+                .expect("store legacy sandbox spec");
+
+            let response = handle_get_sandbox_config(
+                &state,
+                with_sandbox(
+                    Request::new(GetSandboxConfigRequest {
+                        name: sandbox_id.clone(),
+                        workspace_scope: None,
+                    }),
+                    &sandbox_id,
+                ),
+            )
+            .await
+            .expect("defaulted stored spec must backfill")
+            .into_inner();
+
+            assert_eq!(response.policy.as_ref(), Some(&canonical), "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(
+                mcp_versions(response.policy.as_ref().expect("backfilled policy")),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            let persisted = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .expect("canonical history revision");
+            assert_eq!(persisted.policy_payload, canonical_payload, "{case}");
+            assert_eq!(persisted.policy_hash, canonical_hash, "{case}");
+            assert_eq!(persisted.status, "loaded", "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_defaulted_mcp_policy_canonicalizes_for_current_base_and_history_export() {
+        let store = test_store().await;
+        let canonical = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, raw) in cases {
+            let sandbox_id = format!("legacy-default-history-{case}");
+            let sandbox = test_sandbox(&sandbox_id, &sandbox_id, raw.clone(), Vec::new());
+
+            let spec_base = current_base_policy_for_sandbox(&store, &sandbox)
+                .await
+                .expect("legacy spec policy must canonicalize");
+            assert_eq!(spec_base, canonical, "{case}");
+            assert_eq!(
+                mcp_versions(&spec_base),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            store
+                .put_policy_revision(
+                    &format!("legacy-default-history-revision-{case}"),
+                    &sandbox_id,
+                    "default",
+                    1,
+                    &raw.encode_to_vec(),
+                    "legacy-uncanonicalized-hash",
+                )
+                .await
+                .expect("store legacy policy history");
+
+            let history_base = current_base_policy_for_sandbox(&store, &sandbox)
+                .await
+                .expect("legacy history policy must canonicalize");
+            assert_eq!(history_base, canonical, "{case}");
+
+            let record = store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .expect("legacy policy history");
+            let revision = policy_record_to_revision(&record, true)
+                .expect("legacy history export must canonicalize");
+            assert_eq!(revision.policy_hash, canonical_hash, "{case}");
+            let exported = revision.policy.expect("exported history policy");
+            assert_eq!(exported, canonical, "{case}");
+            assert_eq!(
+                mcp_versions(&exported),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            let listed = policy_record_to_revision(&record, false)
+                .expect("legacy history list projection must canonicalize");
+            assert_eq!(listed.policy_hash, canonical_hash, "{case}");
+            assert!(listed.policy.is_none(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_latest_history_fails_closed_but_remains_listable() {
+        let state = test_server_state().await;
+        let sandbox_id = "stored-invalid-history";
+        let valid = validate_and_canonicalize_policy(mcp_policy_with_versions(&[]))
+            .expect("valid history policy must canonicalize");
+        let valid_hash = deterministic_policy_hash(&valid);
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "stored-invalid-history",
+                valid.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+        state
+            .store
+            .put_policy_revision(
+                "stored-valid-history-revision",
+                sandbox_id,
+                "default",
+                1,
+                &valid.encode_to_vec(),
+                &valid_hash,
+            )
+            .await
+            .expect("store valid history");
+        let invalid = legacy_non_mcp_policy_with_mcp_options();
+        state
+            .store
+            .put_policy_revision(
+                "stored-invalid-history-revision",
+                sandbox_id,
+                "default",
+                2,
+                &invalid.encode_to_vec(),
+                "uncanonicalized-hash",
+            )
+            .await
+            .expect("store legacy invalid history");
+
+        let rejected = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: sandbox_id.to_string(),
+                    workspace_scope: None,
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("invalid latest history must remain repairable")
+        .into_inner();
+
+        assert!(!rejected.configuration_admitted);
+        assert!(rejected.policy.is_none());
+        assert!(!rejected.configuration_error.is_empty());
+
+        let record = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("policy history lookup")
+            .expect("invalid policy history");
+        let listed_invalid = policy_record_to_revision(&record, false)
+            .expect("list projection must preserve invalid legacy history metadata");
+        assert_eq!(listed_invalid.version, 2);
+        assert_eq!(listed_invalid.status, PolicyStatus::Failed as i32);
+        assert!(listed_invalid.policy_hash.is_empty());
+        assert!(listed_invalid.policy.is_none());
+        assert!(
+            listed_invalid
+                .load_error
+                .contains(STORED_POLICY_SOURCE_HISTORY)
+        );
+
+        let detail_error = handle_get_sandbox_policy_status(
+            &state,
+            with_user(Request::new(GetSandboxPolicyStatusRequest {
+                sandbox: "stored-invalid-history".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                version: 2,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("invalid history detail must remain fail-closed");
+        assert_eq!(detail_error.code(), Code::FailedPrecondition);
+        assert!(
+            detail_error
+                .message()
+                .contains(STORED_POLICY_SOURCE_HISTORY)
+        );
+
+        let listed = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                sandbox: "stored-invalid-history".to_string(),
+                page_size: 10,
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("one invalid revision must not hide the rest of the history")
+        .into_inner();
+
+        assert_eq!(listed.revisions.len(), 2);
+        assert_eq!(listed.revisions[0], listed_invalid);
+        assert_eq!(listed.revisions[1].version, 1);
+        assert_eq!(listed.revisions[1].policy_hash, valid_hash);
+        assert_eq!(listed.revisions[1].status, PolicyStatus::Pending as i32);
+        assert!(listed.revisions[1].load_error.is_empty());
+        assert!(listed.revisions[1].policy.is_none());
+    }
+
+    #[tokio::test]
+    async fn valid_global_policy_overrides_invalid_legacy_history() {
+        let state = test_server_state().await;
+        let global_policy = install_test_global_policy(&state).await;
+        let sandbox_id = "global-overrides-invalid-history";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("store sandbox");
+
+        let invalid = legacy_non_mcp_policy_with_mcp_options();
+        state
+            .store
+            .put_policy_revision(
+                "global-overrides-invalid-history-revision",
+                sandbox_id,
+                "default",
+                2,
+                &invalid.encode_to_vec(),
+                "untrusted-legacy-hash",
+            )
+            .await
+            .expect("store invalid legacy policy history");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: sandbox_id.to_string(),
+                    workspace_scope: None,
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("valid global policy must override invalid local history")
+        .into_inner();
+
+        assert_eq!(response.policy.as_ref(), Some(&global_policy));
+        assert_eq!(
+            response.policy_hash,
+            deterministic_policy_hash(&global_policy)
+        );
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert_eq!(response.version, 2);
+        assert_eq!(response.global_policy_version, 1);
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("provider profile catalog");
+        let effective = current_effective_policy_for_sandbox(
+            state.as_ref(),
+            &catalog,
+            "default",
+            &sandbox,
+            sandbox_id,
+        )
+        .await
+        .expect("effective-policy lookup must bypass invalid local history");
+        assert_eq!(effective, global_policy);
+    }
+
+    #[tokio::test]
+    async fn valid_global_policy_overrides_invalid_legacy_spec_without_backfill() {
+        let state = test_server_state().await;
+        let global_policy = install_test_global_policy(&state).await;
+        let sandbox_id = "global-overrides-invalid-spec";
+        let sandbox = test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            legacy_non_mcp_policy_with_mcp_options(),
+            Vec::new(),
+        );
+        state
+            .store
+            .put_message(&sandbox)
+            .await
+            .expect("store sandbox with invalid legacy spec");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: sandbox_id.to_string(),
+                    workspace_scope: None,
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .expect("valid global policy must override invalid local spec")
+        .into_inner();
+
+        assert_eq!(response.policy.as_ref(), Some(&global_policy));
+        assert_eq!(
+            response.policy_hash,
+            deterministic_policy_hash(&global_policy)
+        );
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert_eq!(response.version, 1);
+        assert_eq!(response.global_policy_version, 1);
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none(),
+            "global override must not backfill invalid dormant spec state"
+        );
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("provider profile catalog");
+        let effective = current_effective_policy_for_sandbox(
+            state.as_ref(),
+            &catalog,
+            "default",
+            &sandbox,
+            sandbox_id,
+        )
+        .await
+        .expect("effective-policy lookup must bypass invalid local spec");
+        assert_eq!(effective, global_policy);
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .expect("policy history lookup")
+                .is_none(),
+            "effective-policy lookup must not create policy history"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_mcp_version_order_produces_identical_policy_bytes_and_hashes() {
+        let state = test_server_state().await;
+        let forward = mcp_policy_with_versions(&["2025-03-26", "2025-06-18", "2025-11-25"]);
+        let forward =
+            validate_and_canonicalize_policy(forward).expect("forward policy must validate");
+        let reverse = mcp_policy_with_versions(&["2025-11-25", "2025-06-18", "2025-03-26"]);
+        let reverse =
+            validate_and_canonicalize_policy(reverse).expect("reverse policy must validate");
+
+        assert_eq!(forward.encode_to_vec(), reverse.encode_to_vec());
+        assert_eq!(
+            deterministic_policy_hash(&forward),
+            deterministic_policy_hash(&reverse)
+        );
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(mcp_policy_with_versions(&[
+                    "2025-11-25",
+                    "2025-06-18",
+                    "2025-03-26",
+                ])),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("global policy ingress must accept supported versions");
+
+        let persisted = state
+            .store
+            .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+            .await
+            .expect("global policy lookup")
+            .expect("global policy revision");
+        assert_eq!(persisted.policy_payload, forward.encode_to_vec());
+        assert_eq!(persisted.policy_hash, deterministic_policy_hash(&forward));
+    }
+
+    #[tokio::test]
+    async fn global_policy_ingress_persists_defaulted_mcp_versions_identically() {
+        let state = test_server_state().await;
+        let canonical = mcp_policy_with_versions(&["2025-11-25"]);
+        let canonical = validate_and_canonicalize_policy(canonical)
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_payload = canonical.encode_to_vec();
+        let canonical_hash = deterministic_policy_hash(&canonical);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, policy) in cases {
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(policy),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("defaulted global policy ingress must succeed")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let persisted = state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+                .expect("global policy lookup")
+                .expect("global policy revision");
+            assert_eq!(persisted.policy_payload, canonical_payload, "{case}");
+            assert_eq!(persisted.policy_hash, canonical_hash, "{case}");
+
+            let global_settings = load_global_settings(state.store.as_ref())
+                .await
+                .expect("global settings lookup");
+            let stored_policy = decode_policy_from_global_settings(&global_settings)
+                .expect("stored global policy must decode")
+                .expect("stored global policy");
+            assert_eq!(stored_policy, canonical, "{case}");
+            assert_eq!(
+                mcp_versions(&stored_policy),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_global_deduplicates_defaulted_mcp_history() {
+        for (case, legacy_policy) in defaulted_mcp_policy_cases() {
+            let state = test_server_state().await;
+            let canonical = mcp_policy_with_versions(&["2025-11-25"]);
+            let canonical = validate_and_canonicalize_policy(canonical)
+                .expect("explicit default MCP policy must canonicalize");
+            let canonical_hash = deterministic_policy_hash(&canonical);
+
+            state
+                .store
+                .put_policy_revision(
+                    &format!("global-legacy-default-{case}"),
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    "",
+                    1,
+                    &legacy_policy.encode_to_vec(),
+                    "untrusted-legacy-hash",
+                )
+                .await
+                .expect("store legacy global policy revision");
+            state
+                .store
+                .update_policy_status(
+                    GLOBAL_POLICY_SANDBOX_ID,
+                    1,
+                    "loaded",
+                    None,
+                    Some(current_time_ms()),
+                )
+                .await
+                .expect("mark legacy global policy loaded");
+
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    policy: Some(mcp_policy_with_versions(&["2025-11-25"])),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("semantic default must reuse the legacy global revision")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let revisions = state
+                .store
+                .list_policies(GLOBAL_POLICY_SANDBOX_ID, 10, 0)
+                .await
+                .expect("list global policy revisions");
+            assert_eq!(revisions.len(), 1, "{case}");
+            let settings = load_global_settings(state.store.as_ref())
+                .await
+                .expect("load canonical global setting");
+            assert_eq!(
+                decode_policy_from_global_settings(&settings)
+                    .expect("decode canonical global setting")
+                    .expect("global policy setting"),
+                canonical,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_sandbox_deduplicates_defaulted_mcp_history() {
+        let state = test_server_state().await;
+        let canonical = mcp_policy_with_versions(&["2025-11-25"]);
+        let canonical = validate_and_canonicalize_policy(canonical)
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_hash = deterministic_policy_hash(&canonical);
+
+        for (case, legacy_policy) in defaulted_mcp_policy_cases() {
+            let sandbox_id = format!("identity-default-{case}");
+            let sandbox_name = format!("identity-default-{case}");
+            state
+                .store
+                .put_message(&test_sandbox(
+                    &sandbox_id,
+                    &sandbox_name,
+                    canonical.clone(),
+                    Vec::new(),
+                ))
+                .await
+                .expect("store sandbox");
+            state
+                .store
+                .put_policy_revision(
+                    &format!("policy-identity-default-{case}"),
+                    &sandbox_id,
+                    "default",
+                    1,
+                    &legacy_policy.encode_to_vec(),
+                    "untrusted-legacy-hash",
+                )
+                .await
+                .expect("store legacy sandbox policy revision");
+
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox_name.clone(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    policy: Some(mcp_policy_with_versions(&["2025-11-25"])),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("semantic default must reuse the legacy sandbox revision")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let revisions = state
+                .store
+                .list_policies(&sandbox_id, 10, 0)
+                .await
+                .expect("list sandbox policy revisions");
+            assert_eq!(revisions.len(), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_merge_deduplicates_defaulted_mcp_history() {
+        let store = test_store().await;
+        let canonical = validate_and_canonicalize_policy(mcp_policy_with_versions(&["2025-11-25"]))
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_hash = deterministic_policy_hash(&canonical);
+
+        for (case, legacy_policy) in defaulted_mcp_policy_cases() {
+            let sandbox_id = format!("identity-merge-default-{case}");
+            store
+                .put_policy_revision(
+                    &format!("policy-identity-merge-default-{case}"),
+                    &sandbox_id,
+                    "default",
+                    1,
+                    &legacy_policy.encode_to_vec(),
+                    "untrusted-legacy-hash",
+                )
+                .await
+                .expect("store legacy merge base");
+
+            let (version, hash, _) = apply_merge_operations_with_retry(
+                &store,
+                &sandbox_id,
+                "default",
+                None,
+                &[],
+                PolicyMergeValidationContext {
+                    provider_layers: &[],
+                    credential_binding: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("empty merge must reuse the semantic policy revision");
+
+            assert_eq!(version, 1, "{case}");
+            assert_eq!(hash, canonical_hash, "{case}");
+            let revisions = store
+                .list_policies(&sandbox_id, 10, 0)
+                .await
+                .expect("list merge policy revisions");
+            assert_eq!(revisions.len(), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_record_identity_ignores_stale_matching_metadata() {
+        let state = test_server_state().await;
+        let candidate = mcp_policy_with_versions(&["2025-11-25"]);
+        let candidate = validate_and_canonicalize_policy(candidate)
+            .expect("candidate MCP policy must canonicalize");
+        let candidate_hash = deterministic_policy_hash(&candidate);
+        let different = mcp_policy_with_versions(&["2025-06-18"]);
+        let different = validate_and_canonicalize_policy(different)
+            .expect("different MCP policy must canonicalize");
+        let sandbox_id = "identity-stale-metadata";
+        let sandbox_name = "identity-stale-metadata";
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                candidate.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+        state
+            .store
+            .put_policy_revision(
+                "policy-identity-stale-metadata",
+                sandbox_id,
+                "default",
+                1,
+                &different.encode_to_vec(),
+                &candidate_hash,
+            )
+            .await
+            .expect("store policy with stale matching metadata");
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(candidate.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("different payload must create a new revision")
+        .into_inner();
+
+        assert_eq!(response.version, 2);
+        assert_eq!(response.policy_hash, candidate_hash);
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .expect("load latest policy")
+            .expect("new policy revision");
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.policy_payload, candidate.encode_to_vec());
+    }
+
+    #[tokio::test]
+    async fn valid_full_replacement_recovers_from_malformed_payload_with_matching_metadata() {
+        let state = test_server_state().await;
+        let candidate = mcp_policy_with_versions(&["2025-11-25"]);
+        let candidate = validate_and_canonicalize_policy(candidate)
+            .expect("candidate MCP policy must canonicalize");
+        let candidate_hash = deterministic_policy_hash(&candidate);
+        let malformed = mcp_policy_with_versions(&["2025-11-25", "2025-11-25"]);
+        let sandbox_id = "identity-malformed-payload";
+        let sandbox_name = "identity-malformed-payload";
+
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                candidate.clone(),
+                Vec::new(),
+            ))
+            .await
+            .expect("store sandbox");
+        state
+            .store
+            .put_policy_revision(
+                "policy-identity-malformed-payload",
+                sandbox_id,
+                "default",
+                1,
+                &malformed.encode_to_vec(),
+                &candidate_hash,
+            )
+            .await
+            .expect("store malformed policy payload");
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(candidate.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("valid full replacement must repair malformed latest history")
+        .into_inner();
+
+        assert_eq!(response.version, 2);
+        assert_eq!(response.policy_hash, candidate_hash);
+        let revisions = state
+            .store
+            .list_policies(sandbox_id, 10, 0)
+            .await
+            .expect("list sandbox policy revisions");
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].version, 2);
+        assert_eq!(revisions[0].policy_payload, candidate.encode_to_vec());
+        assert_eq!(revisions[0].policy_hash, candidate_hash);
+        assert_eq!(revisions[1].version, 1);
+    }
+
+    #[test]
+    fn provider_credentialed_stamping_matches_host_ports_and_paths() {
+        let mut policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([(
+                "test".to_string(),
+                NetworkPolicyRule {
+                    endpoints: vec![
+                        NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 443,
+                            path: "/mcp/private/**".to_string(),
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 8443,
+                            path: "/mcp/private/**".to_string(),
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "*.api.example.com".to_string(),
+                            port: 443,
+                            path: "/mcp/private/**".to_string(),
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 443,
+                            path: "/mcp/public/**".to_string(),
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let scopes = vec![CredentialedEndpointScope {
+            host: "*.example.com".to_string(),
+            ports: vec![443],
+            path: "/mcp/private/**".to_string(),
+        }];
+
+        clear_provider_credentialed_markers(&mut policy);
+        stamp_provider_credentialed_endpoints(&mut policy, &scopes);
+
+        let endpoints = &policy.network_policies["test"].endpoints;
+        assert!(endpoints[0].provider_credentialed);
+        assert!(!endpoints[1].provider_credentialed);
+        assert!(!endpoints[2].provider_credentialed);
+        assert!(!endpoints[3].provider_credentialed);
+    }
+
+    #[test]
+    fn policy_bindings_add_scopes_only_for_attached_endpointless_providers() {
+        let mut scopes = vec![CredentialedEndpointScope {
+            host: "profile.example.com".to_string(),
+            ports: vec![443],
+            path: "/**".to_string(),
+        }];
+        let bindings = HashMap::from([
+            (
+                "bound".to_string(),
+                vec![
+                    StaticCredentialEndpointBinding {
+                        host: "API.Bound.Example".to_string(),
+                        port: 8443,
+                        path: "/v1".to_string(),
+                    },
+                    StaticCredentialEndpointBinding {
+                        host: "api.bound.example".to_string(),
+                        port: 8443,
+                        path: "/v2".to_string(),
+                    },
+                ],
+            ),
+            (
+                "endpointful".to_string(),
+                vec![StaticCredentialEndpointBinding {
+                    host: "profile-bound.example".to_string(),
+                    port: 443,
+                    path: String::new(),
+                }],
+            ),
+            (
+                "unattached".to_string(),
+                vec![StaticCredentialEndpointBinding {
+                    host: "unattached.example".to_string(),
+                    port: 443,
+                    path: String::new(),
+                }],
+            ),
+        ]);
+
+        extend_credentialed_scopes_from_policy_bindings(
+            &mut scopes,
+            &bindings,
+            &HashSet::from(["bound".to_string()]),
+        );
+
+        assert_eq!(
+            scopes,
+            vec![
+                CredentialedEndpointScope {
+                    host: "profile.example.com".to_string(),
+                    ports: vec![443],
+                    path: "/**".to_string(),
+                },
+                CredentialedEndpointScope {
+                    host: "api.bound.example".to_string(),
+                    ports: vec![8443],
+                    path: "/v1".to_string(),
+                },
+                CredentialedEndpointScope {
+                    host: "api.bound.example".to_string(),
+                    ports: vec![8443],
+                    path: "/v2".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn credentialed_l4_and_tls_skip_require_explicit_opt_in() {
+        let endpoint = |protocol: &str, tls: &str, allow: bool| NetworkEndpoint {
+            host: "api.vendor.example".to_string(),
+            port: 443,
+            protocol: protocol.to_string(),
+            tls: openshell_policy::network_tls_mode_from_str(tls).expect("valid test TLS mode")
+                as i32,
+            provider_credentialed: true,
+            allow_uninspected_credentials: allow,
+            ..Default::default()
+        };
+        let policy = |endpoint| ProtoSandboxPolicy {
+            network_policies: HashMap::from([(
+                "vendor".to_string(),
+                NetworkPolicyRule {
+                    endpoints: vec![endpoint],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert!(
+            validate_uninspected_credentialed_endpoints(&policy(endpoint("", "", false))).is_err()
+        );
+        assert!(
+            validate_uninspected_credentialed_endpoints(&policy(endpoint("rest", "skip", false)))
+                .is_err()
+        );
+        assert!(
+            validate_uninspected_credentialed_endpoints(&policy(endpoint("", "", true))).is_ok()
+        );
+
+        let mut plain = endpoint("", "", false);
+        plain.provider_credentialed = false;
+        assert!(validate_uninspected_credentialed_endpoints(&policy(plain)).is_ok());
+    }
+
+    #[test]
+    fn security_notes_flag_allow_uninspected_credentials() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "api.vendor.example".to_string(),
+                port: 443,
+                allow_uninspected_credentials: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(notes.contains("cannot inspect or rewrite"));
     }
 
     #[test]
@@ -5634,7 +9488,10 @@ mod tests {
     #[test]
     fn sandbox_caller_update_validation_allows_sandbox_policy_sync() {
         let req = UpdateConfigRequest {
-            name: "sandbox-1".to_string(),
+            sandbox: "sandbox-1".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             policy: Some(ProtoSandboxPolicy::default()),
             ..Default::default()
         };
@@ -5655,7 +9512,10 @@ mod tests {
     #[test]
     fn sandbox_caller_update_validation_rejects_setting_mutation() {
         let req = UpdateConfigRequest {
-            name: "sandbox-1".to_string(),
+            sandbox: "sandbox-1".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             setting_key: "inference.model".to_string(),
             setting_value: Some(SettingValue { value: None }),
             ..Default::default()
@@ -5707,12 +9567,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "sandbox-b-id".to_string(),
                 name: "sandbox-b".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "workspace-b".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             ..Sandbox::default()
         };
@@ -5722,12 +9582,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "member-a-id".to_string(),
                 name: "test-user".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             principal_subject: "test-user".to_string(),
             role: WorkspaceRole::User.into(),
@@ -5737,8 +9597,10 @@ mod tests {
         let error = handle_get_sandbox_logs(
             &state,
             with_user(Request::new(GetSandboxLogsRequest {
-                sandbox_id: "sandbox-b-id".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "sandbox-b".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 ..GetSandboxLogsRequest::default()
             })),
         )
@@ -5753,6 +9615,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_sandbox_logs_rejects_invalid_since_time() {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".to_string(),
+                name: "sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox: "sandbox".to_string(),
+                since_time: Some(prost_types::Timestamp {
+                    seconds: 253_402_300_800,
+                    nanos: 0,
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_logs_filters_with_nanosecond_precision() {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".to_string(),
+                name: "sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        for (timestamp, message) in [
+            (
+                prost_types::Timestamp {
+                    seconds: -1,
+                    nanos: 999_999_999,
+                },
+                "pre-epoch",
+            ),
+            (
+                prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 0,
+                },
+                "epoch",
+            ),
+        ] {
+            state.tracing_log_bus.publish_external(SandboxLogLine {
+                sandbox_id: "sandbox-id".to_string(),
+                event_time: Some(timestamp),
+                message: message.to_string(),
+                ..Default::default()
+            });
+        }
+        for (nanos, message) in [(100, "before"), (900, "at-boundary"), (950, "after")] {
+            state.tracing_log_bus.publish_external(SandboxLogLine {
+                sandbox_id: "sandbox-id".to_string(),
+                event_time: Some(prost_types::Timestamp { seconds: 1, nanos }),
+                message: message.to_string(),
+                ..Default::default()
+            });
+        }
+
+        let response = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox: "sandbox".to_string(),
+                since_time: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 900,
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .logs
+                .iter()
+                .map(|log| log.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["at-boundary", "after"]
+        );
+
+        let response = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox: "sandbox".to_string(),
+                since_time: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 0,
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let messages = response
+            .logs
+            .iter()
+            .map(|log| log.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(!messages.contains(&"pre-epoch"));
+        assert!(messages.contains(&"epoch"));
+    }
+
+    #[tokio::test]
+    async fn submit_policy_analysis_rejects_only_chunks_with_invalid_timestamps() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_name = "invalid-policy-chunk-timestamps";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-policy-chunk-timestamps",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let chunk = |name: &str| PolicyChunk {
+            rule_name: name.to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: name.to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: format!("{name}.example.com"),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let invalid = prost_types::Timestamp {
+            seconds: 253_402_300_800,
+            nanos: 0,
+        };
+        let mut invalid_first = chunk("invalid_first");
+        invalid_first.first_seen_time = Some(invalid);
+        let mut invalid_last = chunk("invalid_last");
+        invalid_last.last_seen_time = Some(invalid);
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![invalid_first, invalid_last, chunk("valid_absent")],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 1);
+        assert_eq!(response.rejected_chunks, 2);
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("invalid first_seen_time"))
+        );
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("invalid last_seen_time"))
+        );
+    }
+
+    #[tokio::test]
     async fn update_config_global_requires_platform_admin() {
         use openshell_core::proto::datamodel::v1::ObjectMeta;
         use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
@@ -5763,12 +9828,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "default-admin-member-id".to_string(),
                 name: "test-user".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             principal_subject: "test-user".to_string(),
             role: WorkspaceRole::Admin.into(),
@@ -5778,6 +9843,7 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
+                request_id: String::new(),
                 global: true,
                 setting_key: "log_level".to_string(),
                 delete_setting: true,
@@ -5825,12 +9891,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_policy_requests_reject_workspace_selectors() {
+        let state = test_server_state().await;
+
+        let update_error = handle_update_config(
+            &state,
+            authed_request(UpdateConfigRequest {
+                global: true,
+                sandbox: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(update_error.code(), Code::InvalidArgument);
+
+        let get_error = handle_get_sandbox_policy_status(
+            &state,
+            authed_request(GetSandboxPolicyStatusRequest {
+                global: true,
+                sandbox: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(get_error.code(), Code::InvalidArgument);
+
+        let list_error = handle_list_sandbox_policies(
+            &state,
+            authed_request(ListSandboxPoliciesRequest {
+                global: true,
+                sandbox: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(list_error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn update_config_rejects_missing_principal() {
         let state = test_server_state().await;
 
         let error = handle_update_config(
             &state,
             Request::new(UpdateConfigRequest {
+                request_id: String::new(),
                 global: true,
                 setting_key: "log_level".to_string(),
                 delete_setting: true,
@@ -5857,8 +9974,420 @@ mod tests {
         assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
+    fn l7_scope_target() -> ProtoL7RuleTarget {
+        ProtoL7RuleTarget {
+            rule_name: "selected".to_string(),
+            host: "api.example.com".to_string(),
+            ports: vec![443, 8443],
+            path: Some(String::new()),
+            binaries: vec![
+                NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                },
+                NetworkBinary {
+                    path: "/usr/bin/python3".to_string(),
+                },
+            ],
+            any_binary: false,
+        }
+    }
+
+    fn l7_scope_operation(target: Option<ProtoL7RuleTarget>, deny: bool) -> PolicyMergeOperation {
+        let operation = if deny {
+            policy_merge_operation::Operation::AddDenyRules(ProtoAddDenyRules {
+                target,
+                deny_rules: vec![L7DenyRule {
+                    method: "POST".to_string(),
+                    path: "/admin".to_string(),
+                    ..Default::default()
+                }],
+            })
+        } else {
+            policy_merge_operation::Operation::AddAllowRules(ProtoAddAllowRules {
+                target,
+                rules: vec![L7Rule {
+                    allow: Some(openshell_core::proto::L7Allow {
+                        method: "POST".to_string(),
+                        path: "/admin".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+            })
+        };
+        PolicyMergeOperation {
+            operation: Some(operation),
+        }
+    }
+
+    fn l7_scope_policy() -> ProtoSandboxPolicy {
+        let endpoint = NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            ports: vec![443, 8443],
+            protocol: "rest".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+            ..Default::default()
+        };
+        let selected = NetworkPolicyRule {
+            name: "selected".to_string(),
+            endpoints: vec![
+                endpoint.clone(),
+                NetworkEndpoint {
+                    path: "/v1/**".to_string(),
+                    ..endpoint.clone()
+                },
+            ],
+            binaries: l7_scope_target().binaries,
+        };
+        let sibling = NetworkPolicyRule {
+            name: "sibling".to_string(),
+            endpoints: vec![endpoint],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/wget".to_string(),
+            }],
+        };
+        validate_and_canonicalize_policy(ProtoSandboxPolicy {
+            network_policies: HashMap::from([
+                ("selected".to_string(), selected),
+                ("sibling".to_string(), sibling),
+            ]),
+            ..Default::default()
+        })
+        .expect("L7 scope fixture must be a valid policy")
+    }
+
+    #[test]
+    fn l7_target_scope_ingress_requires_target_and_exclusive_binary_declaration() {
+        for deny in [false, true] {
+            let missing = parse_merge_operations(&[l7_scope_operation(None, deny)]).unwrap_err();
+            assert_eq!(missing.code(), Code::InvalidArgument);
+
+            let mut omitted = l7_scope_target();
+            omitted.binaries.clear();
+            let mut contradictory = l7_scope_target();
+            contradictory.any_binary = true;
+            for target in [omitted, contradictory] {
+                let error = parse_merge_operations(&[l7_scope_operation(Some(target), deny)])
+                    .expect_err("binary scope must be explicit and exclusive");
+                assert_eq!(error.code(), Code::InvalidArgument);
+                assert!(error.message().contains("exactly one"));
+            }
+
+            let mut any = l7_scope_target();
+            any.any_binary = true;
+            any.binaries.clear();
+            let operations =
+                parse_merge_operations(&[l7_scope_operation(Some(any), deny)]).unwrap();
+            let (PolicyMergeOp::AddAllowRules { target, .. }
+            | PolicyMergeOp::AddDenyRules { target, .. }) = &operations[0]
+            else {
+                panic!("L7 operation expected");
+            };
+            assert_eq!(target.binaries, L7BinaryScope::Any);
+            assert_eq!(target.path.as_deref(), Some(""));
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_ingress_rejects_malformed_targets() {
+        let mut invalid_targets = Vec::new();
+        let mut target = l7_scope_target();
+        target.rule_name.clear();
+        invalid_targets.push(target);
+        let mut target = l7_scope_target();
+        target.rule_name = "_provider_example".to_string();
+        invalid_targets.push(target);
+        let mut target = l7_scope_target();
+        target.host = "https://api.example.com".to_string();
+        invalid_targets.push(target);
+        for ports in [vec![], vec![0], vec![65536]] {
+            let mut target = l7_scope_target();
+            target.ports = ports;
+            invalid_targets.push(target);
+        }
+        let mut target = l7_scope_target();
+        target.binaries[0].path.clear();
+        invalid_targets.push(target);
+
+        for target in invalid_targets {
+            for deny in [false, true] {
+                let error =
+                    parse_merge_operations(&[l7_scope_operation(Some(target.clone()), deny)])
+                        .expect_err("malformed L7 target must fail at request ingress");
+                assert_eq!(error.code(), Code::InvalidArgument, "{target:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn l7_target_scope_ingress_preserves_existing_payload_guards() {
+        for operation in [
+            policy_merge_operation::Operation::AddAllowRules(ProtoAddAllowRules {
+                target: Some(l7_scope_target()),
+                rules: vec![],
+            }),
+            policy_merge_operation::Operation::AddDenyRules(ProtoAddDenyRules {
+                target: Some(l7_scope_target()),
+                deny_rules: vec![],
+            }),
+            policy_merge_operation::Operation::AddAllowRules(ProtoAddAllowRules {
+                target: Some(l7_scope_target()),
+                rules: vec![L7Rule { allow: None }],
+            }),
+        ] {
+            let error = parse_merge_operations(&[PolicyMergeOperation {
+                operation: Some(operation),
+            }])
+            .expect_err("target presence does not make an empty payload valid");
+            assert_eq!(error.code(), Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn l7_target_scope_update_config_rejects_batch_without_persistence() {
+        let state = test_server_state().await;
+        let policy = l7_scope_policy();
+        let sandbox_id = "l7-scope-rejected";
+        let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy.clone(), Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations =
+            HashMap::from([("example.com/owner".to_string(), "original".to_string())]);
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "l7-scope-seed",
+                sandbox_id,
+                "default",
+                1,
+                &policy.encode_to_vec(),
+                &deterministic_policy_hash(&policy),
+            )
+            .await
+            .unwrap();
+        let before = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_revision = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut missing_binary = l7_scope_target();
+        missing_binary.binaries.pop();
+        let mut missing_port = l7_scope_target();
+        missing_port.ports = vec![443];
+        let mut ambiguous = l7_scope_target();
+        ambiguous.path = None;
+        let mut missing_rule = l7_scope_target();
+        missing_rule.rule_name = "absent".to_string();
+        let mut wrong_any = l7_scope_target();
+        wrong_any.binaries.clear();
+        wrong_any.any_binary = true;
+        let cases = [
+            (None, Code::InvalidArgument, "target"),
+            (
+                Some(missing_binary),
+                Code::FailedPrecondition,
+                "/usr/bin/python3",
+            ),
+            (Some(missing_port), Code::FailedPrecondition, "8443"),
+            (Some(ambiguous), Code::FailedPrecondition, "/v1/**"),
+            (Some(missing_rule), Code::NotFound, "absent"),
+            (Some(wrong_any), Code::FailedPrecondition, "/usr/bin/curl"),
+        ];
+
+        for (target, code, detail) in cases {
+            for deny in [false, true] {
+                // The first operation is valid and changes the private candidate.
+                // A failure in the second must roll back policy and metadata together.
+                let error = handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: sandbox_id.to_string(),
+                        merge_operations: vec![
+                            l7_scope_operation(Some(l7_scope_target()), false),
+                            l7_scope_operation(target.clone(), deny),
+                        ],
+                        expected_resource_version: before
+                            .metadata
+                            .as_ref()
+                            .unwrap()
+                            .resource_version,
+                        annotations: HashMap::from([(
+                            "example.com/change".to_string(),
+                            "rejected".to_string(),
+                        )]),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .expect_err("incomplete or ambiguous target must reject the batch");
+                assert_eq!(error.code(), code, "{detail}, deny={deny}: {error}");
+                assert!(error.message().contains(detail), "{error}");
+                let after = state
+                    .store
+                    .get_message_by_name::<Sandbox>("default", sandbox_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    after, before,
+                    "rejected batch must preserve all sandbox metadata and spec"
+                );
+                let revision = state
+                    .store
+                    .get_latest_policy(sandbox_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(revision.version, before_revision.version);
+                assert_eq!(revision.policy_hash, before_revision.policy_hash);
+                assert_eq!(revision.policy_payload, before_revision.policy_payload);
+                assert_eq!(
+                    state
+                        .store
+                        .list_policies(sandbox_id, 10, 0)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn l7_target_scope_update_config_changes_only_selected_endpoint() {
+        for deny in [false, true] {
+            let state = test_server_state().await;
+            let policy = l7_scope_policy();
+            let sandbox_id = "l7-scope-selected";
+            state
+                .store
+                .put_message(&test_sandbox(
+                    sandbox_id,
+                    sandbox_id,
+                    policy.clone(),
+                    Vec::new(),
+                ))
+                .await
+                .unwrap();
+            let initial_hash = deterministic_policy_hash(&policy);
+            state
+                .store
+                .put_policy_revision(
+                    "l7-scope-seed",
+                    sandbox_id,
+                    "default",
+                    1,
+                    &policy.encode_to_vec(),
+                    &initial_hash,
+                )
+                .await
+                .unwrap();
+            let before = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut target = l7_scope_target();
+            target.host = "API.EXAMPLE.COM".to_string();
+            target.ports = vec![8443, 443, 8443];
+            target.binaries.reverse();
+            target.binaries.push(target.binaries[0].clone());
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox_id.to_string(),
+                    merge_operations: vec![l7_scope_operation(Some(target), deny)],
+                    expected_resource_version: before.metadata.as_ref().unwrap().resource_version,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("complete explicit scope must resolve the selected endpoint")
+            .into_inner();
+            assert_eq!(response.version, 2);
+            assert_ne!(response.policy_hash, initial_hash);
+            let revision = state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let after = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
+            assert_eq!(
+                after.network_policies["sibling"],
+                policy.network_policies["sibling"]
+            );
+            let before_rule = &policy.network_policies["selected"];
+            let after_rule = &after.network_policies["selected"];
+            assert_eq!(after_rule.binaries, before_rule.binaries);
+            assert_eq!(after_rule.endpoints.len(), before_rule.endpoints.len());
+            assert_eq!(
+                after_rule
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| !endpoint.path.is_empty()),
+                before_rule
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| !endpoint.path.is_empty()),
+            );
+            let endpoint = after_rule
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.path.is_empty())
+                .unwrap();
+            if deny {
+                assert!(
+                    endpoint
+                        .deny_rules
+                        .iter()
+                        .any(|rule| rule.method == "POST" && rule.path == "/admin")
+                );
+            } else {
+                assert!(endpoint.rules.iter().any(|rule| {
+                    rule.allow
+                        .as_ref()
+                        .is_some_and(|allow| allow.method == "POST" && allow.path == "/admin")
+                }));
+            }
+            assert_eq!(
+                state
+                    .store
+                    .list_policies(sandbox_id, 10, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(revision.policy_hash, response.policy_hash);
+            assert_eq!(revision.policy_hash, deterministic_policy_hash(&after));
+        }
+    }
+
     #[test]
     fn policy_merge_error_mapping_distinguishes_request_shape_from_state_conflicts() {
+        let invalid_operation =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidOperationPolicy {
+                operation_index: 0,
+                violations: Vec::new(),
+            });
+        assert_eq!(invalid_operation.code(), Code::InvalidArgument);
+
         let empty =
             map_policy_merge_error(openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints {
                 operation_index: 0,
@@ -5903,18 +10432,53 @@ mod tests {
         // detail must survive into the status message.
         assert!(existing_scope.message().contains("/usr/bin/other"));
 
-        // Both of these describe a well-formed request the current policy state
-        // forbids, so they are preconditions rather than argument errors.
-        let ambiguous =
-            map_policy_merge_error(openshell_policy::PolicyMergeError::AmbiguousEndpointRule {
+        let invalid_target =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidL7Target {
+                operation_index: 0,
+                reason: "ports are required".to_string(),
+            });
+        assert_eq!(invalid_target.code(), Code::InvalidArgument);
+
+        let missing =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::L7TargetNotFound {
+                rule_name: "missing".to_string(),
                 host: "api.example.com".to_string(),
-                port: 443,
-                targets: vec!["broad".to_string(), "narrow".to_string()],
+                ports: vec![443],
+                path: None,
+            });
+        assert_eq!(missing.code(), Code::NotFound);
+
+        // Ambiguous or incomplete declarations describe a well-formed request
+        // the current policy forbids, so they are preconditions.
+        let ambiguous =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::AmbiguousL7Target {
+                rule_name: "selected".to_string(),
+                host: "api.example.com".to_string(),
+                ports: vec![443],
+                paths: vec!["/v1/**".to_string(), "/v2/**".to_string()],
             });
         assert_eq!(ambiguous.code(), Code::FailedPrecondition);
-        // The operator has to know which rules collide to pick a way forward.
-        assert!(ambiguous.message().contains("broad"));
-        assert!(ambiguous.message().contains("narrow"));
+        assert!(ambiguous.message().contains("/v1/**"));
+        assert!(ambiguous.message().contains("/v2/**"));
+
+        let binary_scope =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::L7BinaryScopeMismatch {
+                rule_name: "selected".to_string(),
+                expected: vec!["/usr/bin/curl".to_string(), "/usr/bin/python3".to_string()],
+                declared: vec!["/usr/bin/curl".to_string()],
+            });
+        assert_eq!(binary_scope.code(), Code::FailedPrecondition);
+        assert!(binary_scope.message().contains("/usr/bin/python3"));
+
+        let port_scope =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::L7PortScopeMismatch {
+                rule_name: "selected".to_string(),
+                host: "api.example.com".to_string(),
+                expected: vec![443, 8443],
+                declared: vec![443],
+            });
+        assert_eq!(port_scope.code(), Code::FailedPrecondition);
+        assert!(port_scope.message().contains("8443"));
 
         let undeclared_port = map_policy_merge_error(
             openshell_policy::PolicyMergeError::UndeclaredPortWouldChange {
@@ -5952,6 +10516,18 @@ mod tests {
         );
         assert_eq!(any_binary.code(), Code::FailedPrecondition);
         assert!(any_binary.message().contains("/usr/bin/untrusted"));
+
+        let invalid_input =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidInputPolicy {
+                violations: Vec::new(),
+            });
+        assert_eq!(invalid_input.code(), Code::FailedPrecondition);
+
+        let invalid_merged =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::InvalidMergedPolicy {
+                violations: Vec::new(),
+            });
+        assert_eq!(invalid_merged.code(), Code::Internal);
     }
 
     // ---- Sandbox IDOR guard (issue #1354) ----
@@ -5967,12 +10543,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -5985,7 +10561,8 @@ mod tests {
         }
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-b".to_string(),
+                name: "sb-b".to_string(),
+                workspace_scope: None,
             }),
             "sb-a",
         );
@@ -5996,6 +10573,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_sandbox_get_sandbox_config_matches_foreign_sandbox_denial() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                name: "missing-sandbox".to_string(),
+                workspace_scope: None,
+            }),
+            "sb-a",
+        );
+
+        let err = handle_get_sandbox_config(&state, req)
+            .await
+            .expect_err("missing sandbox must not be distinguishable from a foreign sandbox");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), "sandbox not found or not owned by caller");
+    }
+
+    #[tokio::test]
     async fn same_sandbox_get_sandbox_config_allowed() {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
@@ -6003,12 +10598,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-self".to_string(),
                 name: "self".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -6020,13 +10615,35 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-self".to_string(),
+                name: "self".to_string(),
+                workspace_scope: None,
             }),
             "sb-self",
         );
         handle_get_sandbox_config(&state, req)
             .await
             .expect("matching principal must be allowed");
+    }
+
+    #[tokio::test]
+    async fn sandbox_get_sandbox_config_rejects_all_workspaces_selector() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                name: "self".to_string(),
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+            }),
+            "sb-self",
+        );
+
+        let err = handle_get_sandbox_config(&state, req)
+            .await
+            .expect_err("single-sandbox bootstrap must reject all_workspaces");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "all_workspaces is not supported by this request"
+        );
     }
 
     #[tokio::test]
@@ -6038,12 +10655,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -6056,6 +10673,7 @@ mod tests {
         }
         let req = with_sandbox(
             Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: "sandbox-b".to_string(),
                 ..Default::default()
             }),
@@ -6076,12 +10694,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -6094,9 +10712,11 @@ mod tests {
         }
         let req = with_sandbox(
             Request::new(GetDraftPolicyRequest {
-                name: "sandbox-b".to_string(),
+                sandbox: "sandbox-b".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             }),
             "sb-a",
         );
@@ -6107,11 +10727,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_update_config_missing_name_returns_permission_denied() {
+    async fn sandbox_update_config_missing_name_matches_foreign_sandbox_denial() {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(UpdateConfigRequest {
-                name: "missing-sandbox".to_string(),
+                sandbox: "missing-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(ProtoSandboxPolicy::default()),
                 ..Default::default()
             }),
@@ -6129,6 +10752,7 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: "missing-sandbox".to_string(),
                 ..Default::default()
             }),
@@ -6142,13 +10766,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_get_draft_policy_missing_name_returns_permission_denied() {
+    async fn sandbox_get_draft_policy_missing_name_matches_foreign_sandbox_denial() {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(GetDraftPolicyRequest {
-                name: "missing-sandbox".to_string(),
+                sandbox: "missing-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             }),
             "sb-a",
         );
@@ -6168,12 +10794,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-x".to_string(),
                 name: "x".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -6184,7 +10810,10 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_user(Request::new(GetSandboxConfigRequest {
-            sandbox_id: "sb-x".to_string(),
+            name: "x".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
         }));
         handle_get_sandbox_config(&state, req)
             .await
@@ -6251,12 +10880,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-no-policy".to_string(),
                 name: "no-policy-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -6280,18 +10909,18 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
                 .collect(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
@@ -6351,8 +10980,7 @@ mod tests {
         let mut policy = test_policy_with_rule("aws", host);
         let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
         endpoint.protocol = "rest".to_string();
-        endpoint.tls = "terminate".to_string();
-        endpoint.access = "full".to_string();
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         endpoint.credential_signing = "sigv4".to_string();
         endpoint.signing_service = "s3".to_string();
         endpoint.credential_binding =
@@ -6364,13 +10992,14 @@ mod tests {
 
     fn test_ambiguous_policy() -> ProtoSandboxPolicy {
         let mut left = test_policy_with_rule("left", "api.example.com");
-        left.network_policies.get_mut("left").unwrap().endpoints[0].tls = "skip".to_string();
+        left.network_policies.get_mut("left").unwrap().endpoints[0].tls =
+            openshell_core::proto::NetworkTlsMode::Skip as i32;
         let right = test_policy_with_rule("right", "api.example.com");
         left.network_policies.extend(right.network_policies);
         left
     }
 
-    fn test_sandbox(
+    pub(super) fn test_sandbox(
         id: &str,
         name: &str,
         policy: ProtoSandboxPolicy,
@@ -6382,12 +11011,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(policy),
@@ -6400,26 +11029,20 @@ mod tests {
         sandbox
     }
 
-    async fn enable_providers_v2(state: &Arc<ServerState>) {
-        let global_settings = StoredSettings {
-            revision: 1,
-            settings: std::iter::once((
-                settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                StoredSettingValue::Bool(true),
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        save_global_settings(state.store.as_ref(), &global_settings)
-            .await
-            .unwrap();
-    }
-
     async fn get_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str) -> ProtoSandboxPolicy {
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .expect("sandbox lookup")
+            .expect("sandbox exists");
         handle_get_sandbox_config(
             state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
+                name: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (sandbox.object_workspace()).to_string(),
+                )),
             })),
         )
         .await
@@ -6461,6 +11084,8 @@ mod tests {
                 endpoints: vec![NetworkEndpoint {
                     host: host.to_string(),
                     port: 443,
+                    protocol: "rest".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -6510,7 +11135,6 @@ mod tests {
             Arc::clone(&fetch_count),
         );
         let state = Arc::new(state);
-        enable_providers_v2(&state).await;
 
         let mut provider_a = test_provider("provider-a", "moving-a");
         provider_a.credentials = HashMap::from([("TOKEN_A".to_string(), "a".to_string())]);
@@ -6532,7 +11156,10 @@ mod tests {
         let first = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-snapshot-consistency".to_string(),
+                name: "snapshot-consistency".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -6554,7 +11181,10 @@ mod tests {
         let second = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-snapshot-consistency".to_string(),
+                name: "snapshot-consistency".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -6600,6 +11230,7 @@ mod tests {
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: "snapshot-consistency".to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6613,7 +11244,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -6650,16 +11280,16 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-generic".to_string(),
                     name: "generic".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
@@ -6694,7 +11324,48 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
+    async fn provider_policy_layers_prefer_exact_imported_alias_profile() {
+        let store = test_store().await;
+        store
+            .put_message(&test_provider("enterprise-github", "gh"))
+            .await
+            .unwrap();
+        store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-gh".to_string(),
+                    name: "gh".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: "gh".to_string(),
+                    display_name: "Enterprise GitHub".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "github.enterprise.example".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let layers =
+            profile_provider_policy_layers(&store, "default", &["enterprise-github".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule.endpoints.len(), 1);
+        assert_eq!(
+            layers[0].rule.endpoints[0].host,
+            "github.enterprise.example"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_policy_layers_include_custom_provider_profiles() {
         let store = test_store().await;
         store
@@ -6702,16 +11373,16 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -6739,7 +11410,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/custom".to_string(),
-                        harness: true,
                     }],
                     inference_capable: false,
                     discovery: None,
@@ -6763,7 +11433,7 @@ mod tests {
         assert_eq!(layers[0].rule.endpoints[0].allowed_ips, vec!["10.0.0.0/24"]);
         assert!(layers[0].rule.endpoints[0].allow_encoded_slash);
         assert_eq!(layers[0].rule.endpoints[0].path, "/v1");
-        assert!(layers[0].rule.binaries[0].harness);
+        assert_eq!(layers[0].rule.binaries[0].path, "/usr/bin/custom");
     }
 
     #[tokio::test]
@@ -6774,16 +11444,16 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_message(&openshell_core::proto::StoredProviderProfile {
+            .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -6838,6 +11508,13 @@ mod tests {
                 .rule
                 .endpoints
                 .iter()
+                .all(|endpoint| endpoint.provider_credentialed)
+        );
+        assert!(
+            layers[0]
+                .rule
+                .endpoints
+                .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
         );
         assert!(
@@ -6845,7 +11522,8 @@ mod tests {
                 endpoint.host == "api.github.com"
                     && endpoint.protocol == "graphql"
                     && endpoint.path == "/graphql"
-                    && endpoint.access == "read-only"
+                    && endpoint.access
+                        == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
             }),
             "github provider policy should include read-only GraphQL endpoint"
         );
@@ -6854,9 +11532,9 @@ mod tests {
                 // API endpoints stay read-only; the github.com git transport
                 // carries explicit rules so clone/fetch works (see #1769).
                 if endpoint.host == "github.com" {
-                    endpoint.access.is_empty()
+                    endpoint.access == 0
                 } else {
-                    endpoint.access == "read-only"
+                    endpoint.access == openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
                 }
             }),
             "github API endpoints should be read-only; git transport uses explicit rules"
@@ -6903,32 +11581,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_policy_layers_skip_public_vendor_endpoints_for_alternate_upstreams() {
+        let store = test_store().await;
+        let mut openai = test_provider("alternate-openai", "openai");
+        openai.config.insert(
+            "OPENAI_BASE_URL".to_string(),
+            "https://api.example.com/v1".to_string(),
+        );
+        let mut anthropic = test_provider("alternate-anthropic", "anthropic");
+        anthropic.config.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.example.com/v1".to_string(),
+        );
+        store.put_message(&openai).await.unwrap();
+        store.put_message(&anthropic).await.unwrap();
+
+        let layers = profile_provider_policy_layers(
+            &store,
+            "default",
+            &[
+                "alternate-openai".to_string(),
+                "alternate-anthropic".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
     async fn provider_policy_layers_respect_profile_workspace_scope() {
         let store = test_store().await;
 
-        let make_stored_profile =
-            |id: &str, workspace: &str, host: &str| openshell_core::proto::StoredProviderProfile {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("profile-{id}-{workspace}"),
-                    name: id.to_string(),
-                    created_at_ms: 1_000_000,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                profile: Some(openshell_core::proto::ProviderProfile {
-                    id: id.to_string(),
-                    display_name: format!("{host} profile"),
-                    endpoints: vec![NetworkEndpoint {
-                        host: host.to_string(),
-                        port: 443,
-                        ..Default::default()
-                    }],
+        let make_stored_profile = |id: &str, workspace: &str, host: &str| StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("profile-{id}-{workspace}"),
+                name: id.to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: workspace.to_string(),
+                deletion_time: None,
+            }),
+            profile: Some(openshell_core::proto::ProviderProfile {
+                id: id.to_string(),
+                display_name: format!("{host} profile"),
+                endpoints: vec![NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
                     ..Default::default()
-                }),
-            };
+                }],
+                ..Default::default()
+            }),
+        };
 
         store
             .put_message(&make_stored_profile(
@@ -6975,65 +11682,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn providers_v2_enabled_defaults_false_when_unset() {
-        assert!(
-            !bool_setting_enabled(
-                &StoredSettings::default(),
-                settings::PROVIDERS_V2_ENABLED_KEY
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn providers_v2_enabled_reads_global_bool_setting() {
-        let mut settings = StoredSettings::default();
-        settings.settings.insert(
-            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-            StoredSettingValue::Bool(true),
-        );
-
-        assert!(bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
-    }
-
     #[tokio::test]
-    async fn sandbox_config_omits_provider_layers_when_v2_disabled() {
+    async fn sandbox_config_always_composes_provider_layers() {
         let state = test_server_state().await;
-        state
-            .store
-            .put_message(&test_provider("work-github", "github"))
-            .await
-            .unwrap();
-        state
-            .store
-            .put_message(&test_sandbox(
-                "sb-v2-disabled",
-                "v2-disabled",
-                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
-                vec!["work-github".to_string()],
-            ))
-            .await
-            .unwrap();
-
-        let effective_policy = get_sandbox_policy(&state, "sb-v2-disabled").await;
-
-        assert!(
-            effective_policy
-                .network_policies
-                .contains_key("sandbox_only")
-        );
-        assert!(
-            !effective_policy
-                .network_policies
-                .contains_key("_provider_work_github")
-        );
-    }
-
-    #[tokio::test]
-    async fn sandbox_config_composes_provider_layers_when_v2_enabled() {
-        let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -7073,6 +11724,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-mcp-default".to_string(),
+                    name: "mcp-default".to_string(),
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_time: None,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "mcp-default".to_string(),
+                    display_name: "MCP default".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "mcp.example.com".to_string(),
+                        port: 443,
+                        protocol: "mcp".to_string(),
+                        mcp: None,
+                        rules: vec![L7Rule {
+                            allow: Some(openshell_core::proto::L7Allow {
+                                method: "tools/list".to_string(),
+                                ..Default::default()
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .expect("store versionless MCP provider profile");
+        state
+            .store
+            .put_message(&test_provider("work-mcp-default", "mcp-default"))
+            .await
+            .expect("store MCP provider");
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-mcp-default-composed",
+                "mcp-default-composed",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-mcp-default".to_string()],
+            ))
+            .await
+            .expect("store MCP sandbox");
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                name: "mcp-default-composed".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            })),
+        )
+        .await
+        .expect("provider-composed MCP policy must materialize")
+        .into_inner();
+        let effective_policy = response.policy.expect("effective composed policy");
+        let endpoint = effective_policy
+            .network_policies
+            .values()
+            .flat_map(|rule| &rule.endpoints)
+            .find(|endpoint| endpoint.host == "mcp.example.com")
+            .expect("composed MCP endpoint");
+
+        assert_eq!(
+            endpoint
+                .mcp
+                .as_ref()
+                .expect("canonical MCP options")
+                .versions,
+            ["2025-11-25".to_string()]
+        );
+        assert_eq!(
+            response.policy_hash,
+            deterministic_policy_hash(&effective_policy)
+        );
+    }
+
     #[test]
     fn candidate_effective_policy_rejects_provider_endpoint_ambiguity() {
         let base = test_policy_with_rule("base", "api.example.com");
@@ -7080,7 +11821,7 @@ mod tests {
             .network_policies
             .remove("provider")
             .unwrap();
-        provider_rule.endpoints[0].tls = "skip".to_string();
+        provider_rule.endpoints[0].tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
         let layers = [ProviderPolicyLayer {
             rule_name: "_provider_test".to_string(),
             rule: provider_rule,
@@ -7108,8 +11849,10 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "ambiguous-update".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "ambiguous-update".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_ambiguous_policy()),
                 ..Default::default()
             })),
@@ -7145,8 +11888,10 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "unattached-binding".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "unattached-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_policy_with_credential_binding(
                     "cloud",
                     "api.cloud.example",
@@ -7190,8 +11935,10 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "double-binding".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "double-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_policy_with_credential_binding(
                     "cloud",
                     "api.cloud.example",
@@ -7205,6 +11952,170 @@ mod tests {
 
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("already defines endpoints"));
+    }
+
+    #[tokio::test]
+    async fn update_config_gates_uninspected_endpointless_credential_binding() {
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-endpointless-gating".to_string(),
+                    name: "endpointless-gating".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "endpointless-gating".to_string(),
+                    display_name: "Endpointless Gating".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: Vec::new(),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-endpointless", "endpointless-gating"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-endpointless-gating",
+            "endpointless-gating",
+            ProtoSandboxPolicy::default(),
+            vec!["work-endpointless".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let l4 =
+            test_policy_with_credential_binding("bound", "api.bound.example", "work-endpointless");
+        let add_bound_rule = |policy: &ProtoSandboxPolicy| PolicyMergeOperation {
+            operation: Some(policy_merge_operation::Operation::AddRule(
+                openshell_core::proto::AddNetworkRule {
+                    rule_name: "bound".to_string(),
+                    rule: Some(policy.network_policies["bound"].clone()),
+                },
+            )),
+        };
+        let l4_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "endpointless-gating".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(l4.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("L4-only credential binding must be rejected");
+        assert_eq!(l4_error.code(), Code::FailedPrecondition);
+        assert!(l4_error.message().contains("L4-only"));
+
+        let mut tls_skip = l4.clone();
+        let tls_endpoint = &mut tls_skip
+            .network_policies
+            .get_mut("bound")
+            .unwrap()
+            .endpoints[0];
+        tls_endpoint.protocol = "rest".to_string();
+        tls_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
+        tls_endpoint.tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
+        let tls_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "endpointless-gating".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(tls_skip.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("tls: skip credential binding must be rejected");
+        assert_eq!(tls_error.code(), Code::FailedPrecondition);
+        assert!(tls_error.message().contains("tls: skip"));
+
+        let merge_l4_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "endpointless-gating".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                merge_operations: vec![add_bound_rule(&l4)],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("L4-only credential binding merge must be rejected");
+        assert_eq!(merge_l4_error.code(), Code::FailedPrecondition);
+        assert!(merge_l4_error.message().contains("L4-only"));
+
+        let merge_tls_error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "endpointless-gating".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                merge_operations: vec![add_bound_rule(&tls_skip)],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("tls: skip credential binding merge must be rejected");
+        assert_eq!(merge_tls_error.code(), Code::FailedPrecondition);
+        assert!(merge_tls_error.message().contains("tls: skip"));
+
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-endpointless-gating")
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected policies must not leave a revision in history"
+        );
+
+        let mut opted_in = l4;
+        opted_in
+            .network_policies
+            .get_mut("bound")
+            .unwrap()
+            .endpoints[0]
+            .allow_uninspected_credentials = true;
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "endpointless-gating".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                merge_operations: vec![add_bound_rule(&opted_in)],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("explicit opt-in must admit the endpointless credential binding merge");
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-endpointless-gating")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[tokio::test]
@@ -7222,8 +12133,10 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "signing-no-source".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "signing-no-source".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_sigv4_policy("s3.amazonaws.com", None)),
                 ..Default::default()
             })),
@@ -7268,8 +12181,10 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "signing-unbound-aws".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "signing-unbound-aws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_sigv4_policy("s3.amazonaws.com", None)),
                 ..Default::default()
             })),
@@ -7305,8 +12220,10 @@ mod tests {
         handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "signing-bound-aws".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "signing-bound-aws".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_sigv4_policy("s3.amazonaws.com", Some("aws-prod"))),
                 ..Default::default()
             })),
@@ -7341,12 +12258,19 @@ mod tests {
         sandbox.spec.as_mut().unwrap().policy = None;
         state.store.put_message(&sandbox).await.unwrap();
 
+        let mut policy = test_sigv4_policy("bucket.s3.amazonaws.com", None);
+        let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::ReadWrite as i32;
+        endpoint.enforcement = openshell_core::proto::NetworkEnforcementMode::Enforce as i32;
+
         handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "signing-profile-endpoint".to_string(),
-                workspace: "default".to_string(),
-                policy: Some(test_sigv4_policy("bucket.s3.amazonaws.com", None)),
+                sandbox: "signing-profile-endpoint".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(policy),
                 ..Default::default()
             })),
         )
@@ -7374,8 +12298,10 @@ mod tests {
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "signing-profile-mismatch".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "signing-profile-mismatch".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_sigv4_policy("api.example.com", None)),
                 ..Default::default()
             })),
@@ -7415,6 +12341,7 @@ mod tests {
                 credential_binding: None,
             },
             None,
+            None,
         )
         .await
         .expect_err("ambiguous merge must fail before persistence");
@@ -7432,24 +12359,21 @@ mod tests {
 
     #[tokio::test]
     async fn provider_attachment_preflight_rejects_composed_ambiguity() {
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&StoredProviderProfile {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-ambiguous".to_string(),
                     name: "ambiguous".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "ambiguous".to_string(),
@@ -7458,7 +12382,7 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
                         port: 443,
-                        tls: "skip".to_string(),
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -7482,10 +12406,13 @@ mod tests {
         let error = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
             authed_request(openshell_core::proto::AttachSandboxProviderRequest {
-                sandbox_name: "provider-ambiguity".to_string(),
-                provider_name: "candidate-provider".to_string(),
+                request_id: String::new(),
+                sandbox: "provider-ambiguity".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "candidate-provider".to_string(),
                 expected_resource_version: 0,
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -7506,22 +12433,21 @@ mod tests {
     async fn sandbox_config_rejects_invalid_provider_composed_policy() {
         use openshell_core::proto::{
             MiddlewareEndpointSelector, NetworkMiddlewareConfig, ProviderProfile,
-            ProviderProfileCategory, StoredProviderProfile,
+            ProviderProfileCategory,
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
 
         let profile = StoredProviderProfile {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "profile-tls-skip".to_string(),
                 name: "tls-skip".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(ProviderProfile {
                 id: "tls-skip".to_string(),
@@ -7530,7 +12456,7 @@ mod tests {
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".to_string(),
                     port: 443,
-                    tls: "skip".to_string(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -7572,7 +12498,10 @@ mod tests {
         let error = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-invalid-composed-policy".to_string(),
+                name: "invalid-composed-policy".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -7584,9 +12513,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_config_skips_profileless_provider_types_when_v2_enabled() {
+    async fn sandbox_config_skips_profileless_provider_types() {
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("legacy-generic", "generic"))
@@ -7621,7 +12549,6 @@ mod tests {
     #[tokio::test]
     async fn sandbox_config_composition_is_jit_and_does_not_persist_provider_layers() {
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -7670,7 +12597,7 @@ mod tests {
         use crate::grpc::provider::handle_update_provider_profiles;
         use openshell_core::proto::{
             ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem,
-            StoredProviderProfile, UpdateProviderProfilesRequest,
+            UpdateProviderProfilesRequest,
         };
 
         fn stored_profile(host: &str) -> StoredProviderProfile {
@@ -7678,12 +12605,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-policy".to_string(),
                     name: "custom-policy".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-policy".to_string(),
@@ -7708,7 +12635,6 @@ mod tests {
         }
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&stored_profile("api.before.example"))
@@ -7749,13 +12675,16 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(updated_profile),
                     source: "custom-policy.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
                 id: "custom-policy".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -7811,18 +12740,25 @@ mod tests {
     #[tokio::test]
     async fn sandbox_config_composes_user_and_provider_rules() {
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
             .await
             .unwrap();
+        let mut policy = test_policy_with_rule("custom_github", "api.github.com");
+        let endpoint = &mut policy
+            .network_policies
+            .get_mut("custom_github")
+            .expect("custom rule")
+            .endpoints[0];
+        endpoint.protocol = "rest".to_string();
+        endpoint.access = openshell_core::proto::NetworkAccessPreset::ReadOnly as i32;
         state
             .store
             .put_message(&test_sandbox(
                 "sb-overlap",
                 "overlap",
-                test_policy_with_rule("custom_github", "api.github.com"),
+                policy,
                 vec!["work-github".to_string()],
             ))
             .await
@@ -7852,7 +12788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_environment_resolution_is_unchanged_by_providers_v2_setting() {
+    async fn provider_environment_resolution_is_stable_across_policy_composition() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
 
         let state = test_server_state().await;
@@ -7884,7 +12820,6 @@ mod tests {
         .into_inner()
         .environment;
 
-        enable_providers_v2(&state).await;
         let v2_env = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
@@ -7899,6 +12834,63 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_readiness_snapshot_uses_baseline_static_binding_contract() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-static-ready",
+            "static-ready",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        let attachment_epoch = uuid::Uuid::new_v4().to_string();
+        sandbox.spec.as_mut().unwrap().provider_attachment_epoch = attachment_epoch.clone();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Static binding support is sufficient to install this snapshot. The
+        // environment and policy must describe the same attachment authority.
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-static-ready".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let config = load_sandbox_config(&state, &sandbox).await.unwrap();
+
+        assert_eq!(
+            response.readiness_reason,
+            ProviderReadinessReason::Unspecified as i32
+        );
+        assert_eq!(response.provider_attachment_epoch, attachment_epoch);
+        assert_eq!(
+            response.provider_attachment_epoch,
+            config.provider_attachment_epoch
+        );
+        assert_eq!(response.provider_env_revision, config.provider_env_revision);
+        assert_eq!(response.policy_hash, config.policy_hash);
+        assert!(response.environment.contains_key("GITHUB_TOKEN"));
+        assert!(
+            response
+                .static_credential_bindings
+                .contains_key("GITHUB_TOKEN")
+        );
+        assert!(
+            !response
+                .non_secret_environment_keys
+                .iter()
+                .any(|key| key == "GITHUB_TOKEN")
+        );
     }
 
     #[tokio::test]
@@ -7935,6 +12927,68 @@ mod tests {
 
         assert!(!response.environment.contains_key("GITHUB_TOKEN"));
         assert!(response.static_credential_bindings.is_empty());
+        assert_eq!(
+            response.readiness_reason,
+            ProviderReadinessReason::UnsupportedSupervisor as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_withholds_unbound_static_credentials_independently() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let mut profileless_openai = test_provider("gateway-openai", "legacy-openai");
+        profileless_openai.credentials =
+            HashMap::from([("OPENAI_API_KEY".to_string(), "openai-secret".to_string())]);
+        state.store.put_message(&profileless_openai).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-unbound-provider-env",
+                "unbound-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string(), "gateway-openai".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-unbound-provider-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.environment.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            response.readiness_reason,
+            ProviderReadinessReason::CredentialsWithheld as i32
+        );
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        assert!(
+            response
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -7942,7 +12996,6 @@ mod tests {
         use openshell_core::proto::{
             GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
             NetworkCredentialBinding, ProviderProfile, ProviderProfileCategory,
-            StoredProviderProfile,
         };
 
         let state = test_server_state().await;
@@ -7959,6 +13012,11 @@ mod tests {
                     id: "endpointless".to_string(),
                     display_name: "Endpointless".to_string(),
                     category: ProviderProfileCategory::Other as i32,
+                    credentials: vec![openshell_core::proto::ProviderProfileCredential {
+                        name: "cloud_token".to_string(),
+                        env_vars: vec!["CLOUD_TOKEN".to_string()],
+                        ..Default::default()
+                    }],
                     endpoints: Vec::new(),
                     ..Default::default()
                 }),
@@ -7979,6 +13037,13 @@ mod tests {
             .credential_binding = Some(NetworkCredentialBinding {
             provider: "work-cloud".to_string(),
         });
+        let bound_endpoint = &mut policy
+            .network_policies
+            .get_mut("cloud_api")
+            .unwrap()
+            .endpoints[0];
+        bound_endpoint.protocol = "rest".to_string();
+        bound_endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32;
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
         state
             .store
@@ -7994,7 +13059,10 @@ mod tests {
         let config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-policy-binding".to_string(),
+                name: "policy-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -8011,6 +13079,11 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(
+            config.policy.as_ref().unwrap().network_policies["cloud_api"].endpoints[0]
+                .provider_credentialed,
+            "config delivery must derive provenance from the endpointless binding"
+        );
         assert_eq!(
             environment.environment.get("CLOUD_TOKEN"),
             Some(&"cloud-secret".to_string())
@@ -8038,8 +13111,10 @@ mod tests {
         handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "policy-binding".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "policy-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(next_policy.clone()),
                 ..Default::default()
             })),
@@ -8049,7 +13124,10 @@ mod tests {
         let next_config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-policy-binding".to_string(),
+                name: "policy-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -8066,6 +13144,10 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(
+            next_config.policy.as_ref().unwrap().network_policies["cloud_api"].endpoints[0]
+                .provider_credentialed
+        );
         assert_ne!(
             config.provider_env_revision, next_config.provider_env_revision,
             "changing the policy binding must rotate the provider environment revision"
@@ -8089,14 +13171,28 @@ mod tests {
         handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "policy-binding".to_string(),
-                workspace: "default".to_string(),
+                sandbox: "policy-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(unbound_policy),
                 ..Default::default()
             })),
         )
         .await
         .expect("removing a policy binding must succeed");
+        let unbound_config = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                name: "policy-binding".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
         let unbound_environment = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
@@ -8108,6 +13204,11 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        assert!(
+            !unbound_config.policy.as_ref().unwrap().network_policies["cloud_api"].endpoints[0]
+                .provider_credentialed,
+            "removing the binding must clear the derived provenance"
+        );
         assert_ne!(
             next_environment.provider_env_revision, unbound_environment.provider_env_revision,
             "removing the binding must rotate the provider environment revision"
@@ -8128,7 +13229,7 @@ mod tests {
     async fn invalid_static_binding_does_not_suppress_valid_dynamic_credentials() {
         use openshell_core::proto::{
             GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant, ProviderProfile,
-            ProviderProfileCategory, ProviderProfileCredential, StoredProviderProfile,
+            ProviderProfileCategory, ProviderProfileCredential,
         };
 
         let state = test_server_state().await;
@@ -8140,12 +13241,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "profile-custom-dynamic".to_string(),
                 name: "custom-dynamic".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(ProviderProfile {
                 id: "custom-dynamic".to_string(),
@@ -8166,6 +13267,8 @@ mod tests {
                     host: "api.dynamic.example.test".to_string(),
                     port: 443,
                     path: "/**".to_string(),
+                    protocol: "rest".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -8197,19 +13300,142 @@ mod tests {
         .expect("mixed snapshot must be returned")
         .into_inner();
 
-        assert_eq!(
-            response.environment.get("INVALID_TOKEN"),
-            Some(&"static-secret".to_string())
+        assert!(
+            !response.environment.contains_key("INVALID_TOKEN"),
+            "an unbound static credential must be withheld before the supervisor snapshot"
         );
         assert!(
             !response
                 .static_credential_bindings
                 .contains_key("INVALID_TOKEN"),
-            "incomplete static metadata must reach the supervisor for fail-closed rejection"
+            "an unbound static credential must not emit incomplete binding metadata"
         );
         assert!(
             !response.dynamic_credentials.is_empty(),
             "valid dynamic credentials must survive an unrelated static binding failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_withholds_token_exchange_subject_credential() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant,
+            ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType,
+            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+        };
+
+        let state = test_server_state().await;
+        let profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-token-exchange-subject".to_string(),
+                name: "token-exchange-subject".to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            profile: Some(ProviderProfile {
+                id: "token-exchange-subject".to_string(),
+                display_name: "Token Exchange Subject".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![
+                    ProviderProfileCredential {
+                        name: "subject_token".to_string(),
+                        ..Default::default()
+                    },
+                    ProviderProfileCredential {
+                        name: "access_token".to_string(),
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
+                        token_grant: Some(ProviderCredentialTokenGrant {
+                            grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                            token_endpoint: "https://auth.example.test/token".to_string(),
+                            audience: "api://exchange".to_string(),
+                            subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                                source: "provider_credential".to_string(),
+                                credential: "subject_token".to_string(),
+                                subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                                    .to_string(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.exchange.example.test".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        state.store.put_message(&profile).await.unwrap();
+
+        let mut provider = test_provider("exchange-provider", "token-exchange-subject");
+        provider.credentials = HashMap::from([(
+            "subject_token".to_string(),
+            "raw-gateway-oidc-token".to_string(),
+        )]);
+        provider.credential_expiration_times = HashMap::from([(
+            "subject_token".to_string(),
+            openshell_core::time::timestamp_from_millis(current_time_ms() + 60_000).unwrap(),
+        )]);
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-token-exchange-subject",
+                "token-exchange-subject",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["exchange-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-token-exchange-subject".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            !response.environment.contains_key("subject_token"),
+            "token-exchange subject credentials must not enter sandbox environment material"
+        );
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("subject_token"),
+            "token-exchange subject credentials must not own workload placeholders"
+        );
+        assert!(
+            !response
+                .credential_expiration_times
+                .contains_key("subject_token"),
+            "withheld subject credentials must not emit sandbox expiry metadata"
+        );
+        let dynamic_access_token = response
+            .dynamic_credentials
+            .values()
+            .find(|credential| credential.name == "access_token")
+            .expect("dynamic access_token credential should remain available");
+        assert_eq!(
+            dynamic_access_token
+                .token_grant
+                .as_ref()
+                .and_then(|grant| grant.subject_token.as_ref())
+                .map(|subject| subject.credential.as_str()),
+            Some("subject_token")
         );
     }
 
@@ -8302,7 +13528,7 @@ mod tests {
     async fn provider_environment_revision_and_payload_share_immutable_record_snapshot() {
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
-            ProviderProfileCredential, StoredProviderProfile,
+            ProviderProfileCredential,
         };
 
         fn dynamic_profile(
@@ -8314,12 +13540,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("profile-{id}"),
                     name: id.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: id.to_string(),
@@ -8327,6 +13553,7 @@ mod tests {
                     category: ProviderProfileCategory::Other as i32,
                     credentials: vec![ProviderProfileCredential {
                         name: "access_token".to_string(),
+                        env_vars: vec!["GITHUB_TOKEN".to_string()],
                         auth_style: "bearer".to_string(),
                         header_name: "authorization".to_string(),
                         token_grant: Some(ProviderCredentialTokenGrant {
@@ -8340,6 +13567,8 @@ mod tests {
                         host: endpoint_host.to_string(),
                         port: 443,
                         path: "/**".to_string(),
+                        protocol: "rest".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -8487,8 +13716,7 @@ mod tests {
         use crate::grpc::provider::handle_update_provider_profiles;
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
-            ProviderProfileCredential, ProviderProfileImportItem, StoredProviderProfile,
-            UpdateProviderProfilesRequest,
+            ProviderProfileCredential, ProviderProfileImportItem, UpdateProviderProfilesRequest,
         };
         use std::time::Duration;
 
@@ -8497,12 +13725,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-token".to_string(),
                     name: "custom-token".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-token".to_string(),
@@ -8525,6 +13753,8 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.custom.example".to_string(),
                         port: 443,
+                        protocol: "rest".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                         ..Default::default()
                     }],
                     binaries: Vec::new(),
@@ -8573,13 +13803,16 @@ mod tests {
         handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
+                request_id: String::new(),
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(rotated_profile),
                     source: "custom-token.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
                 id: "custom-token".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -8602,9 +13835,7 @@ mod tests {
     #[tokio::test]
     async fn platform_profile_narrowing_changes_platform_provider_revision_when_shadowed() {
         use crate::persistence::WriteCondition;
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         fn stored_profile(workspace: &str, path: &str) -> StoredProviderProfile {
             StoredProviderProfile {
@@ -8618,12 +13849,12 @@ mod tests {
                         }
                     ),
                     name: "scoped-revision".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "scoped-revision".to_string(),
@@ -8698,7 +13929,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-github", "github"))
@@ -8735,10 +13965,13 @@ mod tests {
         handle_attach_sandbox_provider(
             &state,
             with_user(Request::new(AttachSandboxProviderRequest {
-                sandbox_name: "attach-lifecycle".to_string(),
-                provider_name: "work-github".to_string(),
+                request_id: String::new(),
+                sandbox: "attach-lifecycle".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -8773,10 +14006,13 @@ mod tests {
         handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "attach-lifecycle".to_string(),
-                provider_name: "work-github".to_string(),
+                request_id: String::new(),
+                sandbox: "attach-lifecycle".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "work-github".to_string(),
                 expected_resource_version: 0,
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -8807,7 +14043,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn custom_imported_profile_policy_and_env_follow_attach_detach_lifecycle() {
         use crate::grpc::provider::handle_import_provider_profiles;
         use crate::grpc::sandbox::{
@@ -8821,10 +14056,10 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         handle_import_provider_profiles(
             &state,
             authed_request(ImportProviderProfilesRequest {
+                request_id: String::new(),
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
@@ -8857,7 +14092,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/custom".to_string(),
-                            harness: true,
                         }],
                         inference_capable: false,
                         discovery: None,
@@ -8865,7 +14099,9 @@ mod tests {
                         scope: String::new(),
                     }),
                 }],
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -8906,10 +14142,13 @@ mod tests {
         handle_attach_sandbox_provider(
             &state,
             with_user(Request::new(AttachSandboxProviderRequest {
-                sandbox_name: "attach-lifecycle".to_string(),
-                provider_name: "work-custom".to_string(),
+                request_id: String::new(),
+                sandbox: "attach-lifecycle".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "work-custom".to_string(),
                 expected_resource_version: 0,
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -8947,10 +14186,13 @@ mod tests {
         handle_detach_sandbox_provider(
             &state,
             authed_request(DetachSandboxProviderRequest {
-                sandbox_name: "attach-lifecycle".to_string(),
-                provider_name: "work-custom".to_string(),
+                request_id: String::new(),
+                sandbox: "attach-lifecycle".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                provider: "work-custom".to_string(),
                 expected_resource_version: 0,
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -8980,7 +14222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_policy_suppresses_provider_profile_layers_when_v2_enabled() {
+    async fn global_policy_suppresses_provider_profile_layers() {
         use openshell_core::proto::{
             GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
             SandboxPolicy, SandboxSpec,
@@ -9013,12 +14255,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-global-profile".to_string(),
                 name: "global-profile-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(sandbox_policy),
@@ -9048,17 +14290,10 @@ mod tests {
         };
         let global_settings = StoredSettings {
             revision: 1,
-            settings: [
-                (
-                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                    StoredSettingValue::Bool(true),
-                ),
-                (
-                    POLICY_SETTING_KEY.to_string(),
-                    StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
-                ),
-            ]
-            .into_iter()
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
+            ))
             .collect(),
             ..Default::default()
         };
@@ -9069,7 +14304,10 @@ mod tests {
         let response = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-global-profile".to_string(),
+                name: "global-profile-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             })),
         )
         .await
@@ -9105,12 +14343,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-backfill".to_string(),
                 name: "backfill-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9191,6 +14429,362 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_all_applies_multiple_independent_chunks_and_reuses_cached_validation() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-approve-all-multiple";
+        let sandbox_name = "approve-all-multiple";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: [
+                    ("alpha", "alpha.example.com", "/usr/bin/curl"),
+                    ("beta", "beta.example.com", "/usr/bin/wget"),
+                ]
+                .into_iter()
+                .map(|(name, host, binary)| PolicyChunk {
+                    rule_name: name.to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: name.to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: host.to_string(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: binary.to_string(),
+                        }],
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunk_ids.len(), 2);
+
+        let mut chunks = Vec::new();
+        for (index, chunk_id) in submit.accepted_chunk_ids.iter().enumerate() {
+            let mut chunk = state
+                .store
+                .get_draft_chunk(chunk_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let proposed_rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice()).unwrap();
+            assert!(
+                proposed_rule.endpoints[0].advisor_proposed,
+                "the gateway must stamp advisor endpoint provenance"
+            );
+            chunk.validation_result = format!("prover: cached sentinel {index}");
+            assert!(
+                state
+                    .store
+                    .update_draft_chunk_evaluation(&chunk)
+                    .await
+                    .unwrap()
+            );
+            chunks.push(chunk);
+        }
+
+        let approved = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                approvals: chunks
+                    .iter()
+                    .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                        chunk_id: chunk.id.clone(),
+                        review_token: chunk.review_token.clone(),
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(approved.chunks_approved, 2);
+        assert_eq!(approved.chunks_skipped, 0);
+        assert_eq!(approved.policy_version, 1);
+        let revision = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
+        assert!(policy.network_policies.contains_key("alpha"));
+        assert!(policy.network_policies.contains_key("beta"));
+        assert!(
+            policy
+                .network_policies
+                .values()
+                .all(|rule| rule.endpoints[0].advisor_proposed)
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            let stored = state
+                .store
+                .get_draft_chunk(&chunk.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, "approved");
+            assert_eq!(
+                stored.validation_result,
+                format!("prover: cached sentinel {index}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_all_skips_later_endpoint_conflict_and_applies_compatible_prefix() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-approve-all-conflict";
+        let sandbox_name = "approve-all-conflict";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![
+                    PolicyChunk {
+                        rule_name: "inspected".to_string(),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: "inspected".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "shared.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    },
+                    PolicyChunk {
+                        rule_name: "conflicting".to_string(),
+                        proposed_rule: Some(NetworkPolicyRule {
+                            name: "conflicting".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "shared.example.com".to_string(),
+                                port: 443,
+                                protocol: "graphql".to_string(),
+                                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                    as i32,
+                                access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                                advisor_proposed: true,
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/wget".to_string(),
+                            }],
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunk_ids.len(), 2);
+        let chunks = futures::future::try_join_all(
+            submit
+                .accepted_chunk_ids
+                .iter()
+                .map(|id| state.store.get_draft_chunk(id)),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<_>>();
+
+        let approved = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                approvals: chunks
+                    .iter()
+                    .map(|chunk| openshell_core::proto::DraftChunkApproval {
+                        chunk_id: chunk.id.clone(),
+                        review_token: chunk.review_token.clone(),
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(approved.chunks_approved, 1);
+        assert_eq!(approved.chunks_skipped, 1);
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&chunks[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+        let skipped = state
+            .store
+            .get_draft_chunk(&chunks[1].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.status, "pending");
+        assert!(!skipped.application_error.is_empty());
+        let revision = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
+        assert!(policy.network_policies.contains_key("inspected"));
+        assert!(!policy.network_policies.contains_key("conflicting"));
+    }
+
+    #[tokio::test]
+    async fn reviewed_batch_operations_stale_snapshot_apply_nothing() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-approve-all-stale";
+        let sandbox_name = "approve-all-stale";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let reviewed_policy = ProtoSandboxPolicy::default();
+        let reviewed_hash = deterministic_policy_hash(&reviewed_policy);
+        let changed_policy = test_policy_with_rule("concurrent", "concurrent.example.com");
+        let changed_hash = deterministic_policy_hash(&changed_policy);
+        state
+            .store
+            .put_policy_revision(
+                "concurrent-policy",
+                sandbox_id,
+                "default",
+                1,
+                &changed_policy.encode_to_vec(),
+                &changed_hash,
+            )
+            .await
+            .unwrap();
+
+        let operations = [
+            PolicyMergeOp::AddRule {
+                rule_name: "alpha".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "alpha".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "alpha.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                    }],
+                },
+            },
+            PolicyMergeOp::AddRule {
+                rule_name: "beta".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "beta".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "beta.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/wget".to_string(),
+                    }],
+                },
+            },
+        ];
+        let error = apply_merge_operations_with_retry(
+            state.store.as_ref(),
+            sandbox_id,
+            "default",
+            Some(&reviewed_policy),
+            &operations,
+            PolicyMergeValidationContext {
+                provider_layers: &[],
+                credential_binding: None,
+            },
+            Some(&reviewed_hash),
+            None,
+        )
+        .await
+        .expect_err("a stale reviewed snapshot must reject the complete batch");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.policy_hash, changed_hash);
+        let policy = ProtoSandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+        assert!(policy.network_policies.contains_key("concurrent"));
+        assert!(!policy.network_policies.contains_key("alpha"));
+        assert!(!policy.network_policies.contains_key("beta"));
+    }
+
+    #[tokio::test]
     async fn approve_all_skips_private_allowed_ips_unless_included() {
         let state = test_server_state().await;
         let sandbox_name = "private-allowed-ips";
@@ -9208,6 +14802,7 @@ mod tests {
         let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -9222,7 +14817,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -9249,9 +14843,16 @@ mod tests {
         let skipped = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
-                name: sandbox_name.to_string(),
+                request_id: String::new(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 include_security_flagged: false,
-                workspace: "default".to_string(),
+                approvals: vec![openshell_core::proto::DraftChunkApproval {
+                    chunk_id: chunk_id.clone(),
+                    review_token: chunk.review_token.clone(),
+                }],
             })),
         )
         .await
@@ -9273,9 +14874,16 @@ mod tests {
         let approved = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
-                name: sandbox_name.to_string(),
+                request_id: String::new(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 include_security_flagged: true,
-                workspace: "default".to_string(),
+                approvals: vec![openshell_core::proto::DraftChunkApproval {
+                    chunk_id: chunk_id.clone(),
+                    review_token: chunk.review_token.clone(),
+                }],
             })),
         )
         .await
@@ -9293,6 +14901,9 @@ mod tests {
                 .status,
             "approved"
         );
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[tokio::test]
@@ -9320,12 +14931,12 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.to_string(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -9346,10 +14957,13 @@ mod tests {
         handle_edit_draft_chunk(
             &state,
             with_user(Request::new(EditDraftChunkRequest {
-                name: sandbox_name.to_string(),
+                request_id: String::new(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(private_rule),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9366,9 +14980,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9383,9 +14999,12 @@ mod tests {
         let skipped = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
-                name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 include_security_flagged: false,
-                workspace: "default".to_string(),
+                ..Default::default()
             })),
         )
         .await
@@ -9431,7 +15050,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let mut chunk = pending_draft_chunk("legacy-private", sandbox_id);
@@ -9448,9 +15066,12 @@ mod tests {
         let skipped = handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
-                name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 include_security_flagged: false,
-                workspace: "default".to_string(),
+                ..Default::default()
             })),
         )
         .await
@@ -9489,6 +15110,7 @@ mod tests {
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.to_string(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -9503,7 +15125,6 @@ mod tests {
                         }],
                         binaries: vec![NetworkBinary {
                             path: "/usr/bin/curl".to_string(),
-                            ..Default::default()
                         }],
                     }),
                     ..Default::default()
@@ -9517,9 +15138,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9566,12 +15189,12 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let first = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.to_string(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -9630,10 +15253,13 @@ mod tests {
         handle_edit_draft_chunk(
             &state,
             with_user(Request::new(EditDraftChunkRequest {
-                name: sandbox_name.to_string(),
+                request_id: String::new(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(finding_rule),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9646,6 +15272,7 @@ mod tests {
         let duplicate = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.to_string(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -9703,12 +15330,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-flow".to_string(),
                 name: "draft-flow".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9726,17 +15353,18 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_github".to_string(),
@@ -9744,8 +15372,8 @@ mod tests {
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
                     hit_count: 3,
-                    first_seen_ms: 100,
-                    last_seen_ms: 200,
+                    first_seen_time: openshell_core::time::timestamp_from_millis(100).ok(),
+                    last_seen_time: openshell_core::time::timestamp_from_millis(200).ok(),
                     binary: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
@@ -9763,9 +15391,11 @@ mod tests {
         let draft_policy = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9773,18 +15403,23 @@ mod tests {
         .into_inner();
         assert_eq!(draft_policy.draft_version, 1);
         assert_eq!(draft_policy.chunks.len(), 1);
-        // The proposal is L4 to a host with a credential in scope, so the
-        // prover emits a HIGH finding and the chunk stays pending for the
+        // The proposal explicitly opts in to L4 credentials. The prover emits
+        // a HIGH finding and the security note keeps the chunk pending for the
         // manual approve path this test exercises.
         assert_eq!(draft_policy.chunks[0].status, "pending");
         let chunk_id = draft_policy.chunks[0].id.clone();
+        let review_token = draft_policy.chunks[0].review_token.clone();
 
         let approve = handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
-                name: sandbox_name.clone(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
-                workspace: "default".to_string(),
+                review_token,
             }),
         )
         .await
@@ -9796,8 +15431,10 @@ mod tests {
         let history_after_approve = handle_get_draft_history(
             &state,
             authed_request(GetDraftHistoryRequest {
-                name: sandbox_name.clone(),
-                workspace: "default".to_string(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9811,11 +15448,13 @@ mod tests {
         let policies_after_approve = handle_list_sandbox_policies(
             &state,
             authed_request(ListSandboxPoliciesRequest {
-                name: sandbox_name.clone(),
-                limit: 10,
-                offset: 0,
+                sandbox: sandbox_name.clone(),
+                page_size: 10,
+                page_token: String::new(),
                 global: false,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9827,9 +15466,12 @@ mod tests {
         let undo = handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
-                name: sandbox_name.clone(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -9841,9 +15483,11 @@ mod tests {
         let draft_policy_after_undo = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9855,8 +15499,10 @@ mod tests {
         let history_after_undo = handle_get_draft_history(
             &state,
             authed_request(GetDraftHistoryRequest {
-                name: sandbox_name.clone(),
-                workspace: "default".to_string(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9868,11 +15514,13 @@ mod tests {
         let policies_after_undo = handle_list_sandbox_policies(
             &state,
             authed_request(ListSandboxPoliciesRequest {
-                name: sandbox_name.clone(),
-                limit: 10,
-                offset: 0,
+                sandbox: sandbox_name.clone(),
+                page_size: 10,
+                page_token: String::new(),
                 global: false,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9885,8 +15533,11 @@ mod tests {
         let cleared = handle_clear_draft_chunks(
             &state,
             authed_request(ClearDraftChunksRequest {
-                name: sandbox_name.clone(),
-                workspace: "default".to_string(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9897,9 +15548,11 @@ mod tests {
         let draft_policy_after_clear = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -9910,8 +15563,10 @@ mod tests {
         let history_after_clear = handle_get_draft_history(
             &state,
             authed_request(GetDraftHistoryRequest {
-                name: sandbox_name,
-                workspace: "default".to_string(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -9934,12 +15589,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-feedback".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9959,13 +15614,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -9985,10 +15640,13 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
-                name: sandbox_name.clone(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
                 reason: guidance.to_string(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -9997,9 +15655,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10035,12 +15695,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l7-verdict".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10068,7 +15728,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -10080,13 +15740,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10104,9 +15764,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10154,12 +15816,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-supersede-flow".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10185,16 +15847,17 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let mechanistic_submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10216,9 +15879,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10230,13 +15895,13 @@ mod tests {
             .find(|c| c.id == mechanistic_chunk_id)
             .expect("mechanistic chunk present");
         assert_eq!(mech.status, "pending");
-        // Mechanistic L4 with credential in scope flags as new credentialed
-        // reach for the binary on the host.
+        // The attached GitHub profile already grants credentialed reach for
+        // this host, so the mechanistic proposal does not expand reach.
         assert!(
-            mech.validation_result
+            !mech
+                .validation_result
                 .contains("credential_reach_expansion"),
-            "mechanistic L4 with credential in scope should emit \
-             credential_reach_expansion; got: {}",
+            "profile-composed reach should prevent a duplicate expansion finding; got: {}",
             mech.validation_result
         );
 
@@ -10255,7 +15920,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -10267,12 +15932,12 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let agent_submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10292,9 +15957,11 @@ mod tests {
         let draft_after = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10362,12 +16029,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mechanistic-clean".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10398,13 +16065,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10422,9 +16089,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10437,6 +16106,455 @@ mod tests {
             "empty-delta mechanistic proposal under auto mode must auto-approve \
              (proposer-agnostic); got status: {}",
             draft.chunks[0].status
+        );
+    }
+
+    #[tokio::test]
+    async fn mechanistic_existing_multi_port_rest_endpoint_auto_approves_narrow_overlay() {
+        use openshell_core::proto::{
+            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "mechanistic-existing-rest".to_string();
+        let mut base_policy = SandboxPolicy::default();
+        base_policy.network_policies.insert(
+            "cargo_registry".to_string(),
+            NetworkPolicyRule {
+                name: "cargo-registry".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "index.crates.io".to_string(),
+                    port: 80,
+                    ports: vec![80, 443],
+                    protocol: "rest".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/cargo".to_string(),
+                }],
+            },
+        );
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-mechanistic-existing-rest".to_string(),
+                name: sandbox_name.clone(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(base_policy),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        let advisor_binary = NetworkBinary {
+            path: "/usr/bin/curl".to_string(),
+        };
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.clone(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_index_crates_io_443".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "allow_index_crates_io_443".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "index.crates.io".to_string(),
+                            port: 443,
+                            advisor_proposed: true,
+                            ..Default::default()
+                        }],
+                        binaries: vec![advisor_binary],
+                    }),
+                    hit_count: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk = &draft.chunks[0];
+        assert_eq!(
+            chunk.status, "approved",
+            "application error: {}; prover: {}",
+            chunk.application_error, chunk.validation_result
+        );
+        assert_eq!(chunk.rule_name, "allow_index_crates_io_443");
+        assert_eq!(chunk.validation_result, "prover: no new findings");
+        assert!(chunk.application_error.is_empty());
+        assert!(!chunk.review_token.is_empty());
+        let canonical = chunk.proposed_rule.as_ref().unwrap();
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(
+            canonical.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
+        assert!(
+            canonical.endpoints[0].advisor_proposed,
+            "a new advisor overlay must retain proposal provenance"
+        );
+
+        let revision = state
+            .store
+            .get_latest_policy("sb-mechanistic-existing-rest")
+            .await
+            .unwrap()
+            .expect("auto approval persisted a policy revision");
+        let applied = ProtoSandboxPolicy::decode(revision.policy_payload.as_slice()).unwrap();
+        let cargo_rule = &applied.network_policies["cargo_registry"];
+        assert_eq!(cargo_rule.endpoints.len(), 1);
+        assert_eq!(cargo_rule.endpoints[0].ports, vec![80, 443]);
+        assert_eq!(cargo_rule.endpoints[0].protocol, "rest");
+        assert_eq!(
+            cargo_rule.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
+        assert_eq!(cargo_rule.binaries.len(), 1);
+        assert_eq!(cargo_rule.binaries[0].path, "/usr/bin/cargo");
+        let curl_rule = &applied.network_policies["allow_index_crates_io_443"];
+        assert_eq!(curl_rule.endpoints.len(), 1);
+        assert_eq!(curl_rule.endpoints[0].ports, vec![443]);
+        assert_eq!(curl_rule.endpoints[0].protocol, "rest");
+        assert_eq!(
+            curl_rule.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::ReadOnly as i32
+        );
+        assert!(
+            curl_rule.endpoints[0].advisor_proposed,
+            "the persisted advisor overlay must retain proposal provenance"
+        );
+        assert_eq!(curl_rule.binaries.len(), 1);
+        assert_eq!(curl_rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[tokio::test]
+    async fn malformed_graphql_candidate_is_rejected_before_reviewer_inbox() {
+        use openshell_core::proto::{
+            L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "invalid-graphql-preflight".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-invalid-graphql-preflight".to_string(),
+                name: sandbox_name.clone(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "bad_graphql".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "bad-graphql".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 443,
+                            protocol: "graphql".to_string(),
+                            enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce
+                                as i32,
+                            rules: vec![L7Rule {
+                                allow: Some(L7Allow {
+                                    // Runtime requires an operation type for
+                                    // GraphQL rules; this intentionally omits it.
+                                    fields: vec!["viewer".to_string()],
+                                    ..Default::default()
+                                }),
+                            }],
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 0);
+        assert_eq!(response.rejected_chunks, 1);
+        assert!(response.rejection_reasons[0].contains("operation_type"));
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(draft.chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_policy_inputs_refresh_token_and_require_fresh_review() {
+        use openshell_core::proto::{
+            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "stale-review-token".to_string();
+        let sandbox_id = "sb-stale-review-token";
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.clone(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "example".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "example".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "example.com".to_string(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = &submit.accepted_chunk_ids[0];
+        let before = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before.review_token.is_empty());
+
+        // The cached verdict is deliberately replaced with a sentinel while
+        // retaining its token. With unchanged inputs, evaluation must carry
+        // that value through instead of invoking the prover again.
+        let mut cached = before.clone();
+        cached.validation_result = "prover: cached sentinel".to_string();
+        assert!(
+            state
+                .store
+                .update_draft_chunk_evaluation(&cached)
+                .await
+                .unwrap()
+        );
+        let unchanged = require_current_proposal_evaluation(
+            &state,
+            "default",
+            &sandbox,
+            &cached,
+            Some(&cached.review_token),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged.validation_result, "prover: cached sentinel");
+
+        let mut changed_base = SandboxPolicy::default();
+        changed_base.network_policies.insert(
+            "unrelated".to_string(),
+            NetworkPolicyRule {
+                name: "unrelated".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "unrelated.example".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/wget".to_string(),
+                }],
+            },
+        );
+        let changed_hash = deterministic_policy_hash(&changed_base);
+        state
+            .store
+            .put_policy_revision(
+                "stale-token-policy",
+                sandbox_id,
+                "default",
+                1,
+                &changed_base.encode_to_vec(),
+                &changed_hash,
+            )
+            .await
+            .unwrap();
+
+        let error = handle_approve_draft_chunk(
+            &state,
+            with_user(Request::new(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                chunk_id: chunk_id.clone(),
+                review_token: before.review_token.clone(),
+            })),
+        )
+        .await
+        .expect_err("changed base policy must invalidate the reviewed token");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("inputs changed"));
+        let refreshed = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.status, "pending");
+        assert_ne!(refreshed.review_token, before.review_token);
+        assert_eq!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .policy_hash,
+            changed_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_change_reconciles_pending_chunk_already_covered_by_live_policy() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-covered-pending";
+        let sandbox_name = "covered-pending";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let rule = NetworkPolicyRule {
+            name: "example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }],
+        };
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "example".to_string(),
+                    proposed_rule: Some(rule.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = &submit.accepted_chunk_ids[0];
+
+        let mut live = ProtoSandboxPolicy::default();
+        live.network_policies.insert("example".to_string(), rule);
+        assert_eq!(
+            reconcile_pending_chunks_covered_by_policy(&state, sandbox_id, &live, 7)
+                .await
+                .unwrap(),
+            1
+        );
+        let reconciled = state
+            .store
+            .get_draft_chunk(chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.status, "rejected");
+        assert_eq!(
+            reconciled.rejection_reason,
+            "covered by active policy revision 7"
         );
     }
 
@@ -10463,12 +16581,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-l7-full-with-cred".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10496,19 +16614,19 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
-                access: "full".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10526,9 +16644,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10572,12 +16692,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-default-manual-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10606,13 +16726,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10630,9 +16750,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10669,12 +16791,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-unknown-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10703,13 +16825,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10727,9 +16849,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10758,12 +16882,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-explicit-manual-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10791,13 +16915,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10815,9 +16939,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10849,12 +16975,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-gateway-auto-mode".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10883,13 +17009,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -10907,9 +17033,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -10940,12 +17068,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-gateway-pinned-manual".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -10978,13 +17106,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11002,9 +17130,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -11036,12 +17166,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-reject-provider-prefix".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -11064,17 +17194,18 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         let response = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11100,6 +17231,94 @@ mod tests {
             "rejection reason must cite the reserved-prefix rule. got: {:?}",
             response.rejection_reasons,
         );
+    }
+
+    #[tokio::test]
+    async fn agent_authored_submit_rejects_native_tcp_and_tls_skip_but_allows_explicit_proxy() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let state = test_server_state().await;
+        let sandbox_name = "reject-agent-raw-transports";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-reject-agent-raw-transports",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let endpoint = |protocol: &str, tls: &str| NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            protocol: protocol.to_string(),
+            tls: openshell_policy::network_tls_mode_from_str(tls)
+                .expect("test TLS mode must be valid") as i32,
+            ..Default::default()
+        };
+        let chunk = |name: &str, endpoint: NetworkEndpoint| PolicyChunk {
+            rule_name: name.to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: name.to_string(),
+                endpoints: vec![endpoint],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![
+                    chunk("native_tcp", endpoint("tcp", "")),
+                    chunk("raw_tls", endpoint("", "skip")),
+                    chunk("explicit_proxy", endpoint("", "")),
+                ],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 1);
+        assert_eq!(response.rejected_chunks, 2);
+        assert_eq!(response.rejection_reasons.len(), 2);
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("protocol tcp"))
+        );
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason.contains("tls: skip"))
+        );
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft.chunks.len(), 1);
+        assert_eq!(draft.chunks[0].rule_name, "explicit_proxy");
     }
 
     #[tokio::test]
@@ -11129,7 +17348,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -11152,6 +17370,7 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            ..Default::default()
         };
         state
             .store
@@ -11162,9 +17381,12 @@ mod tests {
         let err = handle_approve_draft_chunk(
             &state,
             with_user(Request::new(ApproveDraftChunkRequest {
-                name: sandbox_name.to_string(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk.id.clone(),
-                workspace: "default".to_string(),
+                ..Default::default()
             })),
         )
         .await
@@ -11214,12 +17436,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l4-with-cred".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -11243,17 +17465,18 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11271,9 +17494,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -11314,12 +17539,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l4-no-cred".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -11347,13 +17572,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11371,9 +17596,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -11403,12 +17630,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-link-local".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -11436,13 +17663,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11460,9 +17687,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -11481,15 +17710,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_authored_validation_uses_providers_v2_effective_policy() {
+    async fn agent_authored_validation_uses_profile_composed_effective_policy() {
         use openshell_core::proto::{
             FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
             ProviderProfile, ProviderProfileCategory, SandboxPhase, SandboxPolicy, SandboxSpec,
-            StoredProviderProfile,
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
         state
             .store
             .put_message(&test_provider("work-custom", "custom-api"))
@@ -11501,12 +17728,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "profile-custom-api".to_string(),
                     name: "custom-api".to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-api".to_string(),
@@ -11520,7 +17747,7 @@ mod tests {
                         host: "api.github.com".to_string(),
                         port: 443,
                         protocol: "rest".to_string(),
-                        access: "full".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                         deny_rules: vec![L7DenyRule {
                             method: "DELETE".to_string(),
                             path: "/repos/*".to_string(),
@@ -11530,7 +17757,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                     inference_capable: false,
                     discovery: None,
@@ -11541,17 +17767,18 @@ mod tests {
             .await
             .unwrap();
 
+        let sandbox_id = "sb-agent-provider-effective-policy";
         let sandbox_name = "agent-provider-effective-policy".to_string();
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: "sb-agent-provider-effective-policy".to_string(),
+                id: sandbox_id.to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -11576,7 +17803,10 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                // Match the provider-owned endpoint contract so this test
+                // exercises prover composition rather than a deterministic
+                // application failure.
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Audit as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -11584,17 +17814,18 @@ mod tests {
                         ..Default::default()
                     }),
                 }],
+                advisor_proposed: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
-        handle_submit_policy_analysis(
+        let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11607,20 +17838,32 @@ mod tests {
             })),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
+        assert_eq!(submit.accepted_chunks, 1);
+        assert_eq!(submit.rejected_chunks, 0);
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
 
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
+        let chunk = draft
+            .chunks
+            .iter()
+            .find(|chunk| chunk.id == chunk_id)
+            .expect("provider-overlap proposal should reach the draft inbox");
+        assert_eq!(chunk.status, "pending");
+        let verdict = &chunk.validation_result;
         let first_line = verdict.lines().next().unwrap_or("");
         assert!(
             first_line.starts_with("prover: "),
@@ -11630,7 +17873,55 @@ mod tests {
         assert!(
             !verdict.contains("validation unavailable"),
             "providers-v2 composition must not break the prover pipeline; \
-             got: {verdict}"
+            got: {verdict}"
+        );
+
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                chunk_id,
+                review_token: chunk.review_token.clone(),
+            }),
+        )
+        .await
+        .expect("provider-overlap proposal should approve");
+
+        let stored = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("approval should persist a base-policy revision");
+        let base_policy = ProtoSandboxPolicy::decode(stored.policy_payload.as_slice()).unwrap();
+        assert!(
+            base_policy
+                .network_policies
+                .contains_key("github_contents_write")
+        );
+        assert!(
+            !base_policy
+                .network_policies
+                .contains_key("_provider_work_custom"),
+            "provider-composed rules must not be copied into the mutable base policy"
+        );
+
+        let effective_policy = get_sandbox_policy(&state, sandbox_id).await;
+        let provider_rule = &effective_policy.network_policies["_provider_work_custom"];
+        assert_eq!(
+            provider_rule.endpoints[0].access,
+            openshell_core::proto::NetworkAccessPreset::Full as i32
+        );
+        assert_eq!(provider_rule.endpoints[0].deny_rules.len(), 1);
+        assert!(!provider_rule.endpoints[0].advisor_proposed);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("github_contents_write")
         );
     }
 
@@ -11655,7 +17946,6 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        enable_providers_v2(&state).await;
 
         // Github provider attached: a credential ends up in scope for
         // api.github.com (PUT proposal flags MEDIUM). raw.githubusercontent.com
@@ -11672,12 +17962,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-full-loop-v2".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -11704,7 +17994,7 @@ mod tests {
                 host: "raw.githubusercontent.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "GET".to_string(),
@@ -11717,12 +18007,12 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let step1 = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11746,7 +18036,7 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 protocol: "rest".to_string(),
-                enforcement: "enforce".to_string(),
+                enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                 rules: vec![L7Rule {
                     allow: Some(L7Allow {
                         method: "PUT".to_string(),
@@ -11758,12 +18048,12 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let step2 = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -11783,9 +18073,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -11862,12 +18154,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-redraft".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -11893,7 +18185,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -11905,6 +18196,7 @@ mod tests {
                 handle_submit_policy_analysis(
                     &state,
                     with_user(Request::new(SubmitPolicyAnalysisRequest {
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                         name: sandbox_name,
                         analysis_mode: "agent_authored".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -11934,9 +18226,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -11955,10 +18249,13 @@ mod tests {
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
-                name: sandbox_name,
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: second.accepted_chunk_ids[0].clone(),
                 reason: "redraft test".to_string(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -11981,12 +18278,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mech-dedup".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -12006,7 +18303,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit_one = || {
@@ -12017,6 +18313,7 @@ mod tests {
                 handle_submit_policy_analysis(
                     &state,
                     with_user(Request::new(SubmitPolicyAnalysisRequest {
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -12040,9 +18337,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -12089,12 +18388,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -12124,7 +18423,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let submit_one = || {
@@ -12135,6 +18433,7 @@ mod tests {
                 handle_submit_policy_analysis(
                     &state,
                     with_user(Request::new(SubmitPolicyAnalysisRequest {
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -12156,9 +18455,11 @@ mod tests {
         let after_first = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -12177,9 +18478,11 @@ mod tests {
         let after_second = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -12244,6 +18547,7 @@ mod tests {
             last_seen_ms: 1_000,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            ..Default::default()
         }
     }
 
@@ -12362,12 +18666,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-undo-clears".to_string(),
                 name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -12387,13 +18691,13 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         let submit = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -12407,14 +18711,24 @@ mod tests {
         .unwrap()
         .into_inner();
         let chunk_id = submit.accepted_chunk_ids[0].clone();
+        let review_token = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .review_token;
 
         handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
-                name: sandbox_name.clone(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
                 reason: "scope too broad".to_string(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -12423,9 +18737,13 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
-                name: sandbox_name.clone(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
-                workspace: "default".to_string(),
+                review_token,
             }),
         )
         .await
@@ -12434,9 +18752,12 @@ mod tests {
         handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
-                name: sandbox_name.clone(),
+                request_id: String::new(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -12445,9 +18766,11 @@ mod tests {
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
@@ -12464,6 +18787,9 @@ mod tests {
             "undo must clear stale rejection_reason; got: {:?}",
             restored.rejection_reason
         );
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[tokio::test]
@@ -12471,9 +18797,9 @@ mod tests {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
-        // Attach a github provider so the L4 proposal below has a credential
-        // in scope and the prover emits a HIGH finding — keeps the chunk
-        // pending so this cross-sandbox approve check is reachable.
+        // Attach a github provider so the explicitly opted-in L4 proposal
+        // below has a credential in scope and stays pending, keeping this
+        // cross-sandbox approve check reachable.
         state
             .store
             .put_message(&test_provider("github-pat", "github"))
@@ -12483,12 +18809,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-owner".to_string(),
                 name: "draft-owner".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -12502,12 +18828,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-other".to_string(),
                 name: "draft-other".to_string(),
-                created_at_ms: 1_000_001,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_001).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -12524,17 +18850,18 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.github.com".to_string(),
                 port: 443,
+                allow_uninspected_credentials: true,
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
         handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 name: sandbox_a.object_name().to_string(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -12542,8 +18869,8 @@ mod tests {
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
                     hit_count: 3,
-                    first_seen_ms: 100,
-                    last_seen_ms: 200,
+                    first_seen_time: openshell_core::time::timestamp_from_millis(100).ok(),
+                    last_seen_time: openshell_core::time::timestamp_from_millis(200).ok(),
                     binary: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
@@ -12556,23 +18883,30 @@ mod tests {
         let draft_policy = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_a.object_name().to_string(),
+                sandbox: sandbox_a.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 status_filter: String::new(),
-                workspace: "default".to_string(),
             })),
         )
         .await
         .unwrap()
         .into_inner();
         let chunk_id = draft_policy.chunks[0].id.clone();
+        let review_token = draft_policy.chunks[0].review_token.clone();
         let other_name = sandbox_b.object_name().to_string();
 
         let approve_err = handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
-                name: other_name.clone(),
+                request_id: String::new(),
+                sandbox: other_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
-                workspace: "default".to_string(),
+                review_token: String::new(),
             }),
         )
         .await
@@ -12582,10 +18916,13 @@ mod tests {
         let reject_err = handle_reject_draft_chunk(
             &state,
             authed_request(RejectDraftChunkRequest {
-                name: other_name.clone(),
+                request_id: String::new(),
+                sandbox: other_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
                 reason: "wrong sandbox".to_string(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -12595,10 +18932,13 @@ mod tests {
         let edit_err = handle_edit_draft_chunk(
             &state,
             authed_request(EditDraftChunkRequest {
-                name: other_name.clone(),
+                request_id: String::new(),
+                sandbox: other_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(proposed_rule.clone()),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -12608,9 +18948,13 @@ mod tests {
         handle_approve_draft_chunk(
             &state,
             authed_request(ApproveDraftChunkRequest {
-                name: sandbox_a.object_name().to_string(),
+                request_id: String::new(),
+                sandbox: sandbox_a.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id: chunk_id.clone(),
-                workspace: "default".to_string(),
+                review_token,
             }),
         )
         .await
@@ -12619,14 +18963,20 @@ mod tests {
         let undo_err = handle_undo_draft_chunk(
             &state,
             authed_request(UndoDraftChunkRequest {
-                name: other_name,
+                request_id: String::new(),
+                sandbox: other_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 chunk_id,
-                workspace: "default".to_string(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(undo_err.code(), Code::NotFound);
+
+        // Wait for SQLx's SQLite worker threads to stop before the test process exits;
+        state.store.close_for_test().await;
     }
 
     #[test]
@@ -12694,8 +19044,15 @@ mod tests {
     #[test]
     fn summarize_cli_policy_merge_op_formats_rest_allow_rules() {
         let operation = PolicyMergeOp::AddAllowRules {
-            host: "api.github.com".to_string(),
-            port: 443,
+            target: L7RuleTarget {
+                rule_name: "github".to_string(),
+                host: "api.github.com".to_string(),
+                ports: vec![443],
+                path: Some(String::new()),
+                binaries: L7BinaryScope::Restricted(vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }]),
+            },
             rules: vec![L7Rule {
                 allow: Some(openshell_core::proto::L7Allow {
                     method: "POST".to_string(),
@@ -12712,7 +19069,7 @@ mod tests {
 
         assert_eq!(
             summarize_cli_policy_merge_op(&operation),
-            "add-allow api.github.com:443 [POST /repos/*/issues]"
+            "add-allow api.github.com:443 rule=github endpoint-path=Some(\"\") binaries=[/usr/bin/curl] [POST /repos/*/issues]"
         );
     }
 
@@ -12726,13 +19083,12 @@ mod tests {
                     host: "api.github.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    access: "read-only".to_string(),
-                    enforcement: "enforce".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         };
@@ -12753,14 +19109,13 @@ mod tests {
                     host: "realtime.example.com".to_string(),
                     port: 443,
                     protocol: "websocket".to_string(),
-                    access: "read-write".to_string(),
-                    enforcement: "enforce".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     websocket_credential_rewrite: true,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         };
@@ -12781,14 +19136,13 @@ mod tests {
                     host: "slack.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    access: "read-write".to_string(),
-                    enforcement: "enforce".to_string(),
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     request_body_credential_rewrite: true,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         };
@@ -12815,7 +19169,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -12838,6 +19191,7 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            ..Default::default()
         };
 
         let (version, _) =
@@ -12884,7 +19238,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                 },
             ))
@@ -12913,7 +19266,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -12936,6 +19288,7 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            ..Default::default()
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk, &[])
@@ -12986,7 +19339,6 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
                 },
             ))
@@ -13015,7 +19367,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let chunk = DraftChunkRecord {
@@ -13038,6 +19389,7 @@ mod tests {
             last_seen_ms: 0,
             validation_result: String::new(),
             rejection_reason: String::new(),
+            ..Default::default()
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk, &[])
@@ -13072,7 +19424,7 @@ mod tests {
                         port: 443,
                         ports: vec![443],
                         protocol: "rest".to_string(),
-                        access: "read-only".to_string(),
+                        access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -13094,8 +19446,13 @@ mod tests {
             .unwrap();
 
         let add_allow = [PolicyMergeOp::AddAllowRules {
-            host: "api.github.com".to_string(),
-            port: 443,
+            target: L7RuleTarget {
+                rule_name: "github".to_string(),
+                host: "api.github.com".to_string(),
+                ports: vec![443],
+                path: None,
+                binaries: L7BinaryScope::Any,
+            },
             rules: vec![L7Rule {
                 allow: Some(L7Allow {
                     method: "POST".to_string(),
@@ -13110,8 +19467,13 @@ mod tests {
             }],
         }];
         let add_deny = [PolicyMergeOp::AddDenyRules {
-            host: "api.github.com".to_string(),
-            port: 443,
+            target: L7RuleTarget {
+                rule_name: "github".to_string(),
+                host: "api.github.com".to_string(),
+                ports: vec![443],
+                path: None,
+                binaries: L7BinaryScope::Any,
+            },
             deny_rules: vec![L7DenyRule {
                 method: "POST".to_string(),
                 path: "/admin".to_string(),
@@ -13131,6 +19493,7 @@ mod tests {
                     provider_layers: &[],
                     credential_binding: None,
                 },
+                None,
                 None
             ),
             apply_merge_operations_with_retry(
@@ -13143,6 +19506,7 @@ mod tests {
                     provider_layers: &[],
                     credential_binding: None,
                 },
+                None,
                 None
             ),
         );
@@ -13156,7 +19520,7 @@ mod tests {
 
         let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
         let endpoint = &policy.network_policies["github"].endpoints[0];
-        assert!(endpoint.access.is_empty());
+        assert!(endpoint.access == 0);
         assert_eq!(endpoint.rules.len(), 4);
         assert_eq!(endpoint.deny_rules.len(), 1);
         assert_eq!(endpoint.deny_rules[0].path, "/admin");
@@ -13263,8 +19627,13 @@ mod tests {
     #[test]
     fn validate_merge_operations_rejects_add_allow_for_known_metadata_hostname() {
         let operation = PolicyMergeOp::AddAllowRules {
-            host: "metadata.google.internal".to_string(),
-            port: 80,
+            target: L7RuleTarget {
+                rule_name: "metadata".to_string(),
+                host: "metadata.google.internal".to_string(),
+                ports: vec![80],
+                path: None,
+                binaries: L7BinaryScope::Any,
+            },
             rules: vec![L7Rule {
                 allow: Some(openshell_core::proto::L7Allow {
                     method: "GET".to_string(),
@@ -13376,6 +19745,44 @@ mod tests {
             .unwrap()
             .expect("policy present");
         assert_eq!(decoded.version, 7);
+    }
+
+    #[test]
+    fn decode_policy_from_global_settings_validates_and_canonicalizes_stored_policy() {
+        let invalid = mcp_policy_with_versions(&["latest"]);
+        let invalid_global = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(invalid.encode_to_vec())),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let error = decode_policy_from_global_settings(&invalid_global)
+            .expect_err("invalid global policy must fail closed");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains(STORED_POLICY_SOURCE_GLOBAL));
+
+        let reversed = mcp_policy_with_versions(&["2025-11-25", "2025-06-18", "2025-03-26"]);
+        let canonical = validate_and_canonicalize_policy(reversed.clone())
+            .expect("supported global policy must canonicalize");
+        let valid_global = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(reversed.encode_to_vec())),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            decode_policy_from_global_settings(&valid_global)
+                .expect("valid global policy")
+                .expect("global policy present"),
+            canonical
+        );
     }
 
     #[test]
@@ -13560,9 +19967,7 @@ mod tests {
     }
 
     async fn install_ambiguous_provider_binding(state: &Arc<ServerState>, suffix: &str) {
-        use openshell_core::proto::{
-            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
-        };
+        use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
         let profile_name = format!("ambiguous-{suffix}");
         let provider_name = format!("provider-{suffix}");
@@ -13572,12 +19977,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("profile-{suffix}"),
                     name: profile_name.clone(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 profile: Some(ProviderProfile {
                     id: profile_name.clone(),
@@ -13586,7 +19991,7 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
                         port: 443,
-                        tls: "skip".to_string(),
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -13612,32 +20017,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabling_provider_composition_rejects_existing_ambiguous_binding() {
-        let state = test_server_state().await;
-        install_ambiguous_provider_binding(&state, "enable").await;
-
-        let error = handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                global: true,
-                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                ..Default::default()
-            })),
-        )
-        .await
-        .expect_err("provider composition must be validated before activation");
-
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("sandbox-enable"));
-        assert!(error.message().contains("tls"));
-        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
-        assert!(!bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
-    }
-
-    #[tokio::test]
     async fn deleting_global_policy_rejects_reactivated_ambiguous_provider_binding() {
         let state = test_server_state().await;
         install_ambiguous_provider_binding(&state, "delete-policy").await;
@@ -13652,20 +20031,6 @@ mod tests {
         )
         .await
         .expect("global policy should suppress provider composition");
-        handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                global: true,
-                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                ..Default::default()
-            })),
-        )
-        .await
-        .expect("providers may be enabled while a global policy is active");
-
         let error = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
@@ -13684,21 +20049,28 @@ mod tests {
         assert!(settings.settings.contains_key(POLICY_SETTING_KEY));
     }
 
+    #[tokio::test]
+    async fn startup_preflight_rejects_persisted_ambiguous_provider_binding() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "upgrade").await;
+
+        let error = validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect_err("startup must reject policy that unconditional composition would activate");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-upgrade"));
+        assert!(error.message().contains("invalid effective policy"));
+    }
+
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
             revision: 2,
-            settings: [
-                (
-                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
-                    StoredSettingValue::Bool(false),
-                ),
-                (
-                    settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
-                    StoredSettingValue::Bool(false),
-                ),
-            ]
-            .into_iter()
+            settings: std::iter::once((
+                settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(false),
+            ))
             .collect(),
             ..Default::default()
         };
@@ -13706,7 +20078,7 @@ mod tests {
             revision: 1,
             settings: [
                 (
-                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
                     StoredSettingValue::Bool(true),
                 ),
                 (
@@ -13720,15 +20092,6 @@ mod tests {
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        let providers_v2 = merged
-            .get(settings::PROVIDERS_V2_ENABLED_KEY)
-            .expect("providers_v2_enabled present");
-        assert_eq!(providers_v2.scope, SettingScope::Global as i32);
-        assert_eq!(
-            providers_v2.value.as_ref().and_then(|v| v.value.as_ref()),
-            Some(&setting_value::Value::BoolValue(false))
-        );
-
         let ocsf_json = merged
             .get("ocsf_json_enabled")
             .expect("ocsf_json_enabled present");
@@ -13918,6 +20281,137 @@ mod tests {
             deterministic_policy_hash(&policy(false)),
             deterministic_policy_hash(&policy(true)),
             "equivalent middleware configs must hash identically regardless of field insertion order"
+        );
+    }
+
+    #[test]
+    fn review_token_and_policy_hash_are_stable_across_nested_proto_map_order() {
+        use openshell_core::proto::{GraphqlOperation, L7Allow, L7QueryMatcher};
+
+        fn matcher(value: &str) -> L7QueryMatcher {
+            L7QueryMatcher {
+                glob: value.to_string(),
+                any: Vec::new(),
+            }
+        }
+
+        fn rule(reverse: bool) -> NetworkPolicyRule {
+            let mut query = HashMap::new();
+            let mut params = HashMap::new();
+            let mut persisted = HashMap::new();
+            let entries = if reverse {
+                [("zeta", "two"), ("alpha", "one")]
+            } else {
+                [("alpha", "one"), ("zeta", "two")]
+            };
+            for (key, value) in entries {
+                query.insert(key.to_string(), matcher(value));
+                params.insert(key.to_string(), matcher(value));
+                persisted.insert(
+                    key.to_string(),
+                    GraphqlOperation {
+                        operation_type: "query".to_string(),
+                        operation_name: value.to_string(),
+                        fields: vec![value.to_string()],
+                    },
+                );
+            }
+            NetworkPolicyRule {
+                name: "mapped".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "graphql".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "POST".to_string(),
+                            path: "/graphql".to_string(),
+                            query,
+                            params,
+                            operation_type: "query".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    graphql_persisted_queries: persisted,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }],
+            }
+        }
+
+        let left_rule = rule(false);
+        let right_rule = rule(true);
+        assert_eq!(left_rule, right_rule);
+        let left_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("mapped".to_string(), left_rule.clone())]),
+            ..Default::default()
+        };
+        let right_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("mapped".to_string(), right_rule.clone())]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            deterministic_policy_hash(&left_policy),
+            deterministic_policy_hash(&right_policy)
+        );
+        assert_eq!(
+            compute_proposal_review_token(
+                "mapped",
+                &left_rule,
+                &left_policy,
+                &left_policy,
+                &CredentialSet::default(),
+            ),
+            compute_proposal_review_token(
+                "mapped",
+                &right_rule,
+                &right_policy,
+                &right_policy,
+                &CredentialSet::default(),
+            )
+        );
+        assert_eq!(
+            compute_failed_proposal_evaluation_hash("mapped", &left_rule, &left_policy, "failed",),
+            compute_failed_proposal_evaluation_hash("mapped", &right_rule, &right_policy, "failed",)
+        );
+
+        let mut changed_rule = right_rule;
+        changed_rule.endpoints[0].rules[0]
+            .allow
+            .as_mut()
+            .unwrap()
+            .query
+            .get_mut("alpha")
+            .unwrap()
+            .glob = "changed".to_string();
+        let changed_policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("mapped".to_string(), changed_rule.clone())]),
+            ..Default::default()
+        };
+        assert_ne!(
+            deterministic_policy_hash(&left_policy),
+            deterministic_policy_hash(&changed_policy),
+            "map values remain decision-relevant after canonical ordering"
+        );
+        assert_ne!(
+            compute_proposal_review_token(
+                "mapped",
+                &left_rule,
+                &left_policy,
+                &left_policy,
+                &CredentialSet::default(),
+            ),
+            compute_proposal_review_token(
+                "mapped",
+                &changed_rule,
+                &changed_policy,
+                &changed_policy,
+                &CredentialSet::default(),
+            )
         );
     }
 
@@ -14407,12 +20901,12 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sb_id.to_string(),
                     name: sb_name.to_string(),
-                    created_at_ms: 1_000_000,
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     resource_version: 0,
                     workspace: ws.to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -14426,7 +20920,8 @@ mod tests {
 
         let alpha_req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-alpha".to_string(),
+                name: "work".to_string(),
+                workspace_scope: None,
             }),
             "sb-alpha",
         );
@@ -14438,7 +20933,8 @@ mod tests {
 
         let beta_req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
-                sandbox_id: "sb-beta".to_string(),
+                name: "work".to_string(),
+                workspace_scope: None,
             }),
             "sb-beta",
         );
@@ -14549,12 +21045,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None, // No policy yet - will be backfilled
@@ -14587,7 +21083,11 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
-                name: "test-sandbox".to_string(),
+                request_id: String::new(),
+                sandbox: "test-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(new_policy),
                 setting_key: String::new(),
                 setting_value: None,
@@ -14596,7 +21096,6 @@ mod tests {
                 merge_operations: vec![],
                 expected_resource_version: current_version,
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -14607,6 +21106,7 @@ mod tests {
         assert_eq!(response.version, 1);
 
         // Verify the resource_version incremented and policy was backfilled
+        // without replacing an omitted process identity component.
         let updated_sandbox = state
             .store
             .get_message_by_name::<Sandbox>("default", "test-sandbox")
@@ -14618,9 +21118,9 @@ mod tests {
             .as_ref()
             .and_then(|spec| spec.policy.as_ref())
             .and_then(|policy| policy.process.as_ref())
-            .expect("legacy process identity should be persisted");
+            .expect("partial process identity should be persisted");
         assert_eq!(process.run_as_user, "1234");
-        assert_eq!(process.run_as_group, "sandbox");
+        assert!(process.run_as_group.is_empty());
         assert_eq!(
             updated_sandbox.metadata.as_ref().unwrap().resource_version,
             current_version + 1,
@@ -14641,7 +21141,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-annotated-backfill".to_string(),
                 name: "annotated-backfill".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::from([(
@@ -14649,7 +21149,7 @@ mod tests {
                     "keep".to_string(),
                 )]),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -14682,7 +21182,11 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
-                name: "annotated-backfill".to_string(),
+                request_id: String::new(),
+                sandbox: "annotated-backfill".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(ProtoSandboxPolicy::default()),
                 setting_key: String::new(),
                 setting_value: None,
@@ -14691,7 +21195,6 @@ mod tests {
                 merge_operations: vec![],
                 expected_resource_version: current_version,
                 annotations: annotations.clone(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -14758,7 +21261,10 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
-                name: "same-hash".to_string(),
+                sandbox: "same-hash".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(policy),
                 annotations: HashMap::from([(
                     "openshell.nvidia.com/policy-signature".to_string(),
@@ -14844,7 +21350,10 @@ mod tests {
         let first = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "idempotent-provenance".to_string(),
+                sandbox: "idempotent-provenance".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(policy.clone()),
                 annotations: annotations.clone(),
                 ..Default::default()
@@ -14856,7 +21365,10 @@ mod tests {
         let second = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "idempotent-provenance".to_string(),
+                sandbox: "idempotent-provenance".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(policy),
                 annotations: annotations.clone(),
                 ..Default::default()
@@ -14910,7 +21422,10 @@ mod tests {
         let response = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "preserve-full".to_string(),
+                sandbox: "preserve-full".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(updated),
                 ..Default::default()
             })),
@@ -14958,7 +21473,10 @@ mod tests {
         let response = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "preserve-merge".to_string(),
+                sandbox: ("preserve-merge").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 merge_operations: vec![PolicyMergeOperation {
                     operation: Some(policy_merge_operation::Operation::AddRule(
                         openshell_core::proto::AddNetworkRule {
@@ -15029,7 +21547,10 @@ mod tests {
         let response = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "merge-provenance".to_string(),
+                sandbox: ("merge-provenance").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 merge_operations: vec![PolicyMergeOperation {
                     operation: Some(policy_merge_operation::Operation::AddRule(
                         openshell_core::proto::AddNetworkRule {
@@ -15074,7 +21595,7 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-preserve-backfill".to_string(),
                 name: "preserve-backfill".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::from([(
@@ -15082,7 +21603,7 @@ mod tests {
                     "keep".to_string(),
                 )]),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -15105,7 +21626,10 @@ mod tests {
         let response = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
-                name: "preserve-backfill".to_string(),
+                sandbox: "preserve-backfill".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(ProtoSandboxPolicy::default()),
                 expected_resource_version: current_version,
                 ..Default::default()
@@ -15141,6 +21665,329 @@ mod tests {
         assert!(
             stored.spec.as_ref().unwrap().policy.is_some(),
             "policy should still be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_reports_immutable_removal_before_policy_safety_errors() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-static-error-priority";
+        let sandbox_name = "static-error-priority";
+        let baseline = openshell_policy::restrictive_default_policy();
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                baseline.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // The replacement removes baseline paths and adds an unsafe traversal.
+        // Live-policy immutability is the earlier contract, so it must remain
+        // the stable failure even when later whole-policy validation would fail.
+        let mut unsafe_replacement = baseline;
+        unsafe_replacement.filesystem.as_mut().unwrap().read_only =
+            vec!["/usr/../etc/shadow".to_string()];
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(unsafe_replacement),
+                expected_resource_version: current_version,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("immutable removal must fail before whole-policy validation");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("cannot be removed"));
+        let unchanged = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref()),
+            Some(&openshell_policy::restrictive_default_policy())
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_validates_before_persistence() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-invalid-first-sync";
+        let sandbox_name = "invalid-first-sync";
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        let invalid_version_sets: &[&[&str]] = &[&["latest"], &["2025-11-25", "2025-11-25"]];
+        for versions in invalid_version_sets {
+            let error = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox_name.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    policy: Some(mcp_policy_with_versions(versions)),
+                    expected_resource_version: current_version,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("invalid first-sync policy must fail before backfill");
+
+            assert_eq!(error.code(), Code::InvalidArgument);
+            let unchanged = state
+                .store
+                .get_message_by_name::<Sandbox>("default", sandbox_name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(unchanged.spec.as_ref().unwrap().policy.is_none());
+            assert!(
+                state
+                    .store
+                    .get_latest_policy(sandbox_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_persists_defaulted_mcp_versions_identically() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let canonical_policy = mcp_policy_with_versions(&["2025-11-25"]);
+        let canonical_policy = validate_and_canonicalize_policy(canonical_policy)
+            .expect("explicit default MCP policy must canonicalize");
+        let canonical_payload = canonical_policy.encode_to_vec();
+        let canonical_hash = deterministic_policy_hash(&canonical_policy);
+        let cases = [
+            ("omitted-options", mcp_policy_without_options()),
+            ("empty-versions", mcp_policy_with_versions(&[])),
+            (
+                "explicit-default",
+                mcp_policy_with_versions(&["2025-11-25"]),
+            ),
+        ];
+
+        for (case, policy) in cases {
+            let sandbox_id = format!("sb-default-first-sync-{case}");
+            let sandbox_name = format!("default-first-sync-{case}");
+            let mut sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: sandbox_id.clone(),
+                    name: sandbox_name.clone(),
+                    created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_time: None,
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    providers: Vec::new(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+            state.store.put_message(&sandbox).await.unwrap();
+
+            let current = state
+                .store
+                .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                .await
+                .unwrap()
+                .unwrap();
+            let current_version = current.metadata.as_ref().unwrap().resource_version;
+            let response = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox_name.clone(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    policy: Some(policy),
+                    expected_resource_version: current_version,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("defaulted first-sync policy must persist")
+            .into_inner();
+
+            assert_eq!(response.version, 1, "{case}");
+            assert_eq!(response.policy_hash, canonical_hash, "{case}");
+            let stored = state
+                .store
+                .get_message_by_name::<Sandbox>("default", &sandbox_name)
+                .await
+                .unwrap()
+                .unwrap();
+            let stored_policy = stored
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .expect("backfilled sandbox policy");
+            assert_eq!(stored_policy, &canonical_policy, "{case}");
+            assert_eq!(
+                mcp_versions(stored_policy),
+                &["2025-11-25".to_string()],
+                "{case}"
+            );
+
+            let revision = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .unwrap()
+                .expect("first-sync policy revision must exist");
+            assert_eq!(revision.policy_payload, canonical_payload, "{case}");
+            assert_eq!(revision.policy_hash, canonical_hash, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_canonicalizes_mcp_versions_before_persistence() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-canonical-first-sync";
+        let sandbox_name = "canonical-first-sync";
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.to_string(),
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_time: None,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+        let canonical_policy =
+            mcp_policy_with_versions(&["2025-03-26", "2025-06-18", "2025-11-25"]);
+        let canonical_policy = validate_and_canonicalize_policy(canonical_policy)
+            .expect("canonical MCP policy must validate");
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(mcp_policy_with_versions(&[
+                    "2025-11-25",
+                    "2025-06-18",
+                    "2025-03-26",
+                ])),
+                expected_resource_version: current_version,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("valid first-sync policy must persist");
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", sandbox_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.spec.as_ref().and_then(|spec| spec.policy.as_ref()),
+            Some(&canonical_policy)
+        );
+        let revision = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("first-sync policy revision must exist");
+        assert_eq!(revision.policy_payload, canonical_policy.encode_to_vec());
+        assert_eq!(
+            revision.policy_hash,
+            deterministic_policy_hash(&canonical_policy)
         );
     }
 
@@ -15186,7 +22033,10 @@ mod tests {
         let err = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "invalid-annotation".to_string(),
+                sandbox: "invalid-annotation".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(ProtoSandboxPolicy::default()),
                 annotations: HashMap::from([("bad key".to_string(), "value".to_string())]),
                 ..Default::default()
@@ -15216,7 +22066,10 @@ mod tests {
         let err = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
-                name: "user-reserved-key".to_string(),
+                sandbox: "user-reserved-key".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(test_policy_with_rule(
                     "_provider_work_github",
                     "api.github.com",
@@ -15241,12 +22094,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-sync-strip".to_string(),
                 name: "sync-strip".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -15284,7 +22137,10 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(UpdateConfigRequest {
-                    name: "sync-strip".to_string(),
+                    sandbox: "sync-strip".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                     policy: Some(synced_policy),
                     expected_resource_version: current_version,
                     ..Default::default()
@@ -15347,12 +22203,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -15379,7 +22235,11 @@ mod tests {
         let err = handle_update_config(
             &state,
             authed_request(UpdateConfigRequest {
-                name: "test-sandbox".to_string(),
+                request_id: String::new(),
+                sandbox: "test-sandbox".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
                 policy: Some(new_policy),
                 setting_key: String::new(),
                 setting_value: None,
@@ -15388,7 +22248,6 @@ mod tests {
                 merge_operations: vec![],
                 expected_resource_version: 99, // stale version
                 annotations: HashMap::new(),
-                workspace: "default".to_string(),
             }),
         )
         .await
@@ -15442,12 +22301,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -15478,7 +22337,11 @@ mod tests {
                 handle_update_config(
                     &state_clone,
                     authed_request(UpdateConfigRequest {
-                        name: "test-sandbox".to_string(),
+                        request_id: String::new(),
+                        sandbox: "test-sandbox".to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector(
+                            "default".to_string(),
+                        )),
                         policy: Some(new_policy),
                         setting_key: String::new(),
                         setting_value: None,
@@ -15487,7 +22350,6 @@ mod tests {
                         merge_operations: vec![],
                         expected_resource_version: initial_version,
                         annotations: HashMap::new(),
-                        workspace: "default".to_string(),
                     }),
                 )
                 .await
@@ -15548,7 +22410,7 @@ mod tests {
     /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
     /// would create a CWE-203 workspace-name oracle.
     #[tokio::test]
-    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+    async fn non_member_gets_gets_not_found_without_sandbox_oracle() {
         let mut state = test_server_state().await;
         Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
 
@@ -15569,7 +22431,10 @@ mod tests {
         let err = handle_get_sandbox_policy_status(
             &state,
             non_member_request(GetSandboxPolicyStatusRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15577,15 +22442,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_get_sandbox_policy_status should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_get_sandbox_policy_status should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_list_sandbox_policies(
             &state,
             non_member_request(ListSandboxPoliciesRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15593,15 +22461,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_list_sandbox_policies should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_list_sandbox_policies should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_update_config(
             &state,
             non_member_request(UpdateConfigRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15609,15 +22480,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_update_config should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_update_config should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_get_draft_policy(
             &state,
             non_member_request(GetDraftPolicyRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15625,15 +22499,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_get_draft_policy should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_get_draft_policy should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_approve_draft_chunk(
             &state,
             non_member_request(ApproveDraftChunkRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15641,15 +22518,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_approve_draft_chunk should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_approve_draft_chunk should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_reject_draft_chunk(
             &state,
             non_member_request(RejectDraftChunkRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15657,15 +22537,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_reject_draft_chunk should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_reject_draft_chunk should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_approve_all_draft_chunks(
             &state,
             non_member_request(ApproveAllDraftChunksRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15673,15 +22556,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_approve_all_draft_chunks should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_approve_all_draft_chunks should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_edit_draft_chunk(
             &state,
             non_member_request(EditDraftChunkRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15689,15 +22575,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_edit_draft_chunk should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_edit_draft_chunk should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_undo_draft_chunk(
             &state,
             non_member_request(UndoDraftChunkRequest {
-                workspace: "no-such-ws".into(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15705,49 +22594,53 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_undo_draft_chunk should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_undo_draft_chunk should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_clear_draft_chunks(
             &state,
             non_member_request(ClearDraftChunksRequest {
-                workspace: "no-such-ws".into(),
-                ..Default::default()
+                request_id: String::new(),
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_clear_draft_chunks should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_clear_draft_chunks should return NotFound, got {:?}",
             err.code()
         );
 
         let err = handle_get_draft_history(
             &state,
             non_member_request(GetDraftHistoryRequest {
-                workspace: "no-such-ws".into(),
-                ..Default::default()
+                sandbox: ("any").to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "no-such-ws".to_string(),
+                )),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(
             err.code(),
-            Code::PermissionDenied,
-            "handle_get_draft_history should return PermissionDenied, got {:?}",
+            Code::NotFound,
+            "handle_get_draft_history should return NotFound, got {:?}",
             err.code()
         );
     }
 
-    /// ID-based policy handlers must return `NOT_FOUND` — never
-    /// `PERMISSION_DENIED` — when the caller lacks workspace access, so that
-    /// cross-workspace sandbox existence cannot be inferred (CWE-203).
+    /// Name-based policy handlers hide cross-workspace resources after
+    /// authorizing the explicit workspace selector.
     #[tokio::test]
-    async fn id_based_policy_handlers_hide_cross_workspace_sandboxes() {
+    async fn name_based_policy_handlers_hide_cross_workspace_sandboxes() {
         let mut state = test_server_state().await;
         Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
 
@@ -15778,7 +22671,10 @@ mod tests {
         let err = handle_get_sandbox_config(
             &state,
             non_member_request(GetSandboxConfigRequest {
-                sandbox_id: "sandbox-other".into(),
+                name: "other".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "other-workspace".to_string(),
+                )),
             }),
         )
         .await
@@ -15793,7 +22689,10 @@ mod tests {
         let err = handle_get_sandbox_logs(
             &state,
             non_member_request(GetSandboxLogsRequest {
-                sandbox_id: "sandbox-other".into(),
+                sandbox: "other".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "other-workspace".to_string(),
+                )),
                 ..Default::default()
             }),
         )
@@ -15802,7 +22701,7 @@ mod tests {
         assert_eq!(
             err.code(),
             Code::NotFound,
-            "handle_get_sandbox_logs must return NotFound, not PermissionDenied"
+            "handle_get_sandbox_logs must hide unauthorized sandbox existence"
         );
     }
 

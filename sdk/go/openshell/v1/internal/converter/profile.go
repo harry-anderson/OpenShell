@@ -7,6 +7,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // --- ProfileCategory enum mapping ---
@@ -52,6 +53,30 @@ func ProfileCategoryToProto(c types.ProfileCategory) pb.ProviderProfileCategory 
 		return pb.ProviderProfileCategory_PROVIDER_PROFILE_CATEGORY_KNOWLEDGE
 	default:
 		return pb.ProviderProfileCategory_PROVIDER_PROFILE_CATEGORY_UNSPECIFIED
+	}
+}
+
+// CredentialTokenGrantTypeFromProto converts a proto token grant type to an SDK token grant type.
+func CredentialTokenGrantTypeFromProto(t pb.ProviderCredentialTokenGrantType) types.CredentialTokenGrantType {
+	switch t {
+	case pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS:
+		return types.CredentialTokenGrantTypeClientCredentials
+	case pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE:
+		return types.CredentialTokenGrantTypeTokenExchange
+	default:
+		return types.CredentialTokenGrantType("")
+	}
+}
+
+// CredentialTokenGrantTypeToProto converts an SDK token grant type to a proto token grant type.
+func CredentialTokenGrantTypeToProto(t types.CredentialTokenGrantType) pb.ProviderCredentialTokenGrantType {
+	switch t {
+	case types.CredentialTokenGrantTypeClientCredentials:
+		return pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS
+	case types.CredentialTokenGrantTypeTokenExchange:
+		return pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE
+	default:
+		return pb.ProviderCredentialTokenGrantType_PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED
 	}
 }
 
@@ -146,14 +171,28 @@ func ProfileCredentialToProto(c *types.ProfileCredential) *pb.ProviderProfileCre
 	}
 }
 
+func profileDurationFromProto(value *durationpb.Duration) *types.ProfileDuration {
+	if value == nil {
+		return nil
+	}
+	return &types.ProfileDuration{Seconds: value.Seconds, Nanos: value.Nanos}
+}
+
+func profileDurationToProto(value *types.ProfileDuration) *durationpb.Duration {
+	if value == nil {
+		return nil
+	}
+	return &durationpb.Duration{Seconds: value.Seconds, Nanos: value.Nanos}
+}
+
 func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.ProfileCredentialRefresh {
 	if r == nil {
 		return nil
 	}
 	result := &types.ProfileCredentialRefresh{
 		Strategy: RefreshStrategyFromProto(r.GetStrategy()), TokenURL: r.GetTokenUrl(),
-		Scopes: CopyStringSlice(r.GetScopes()), RefreshBeforeSeconds: r.GetRefreshBeforeSeconds(),
-		MaxLifetimeSeconds: r.GetMaxLifetimeSeconds(),
+		Scopes: CopyStringSlice(r.GetScopes()), RefreshBefore: profileDurationFromProto(r.RefreshBefore),
+		MaxLifetime: profileDurationFromProto(r.MaxLifetime),
 	}
 	for _, material := range r.GetMaterial() {
 		result.Material = append(result.Material, types.ProfileCredentialRefreshMaterial{Name: material.GetName(), Description: material.GetDescription(), Required: material.GetRequired(), Secret: material.GetSecret()})
@@ -170,8 +209,8 @@ func profileCredentialRefreshToProto(r *types.ProfileCredentialRefresh) *pb.Prov
 	}
 	result := &pb.ProviderCredentialRefresh{
 		Strategy: RefreshStrategyToProto(r.Strategy), TokenUrl: r.TokenURL,
-		Scopes: CopyStringSlice(r.Scopes), RefreshBeforeSeconds: r.RefreshBeforeSeconds,
-		MaxLifetimeSeconds: r.MaxLifetimeSeconds,
+		Scopes: CopyStringSlice(r.Scopes), RefreshBefore: profileDurationToProto(r.RefreshBefore),
+		MaxLifetime: profileDurationToProto(r.MaxLifetime),
 	}
 	for _, material := range r.Material {
 		result.Material = append(result.Material, &pb.ProviderCredentialRefreshMaterial{Name: material.Name, Description: material.Description, Required: material.Required, Secret: material.Secret})
@@ -191,8 +230,11 @@ func tokenGrantFromProto(tg *pb.ProviderCredentialTokenGrant) *types.CredentialT
 		Audience:            tg.GetAudience(),
 		JWTSVIDAudience:     tg.GetJwtSvidAudience(),
 		Scopes:              CopyStringSlice(tg.GetScopes()),
-		CacheTTLSeconds:     tg.GetCacheTtlSeconds(),
+		CacheTTL:            profileDurationFromProto(tg.CacheTtl),
 		ClientAssertionType: tg.GetClientAssertionType(),
+		GrantType:           CredentialTokenGrantTypeFromProto(tg.GetGrantType()),
+		SubjectToken:        subjectTokenFromProto(tg.GetSubjectToken()),
+		RequestedTokenType:  tg.GetRequestedTokenType(),
 	}
 	if overrides := tg.GetAudienceOverrides(); len(overrides) > 0 {
 		result.AudienceOverrides = make([]types.TokenGrantAudienceOverride, len(overrides))
@@ -212,8 +254,11 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		Audience:            tg.Audience,
 		JwtSvidAudience:     tg.JWTSVIDAudience,
 		Scopes:              CopyStringSlice(tg.Scopes),
-		CacheTtlSeconds:     tg.CacheTTLSeconds,
+		CacheTtl:            profileDurationToProto(tg.CacheTTL),
 		ClientAssertionType: tg.ClientAssertionType,
+		GrantType:           CredentialTokenGrantTypeToProto(tg.GrantType),
+		SubjectToken:        subjectTokenToProto(tg.SubjectToken),
+		RequestedTokenType:  tg.RequestedTokenType,
 	}
 	if len(tg.AudienceOverrides) > 0 {
 		result.AudienceOverrides = make([]*pb.ProviderCredentialTokenGrantAudienceOverride, len(tg.AudienceOverrides))
@@ -222,6 +267,28 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		}
 	}
 	return result
+}
+
+func subjectTokenFromProto(st *pb.ProviderCredentialTokenGrantSubjectToken) *types.TokenGrantSubjectToken {
+	if st == nil {
+		return nil
+	}
+	return &types.TokenGrantSubjectToken{
+		Source:           st.GetSource(),
+		Credential:       st.GetCredential(),
+		SubjectTokenType: st.GetSubjectTokenType(),
+	}
+}
+
+func subjectTokenToProto(st *types.TokenGrantSubjectToken) *pb.ProviderCredentialTokenGrantSubjectToken {
+	if st == nil {
+		return nil
+	}
+	return &pb.ProviderCredentialTokenGrantSubjectToken{
+		Source:           st.Source,
+		Credential:       st.Credential,
+		SubjectTokenType: st.SubjectTokenType,
+	}
 }
 
 func audienceOverrideFromProto(o *pb.ProviderCredentialTokenGrantAudienceOverride) types.TokenGrantAudienceOverride {

@@ -33,15 +33,13 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 
 async fn create_sandbox_with_labels(name: &str, labels: &[(&str, &str)]) -> String {
     let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", "create", "--name", name]);
+    cmd.args(["sandbox", "create", "--detach", "--name", name]);
 
     for (key, value) in labels {
         cmd.arg("--label").arg(format!("{key}={value}"));
     }
 
-    cmd.args(["--", "echo", "test"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -117,23 +115,26 @@ async fn delete_sandbox(name: &str) {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // end-to-end test exercises full label lifecycle
 async fn sandbox_labels_are_stored_and_filterable() {
+    // Keep the unique names below the public 19-character routable-name
+    // limit. Hex keeps the per-process suffix compact on busy CI hosts.
+    let suffix = format!("{:x}", std::process::id());
+    let dev_backend = format!("lbl-db-{suffix}");
+    let staging_backend = format!("lbl-sb-{suffix}");
+    let prod_frontend = format!("lbl-pf-{suffix}");
+    let dev_data = format!("lbl-dd-{suffix}");
+
     // Create sandboxes with different labels
     let name1 =
-        create_sandbox_with_labels("e2e-lbl-dev-back", &[("env", "dev"), ("team", "backend")])
-            .await;
+        create_sandbox_with_labels(&dev_backend, &[("env", "dev"), ("team", "backend")]).await;
 
-    let name2 = create_sandbox_with_labels(
-        "e2e-lbl-stg-back",
-        &[("env", "staging"), ("team", "backend")],
-    )
-    .await;
+    let name2 =
+        create_sandbox_with_labels(&staging_backend, &[("env", "staging"), ("team", "backend")])
+            .await;
 
     let name3 =
-        create_sandbox_with_labels("e2e-lbl-prd-frnt", &[("env", "prod"), ("team", "frontend")])
-            .await;
+        create_sandbox_with_labels(&prod_frontend, &[("env", "prod"), ("team", "frontend")]).await;
 
-    let name4 =
-        create_sandbox_with_labels("e2e-lbl-dev-data", &[("env", "dev"), ("team", "data")]).await;
+    let name4 = create_sandbox_with_labels(&dev_data, &[("env", "dev"), ("team", "data")]).await;
 
     // Test 1: Verify labels are stored in sandbox metadata
     let details = get_sandbox_details(&name1).await;

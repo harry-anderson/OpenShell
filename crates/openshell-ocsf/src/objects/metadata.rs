@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// OCSF Metadata object — event provenance and schema info.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
-    /// OCSF schema version (e.g., "1.7.0").
+    /// OCSF schema version (e.g., "1.8.0").
     pub version: String,
 
     /// The product that generated the event.
@@ -18,7 +18,7 @@ pub struct Metadata {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
 
-    /// Unique event source identifier (sandbox ID).
+    /// Unique event identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
 
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn test_metadata_serialization() {
         let metadata = Metadata {
-            version: "1.7.0".to_string(),
+            version: "1.8.0".to_string(),
             product: Product::openshell_sandbox("0.1.0"),
             profiles: vec!["security_control".to_string(), "container".to_string()],
             uid: Some("sandbox-abc123".to_string()),
@@ -68,7 +68,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(&metadata).unwrap();
-        assert_eq!(json["version"], "1.7.0");
+        assert_eq!(json["version"], "1.8.0");
         assert_eq!(json["product"]["name"], "OpenShell Sandbox Supervisor");
         assert_eq!(json["product"]["vendor_name"], "OpenShell");
         assert!(json.get("log_source").is_none());
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_metadata_with_log_source() {
         let metadata = Metadata {
-            version: "1.7.0".to_string(),
+            version: "1.8.0".to_string(),
             product: Product::openshell_sandbox("0.1.0"),
             profiles: vec![],
             uid: None,

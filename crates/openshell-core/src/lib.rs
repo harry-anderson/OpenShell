@@ -16,54 +16,78 @@ pub mod container_paths;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
+pub mod dynamic_string_allowlist;
 pub mod endpoint_path;
+pub mod endpoint_status;
 pub mod error;
+pub mod extension_protocol;
+#[cfg(unix)]
+pub mod external_driver_socket;
 pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
 pub mod image;
-pub mod inference;
 pub mod jwt;
+pub mod local_api_socket;
+pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod paths;
 pub mod policy;
+pub mod policy_identity;
 pub mod progress;
 pub mod proposals;
 pub mod proto;
 pub mod proto_struct;
 pub mod provider_credentials;
+pub mod resource_admission;
+pub mod rpc_error;
 pub mod sandbox_env;
+pub mod sandbox_generation;
+pub mod sandbox_session;
 pub mod secrets;
+pub mod ssh_agent;
+pub mod git_sign;
 pub mod settings;
+pub mod shell;
+pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 pub mod transport_errors;
 
 pub use config::{
-    ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
+    AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
     GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
     GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
+    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
+    UpstreamProxyConfig,
 };
+pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
+pub use sandbox_session::{SandboxSessionId, SandboxSessionIdError};
 
 /// Build version string derived from git metadata.
 ///
-/// For local builds this is computed by `build.rs` via `git describe` using
-/// the guess-next-dev scheme (e.g. `0.0.4-dev.6+g2bf9969`). In Docker/CI
-/// builds where `.git` is absent, falls back to `CARGO_PKG_VERSION` which
-/// is already set correctly by the build pipeline's sed patch.
+/// For local builds this is computed by `build.rs` from the exact release tag
+/// or the latest merged stable tag using the guess-next-dev scheme (e.g.
+/// `0.0.4-dev.6+g2bf9969ab`). In Docker/CI builds where `.git` is absent, it
+/// falls back to `CARGO_PKG_VERSION`, which the build pipeline already stamps.
 pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+#[cfg(test)]
+#[path = "../build_version.rs"]
+mod build_version;
 
 /// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
 ///

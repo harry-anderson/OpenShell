@@ -9,27 +9,27 @@ description: |
   OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
   It offers a CLI for managing gateways, sandboxes, and providers with
   policy-enforced egress routing, credential proxying, and privacy-aware
-  LLM inference routing.
+  profile-backed model-provider access.
 
   The OpenShell snap ships a CLI (`openshell`), a terminal UI
   (`openshell.term`), and a managed gateway daemon (`openshell.gateway`).
 
   **Setup instructions**
 
-    1. Install the Docker snap:
+    1. Install and start Docker using your preferred package source before
+       installing the OpenShell snap. Use a system package or Docker's package
+       repository. The Docker snap is not currently compatible with OpenShell.
 
-         sudo snap install docker
+       Snap Store installations automatically connect the required interfaces.
 
-       Support for system-installed Docker is coming in snapd 2.76.
+       If the OpenShell snap was installed before Docker was running, it may
+       have hit the systemd start limit when trying to repeatedly start and
+       connect to docker. If this is the case, it can be resolved by doing:
 
-    2. Connect the required interfaces and start the gateway:
+         sudo systemctl reset-failed snap.openshell.gateway.service
+         sudo snap restart openshell.gateway
 
-         sudo snap connect openshell:docker docker:docker-daemon
-         sudo snap connect openshell:log-observe
-         sudo snap connect openshell:system-observe
-         sudo snap start openshell.gateway
-
-    3. Verify the gateway and register it locally:
+    2. Verify the gateway and register it locally:
 
          snap services openshell.gateway
          openshell status
@@ -45,6 +45,11 @@ description: |
 base: core24
 grade: stable
 confinement: strict
+# The system :docker slot was added in snapd 2.76, so this is the minimum
+# required version. Snapd 2.77 allowed manual connection to that slot without
+# snap-declaration overrides from the store, such as when installing a locally-
+# built snap, but that is not required for installations from the snap store.
+assumes: [snapd2.76]
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
 source-code: https://github.com/NVIDIA/OpenShell
@@ -87,17 +92,18 @@ apps:
     # during snap refreshes, which would kill active sandbox sessions.
     # Operators must manually restart the service after a refresh if needed.
     refresh-mode: endure
-    # The wrapper sets OPENSHELL_DISABLE_TLS=true and OPENSHELL_DB_URL to
-    # use $SNAP_COMMON/gateway.db. If $SNAP_COMMON/gateway.toml exists it is
-    # passed to the gateway as --config, allowing operators to override
-    # settings without rebuilding the snap.
+    # Snapd runs this daemon as root, so ordinary CLI users cannot read the
+    # client certificate generated in root-owned snap state. The wrapper sets
+    # OPENSHELL_DISABLE_TLS=true for the loopback-only listener and uses
+    # $SNAP_COMMON/gateway.db. Before startup it bootstraps package-managed
+    # credentials and validates the selected operator-provided config without
+    # creating or rewriting it. A nonempty OPENSHELL_GATEWAY_CONFIG takes
+    # precedence over gateway.toml.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"
     plugs:
       - docker
-      # Docker snap is required because the snap uses the docker:docker-daemon
-      # interface slot. It does not work with system-installed Docker.
       - log-observe
       - network
       - network-bind

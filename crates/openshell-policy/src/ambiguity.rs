@@ -3,7 +3,9 @@
 
 //! Validation for endpoint selectors whose policy-derived behavior conflicts.
 
-use openshell_core::proto::{NetworkEndpoint, SandboxPolicy};
+use openshell_core::proto::{
+    NetworkEndpoint, NetworkEnforcementMode, NetworkTlsMode, SandboxPolicy,
+};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt;
 
@@ -165,9 +167,15 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
     let mut conflicts = Vec::new();
     push_conflict(
         &mut conflicts,
+        "transparent_tcp_eligible",
+        &is_explicit_tcp(&left.protocol),
+        &is_explicit_tcp(&right.protocol),
+    );
+    push_conflict(
+        &mut conflicts,
         "tls",
-        &normalized_tls(&left.tls),
-        &normalized_tls(&right.tls),
+        &normalized_tls(left.tls),
+        &normalized_tls(right.tls),
     );
     push_conflict(
         &mut conflicts,
@@ -175,13 +183,11 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
         &normalized_strings(&left.allowed_ips),
         &normalized_strings(&right.allowed_ips),
     );
-    push_conflict(
-        &mut conflicts,
-        "advisor_proposed",
-        &left.advisor_proposed,
-        &right.advisor_proposed,
-    );
     conflicts
+}
+
+fn is_explicit_tcp(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("tcp")
 }
 
 /// Keep request-pipeline ambiguity checks aligned with Rego's
@@ -190,9 +196,9 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
 /// cannot compete with the single L7/connection-config endpoint selected for
 /// that request.
 fn endpoint_contributes_request_pipeline_metadata(endpoint: &NetworkEndpoint) -> bool {
-    !endpoint.protocol.is_empty()
+    (!endpoint.protocol.is_empty() && !endpoint.protocol.eq_ignore_ascii_case("tcp"))
         || !endpoint.allowed_ips.is_empty()
-        || !endpoint.tls.is_empty()
+        || endpoint.tls != NetworkTlsMode::Unspecified as i32
         || endpoint.credential_binding.is_some()
 }
 
@@ -201,14 +207,14 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
     push_conflict(
         &mut conflicts,
         "protocol",
-        &left.protocol.to_ascii_lowercase(),
-        &right.protocol.to_ascii_lowercase(),
+        &normalized_request_protocol(&left.protocol),
+        &normalized_request_protocol(&right.protocol),
     );
     push_conflict(
         &mut conflicts,
         "enforcement",
-        &normalized_enforcement(&left.enforcement),
-        &normalized_enforcement(&right.enforcement),
+        &normalized_enforcement(left.enforcement),
+        &normalized_enforcement(right.enforcement),
     );
     push_conflict(
         &mut conflicts,
@@ -300,6 +306,14 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
     conflicts
 }
 
+fn normalized_request_protocol(protocol: &str) -> String {
+    if protocol.eq_ignore_ascii_case("tcp") {
+        String::new()
+    } else {
+        protocol.to_ascii_lowercase()
+    }
+}
+
 fn websocket_graphql_policy(endpoint: &NetworkEndpoint) -> bool {
     let allow_rule_has_graphql_fields = endpoint.rules.iter().any(|rule| {
         rule.allow.as_ref().is_some_and(|allow| {
@@ -331,19 +345,23 @@ fn push_conflict<T: fmt::Debug + PartialEq>(
     }
 }
 
-fn normalized_tls(value: &str) -> &'static str {
-    if value.eq_ignore_ascii_case("skip") {
-        "skip"
+fn normalized_tls(value: i32) -> i32 {
+    if value == NetworkTlsMode::Skip as i32 {
+        NetworkTlsMode::Skip as i32
+    } else if NetworkTlsMode::try_from(value).is_ok() {
+        NetworkTlsMode::Unspecified as i32
     } else {
-        "auto"
+        value
     }
 }
 
-fn normalized_enforcement(value: &str) -> &'static str {
-    if value.eq_ignore_ascii_case("enforce") {
-        "enforce"
+fn normalized_enforcement(value: i32) -> i32 {
+    if value == NetworkEnforcementMode::Enforce as i32 {
+        NetworkEnforcementMode::Enforce as i32
+    } else if NetworkEnforcementMode::try_from(value).is_ok() {
+        NetworkEnforcementMode::Audit as i32
     } else {
-        "audit"
+        value
     }
 }
 
@@ -695,7 +713,9 @@ fn complement_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{L7Allow, L7Rule, NetworkBinary, NetworkPolicyRule};
+    use openshell_core::proto::{
+        L7Allow, L7Rule, NetworkAccessPreset, NetworkBinary, NetworkPolicyRule,
+    };
 
     fn endpoint(host: &str, port: u32) -> NetworkEndpoint {
         NetworkEndpoint {
@@ -714,7 +734,6 @@ mod tests {
                 endpoints: vec![left],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -725,7 +744,6 @@ mod tests {
                 endpoints: vec![right],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -752,7 +770,7 @@ mod tests {
     #[test]
     fn disjoint_ports_do_not_overlap() {
         let mut left = endpoint("api.example.com", 443);
-        left.tls = "skip".to_string();
+        left.tls = NetworkTlsMode::Skip as i32;
         let right = endpoint("api.example.com", 8443);
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
     }
@@ -761,12 +779,21 @@ mod tests {
     fn compatible_request_rules_may_overlap() {
         let mut left = endpoint("api.example.com", 443);
         left.protocol = "rest".to_string();
-        left.tls = "skip".to_string();
+        left.tls = NetworkTlsMode::Skip as i32;
         let mut right = left.clone();
-        left.access = "read-only".to_string();
-        right.access = "read-write".to_string();
+        left.access = NetworkAccessPreset::ReadOnly as i32;
+        right.access = NetworkAccessPreset::ReadWrite as i32;
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn advisor_provenance_does_not_make_endpoints_ambiguous() {
+        let explicit = endpoint("api.example.com", 443);
+        let mut proposed = explicit.clone();
+        proposed.advisor_proposed = true;
+
+        assert!(find_endpoint_ambiguities(&policy_with(explicit, proposed)).is_empty());
     }
 
     #[test]
@@ -774,7 +801,7 @@ mod tests {
         let left = endpoint("api.example.com", 443);
         let mut right = endpoint("api.example.com", 443);
         right.protocol = "rest".to_string();
-        right.enforcement = "enforce".to_string();
+        right.enforcement = NetworkEnforcementMode::Enforce as i32;
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
     }
@@ -847,11 +874,11 @@ mod tests {
     fn more_specific_path_may_override_request_pipeline_metadata() {
         let mut left = endpoint("api.example.com", 443);
         left.protocol = "rest".to_string();
-        left.enforcement = "enforce".to_string();
+        left.enforcement = NetworkEnforcementMode::Enforce as i32;
         let mut right = endpoint("api.example.com", 443);
         right.path = "/graphql".to_string();
         right.protocol = "graphql".to_string();
-        right.enforcement = "enforce".to_string();
+        right.enforcement = NetworkEnforcementMode::Enforce as i32;
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
     }
@@ -859,7 +886,7 @@ mod tests {
     #[test]
     fn exact_wildcard_tls_conflict_is_rejected() {
         let mut left = endpoint("*.example.com", 443);
-        left.tls = "skip".to_string();
+        left.tls = NetworkTlsMode::Skip as i32;
         let right = endpoint("api.example.com", 443);
         let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
 
@@ -1019,12 +1046,30 @@ mod tests {
     #[test]
     fn different_binary_lists_do_not_hide_endpoint_ambiguity() {
         let mut left = endpoint("api.example.com", 443);
-        left.tls = "skip".to_string();
+        left.tls = NetworkTlsMode::Skip as i32;
         let right = endpoint("api.example.com", 443);
 
         assert_eq!(
             find_endpoint_ambiguities(&policy_with(left, right)).len(),
             1
+        );
+    }
+
+    #[test]
+    fn explicit_tcp_and_omitted_protocol_are_ambiguous_for_native_tcp_eligibility() {
+        let mut explicit_tcp = endpoint("api.example.com", 443);
+        explicit_tcp.protocol = "tcp".to_string();
+        explicit_tcp.tls = NetworkTlsMode::Skip as i32;
+        let mut omitted = endpoint("api.example.com", 443);
+        omitted.tls = NetworkTlsMode::Skip as i32;
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(explicit_tcp, omitted));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("transparent_tcp_eligible"))
         );
     }
 }

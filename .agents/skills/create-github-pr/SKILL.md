@@ -1,6 +1,8 @@
 ---
 name: create-github-pr
 description: Create GitHub pull requests using the gh CLI. Use when the user wants to create a new PR, submit code for review, or open a pull request. Trigger keywords - create PR, pull request, new PR, submit for review, code review.
+metadata:
+  internal: true
 ---
 
 # Create GitHub Pull Request
@@ -19,9 +21,9 @@ Create pull requests on GitHub using the `gh` CLI.
 
 If the branch changes gateway TOML parsing, `[openshell.gateway]` fields,
 `[openshell.drivers.<name>]` fields, driver config defaults, or Helm rendering
-of `gateway.toml`, verify that `docs/reference/gateway-config.mdx` is updated
+of `gateway.toml`, verify that `docs/how-it-works/gateways/configuration.mdx` is updated
 in the same branch. If the change affects user-facing compute-driver setup,
-also update `docs/reference/sandbox-compute-drivers.mdx` or the relevant
+also update `docs/how-it-works/sandboxes/runtimes.mdx` or the relevant
 deployment docs.
 
 ### Check Agent Infrastructure
@@ -185,7 +187,7 @@ gh pr create \
   --body "$(cat <<'EOF'
 ## Summary
 
-Add `--limit` and `--offset` flags to `openshell sandbox list` for pagination.
+Add `--page-size` and `--page-token` flags to `openshell sandbox list` for continuation-token pagination.
 
 ## Related Issue
 
@@ -193,9 +195,9 @@ Closes #456
 
 ## Changes
 
-- Added `offset` and `limit` query parameters to the sandbox list API call
-- Default limit is 20, max is 100
-- Response includes `total_count` field
+- Added `page_size` and `page_token` fields to the sandbox list API call
+- Default page size is 100, max is 1,000
+- Structured responses include `next_page_token`
 
 ## Testing
 

@@ -5,7 +5,7 @@ title: "Managing Certificates"
 sidebar-title: "Managing Certificates"
 description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
 keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
-position: 3
+position: 4
 ---
 
 The OpenShell gateway uses mTLS certificates for transport between the gateway and sandbox supervisors. These certificates are not Kubernetes user authentication; configure OIDC or a trusted access proxy for user access. The Helm chart supports two ways to provision and manage the certificate bundle:
@@ -66,7 +66,7 @@ By default, cert-manager issues both the server and client certificates from
 a self-signed CA the chart creates — this rotates automatically, but the
 server certificate is still not publicly trusted. `certManager.serverIssuerRef`
 overrides the `issuerRef` on the server `Certificate` resource to point at a
-real `Issuer` or `ClusterIssuer` instead, for example an ACME issuer:
+real `Issuer` or `ClusterIssuer` instead, for example a LetsEncrypt/ACME issuer:
 
 ```shell
 helm upgrade --install openshell \

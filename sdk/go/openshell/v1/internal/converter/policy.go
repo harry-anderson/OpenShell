@@ -54,24 +54,30 @@ func PolicyChunkFromProto(c *pb.PolicyChunk) *types.PolicyChunk {
 		return nil
 	}
 	return &types.PolicyChunk{
-		ID:                c.GetId(),
-		Status:            c.GetStatus(),
-		RuleName:          c.GetRuleName(),
-		ProposedRule:      NetworkPolicyRuleFromProto(c.GetProposedRule()),
-		Rationale:         c.GetRationale(),
-		SecurityNotes:     c.GetSecurityNotes(),
-		Confidence:        c.GetConfidence(),
-		DenialSummaryIDs:  CopyStringSlice(c.GetDenialSummaryIds()),
-		CreatedAt:         TimeFromMillis(c.GetCreatedAtMs()),
-		DecidedAt:         TimeFromMillis(c.GetDecidedAtMs()),
-		Stage:             c.GetStage(),
-		SupersedesChunkID: c.GetSupersedesChunkId(),
-		HitCount:          c.GetHitCount(),
-		FirstSeen:         TimeFromMillis(c.GetFirstSeenMs()),
-		LastSeen:          TimeFromMillis(c.GetLastSeenMs()),
-		Binary:            c.GetBinary(),
-		ValidationResult:  c.GetValidationResult(),
-		RejectionReason:   c.GetRejectionReason(),
+		ID:                           c.GetId(),
+		Status:                       c.GetStatus(),
+		RuleName:                     c.GetRuleName(),
+		ProposedRule:                 NetworkPolicyRuleFromProto(c.GetProposedRule()),
+		Rationale:                    c.GetRationale(),
+		SecurityNotes:                c.GetSecurityNotes(),
+		Confidence:                   c.GetConfidence(),
+		DenialSummaryIDs:             CopyStringSlice(c.GetDenialSummaryIds()),
+		CreatedAt:                    TimeFromProto(c.GetCreatedTime()),
+		DecidedAt:                    TimeFromProto(c.GetDecidedTime()),
+		Stage:                        c.GetStage(),
+		SupersedesChunkID:            c.GetSupersedesChunkId(),
+		HitCount:                     c.GetHitCount(),
+		FirstSeen:                    TimeFromProto(c.GetFirstSeenTime()),
+		LastSeen:                     TimeFromProto(c.GetLastSeenTime()),
+		Binary:                       c.GetBinary(),
+		ValidationResult:             c.GetValidationResult(),
+		RejectionReason:              c.GetRejectionReason(),
+		ApplicationError:             c.GetApplicationError(),
+		ReviewToken:                  c.GetReviewToken(),
+		CurrentEffectivePolicyHash:   c.GetCurrentEffectivePolicyHash(),
+		CandidateEffectivePolicyHash: c.GetCandidateEffectivePolicyHash(),
+		CurrentEffectivePolicy:       SandboxPolicyFromProto(c.GetCurrentEffectivePolicy()),
+		CandidateEffectivePolicy:     SandboxPolicyFromProto(c.GetCandidateEffectivePolicy()),
 	}
 }
 
@@ -85,7 +91,7 @@ func DraftPolicyFromProto(r *pb.GetDraftPolicyResponse) *types.DraftPolicy {
 	result := &types.DraftPolicy{
 		RollingSummary: r.GetRollingSummary(),
 		DraftVersion:   r.GetDraftVersion(),
-		LastAnalyzedAt: TimeFromMillis(r.GetLastAnalyzedAtMs()),
+		LastAnalyzedAt: TimeFromProto(r.GetLastAnalyzedTime()),
 	}
 	if chunks := r.GetChunks(); len(chunks) > 0 {
 		result.Chunks = make([]types.PolicyChunk, 0, len(chunks))
@@ -293,8 +299,8 @@ func SandboxPolicyRevisionFromProto(r *pb.SandboxPolicyRevision) *types.SandboxP
 		PolicyHash: r.GetPolicyHash(),
 		Status:     PolicyLoadStatusFromProto(r.GetStatus()),
 		LoadError:  r.GetLoadError(),
-		CreatedAt:  TimeFromMillis(r.GetCreatedAtMs()),
-		LoadedAt:   TimeFromMillis(r.GetLoadedAtMs()),
+		CreatedAt:  TimeFromProto(r.GetCreatedTime()),
+		LoadedAt:   TimeFromProto(r.GetLoadedTime()),
 		Policy:     SandboxPolicyFromProto(r.GetPolicy()),
 		Provenance: CopyStringMap(r.GetProvenance()),
 	}
@@ -377,7 +383,7 @@ func DraftHistoryEntryFromProto(e *pb.DraftHistoryEntry) *types.DraftHistoryEntr
 		return nil
 	}
 	return &types.DraftHistoryEntry{
-		Timestamp:   TimeFromMillis(e.GetTimestampMs()),
+		Timestamp:   TimeFromProto(e.GetEventTime()),
 		EventType:   e.GetEventType(),
 		Description: e.GetDescription(),
 		ChunkID:     e.GetChunkId(),

@@ -171,36 +171,6 @@ binary_allowed(policy, exec) if {
 	glob.match(b.path, ["/"], p)
 }
 
-user_declared_binary_allowed(_, _) if {
-	not binary_identity_required
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not object.get(b, "advisor_proposed", false)
-	not contains(b.path, "*")
-	b.path == exec.path
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not object.get(b, "advisor_proposed", false)
-	not contains(b.path, "*")
-	ancestor := exec.ancestors[_]
-	b.path == ancestor
-}
-
-user_declared_binary_allowed(policy, exec) if {
-	some b in policy.binaries
-	not object.get(b, "advisor_proposed", false)
-	contains(b.path, "*")
-	all_paths := array.concat([exec.path], exec.ancestors)
-	some p in all_paths
-	glob.match(b.path, ["/"], p)
-}
-
 # --- Network action (allow / deny) ---
 #
 # These rules are mutually exclusive by construction:
@@ -212,6 +182,39 @@ default network_action := "deny"
 # Explicitly allowed: endpoint + binary match in a network policy → allow.
 network_action := "allow" if {
 	network_policy_for_request
+}
+
+# --- Authoritative egress authorization snapshot ---
+#
+# Rust evaluates this rule once per admitted connection. Keeping the action,
+# matched policy, endpoint metadata, and exact-host signal in one result makes
+# them an atomic view of one policy generation.
+
+default _egress_matched_policy := ""
+
+_egress_matched_policy := matched_network_policy if {
+	matched_network_policy
+}
+
+default _egress_deny_reason := ""
+
+_egress_deny_reason := deny_reason if {
+	network_action == "deny"
+}
+
+default _egress_exact_declared_endpoint_host := false
+
+_egress_exact_declared_endpoint_host := true if {
+	exact_declared_endpoint_host
+}
+
+egress_authorization := {
+	"action": network_action,
+	"deny_reason": _egress_deny_reason,
+	"matched_policy": _egress_matched_policy,
+	"endpoint_configs": _matching_endpoint_configs,
+	"matched_endpoints": _matching_endpoint_records,
+	"exact_declared_endpoint_host": _egress_exact_declared_endpoint_host,
 }
 
 # ===========================================================================
@@ -864,9 +867,77 @@ _matching_endpoint_configs := [cfg |
 	endpoint_has_extended_config(cfg)
 ]
 
+# Full matched endpoint records are kept separate from the legacy
+# endpoint-config list, which intentionally contains only connection/L7
+# metadata. The policy name and array index identify the endpoint within this
+# policy generation while the complete endpoint preserves protocol markers
+# needed by later policy-DNS correlation.
+
+_policy_endpoint_records(policy_name, policy) := [record |
+	some endpoint_index, ep in policy.endpoints
+	endpoint_matches_request(ep, input.network)
+	record := {
+		"policy_name": policy_name,
+		"endpoint_index": endpoint_index,
+		"endpoint": ep,
+	}
+]
+
+_matching_endpoint_records := [record |
+	some pname
+	_matching_policy_names[pname]
+	records := _policy_endpoint_records(pname, data.network_policies[pname])
+	record := records[_]
+]
+
+# Endpoints eligible for policy DNS are a policy-data snapshot, not an
+# authorization decision. In particular, they do not depend on input.exec or
+# grant access to any process. Every supported endpoint protocol is carried by
+# TCP, and an omitted protocol is the default L4 TCP form. Endpoints with a
+# resolvable host plus concrete ports are therefore materialized regardless of
+# whether later stream handling is L4, HTTP, WebSocket, or another L7 adapter.
+policy_dns_eligible_endpoint_records := [record |
+	some policy_name, policy in data.network_policies
+	some endpoint_index, ep in policy.endpoints
+	protocol := lower(object.get(ep, "protocol", "tcp"))
+	protocol in {"tcp", "rest", "websocket", "graphql", "sql", "json-rpc", "mcp"}
+	object.get(ep, "host", "") != ""
+	ports := object.get(ep, "ports", [])
+	count(ports) > 0
+	every port in ports {
+		is_number(port)
+		port >= 1
+		port <= 65535
+	}
+	record := {
+		"policy_name": policy_name,
+		"endpoint_index": endpoint_index,
+		"endpoint": ep,
+	}
+]
+
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
+
+# --- Credential provenance view (credential gating only) ---
+# Deliberately separate from `_matching_endpoint_configs`. The credential guard
+# must also see L4-only endpoints, which carry no extended config. Widening
+# `endpoint_has_extended_config` instead would let such an endpoint become
+# element [0] of the shared list and shadow the TLS mode, SSRF allowlist, and
+# L7 protocol of an inspected endpoint on the same host:port.
+_policy_credential_guards(policy) := [ep |
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+]
+
+endpoint_credential_guards := [cfg |
+	some pname
+	_matching_policy_names[pname]
+	cfgs := _policy_credential_guards(data.network_policies[pname])
+	cfg := cfgs[_]
+]
 
 # Expose middleware policy data to Rust. Selection and validation stay in Rust;
 # Rego does not evaluate middleware selectors.
@@ -884,7 +955,7 @@ _policy_has_exact_declared_endpoint(policy) if {
 exact_declared_endpoint_host if {
 	some pname
 	policy := data.network_policies[pname]
-	user_declared_binary_allowed(policy, input.exec)
+	binary_allowed(policy, input.exec)
 	_policy_has_exact_declared_endpoint(policy)
 }
 
@@ -924,10 +995,13 @@ endpoint_path_matches_request(ep, request) if {
 	path_matches(request.path, path)
 }
 
-# An endpoint has extended config if it specifies L7 protocol, allowed_ips,
-# or an explicit tls mode (e.g. tls: skip).
+# An endpoint has extended config if it specifies an L7 protocol, allowed_ips,
+# or an explicit tls mode (e.g. tls: skip). Explicit protocol "tcp" is the
+# authored spelling of plain L4 behavior and does not select an L7 config.
 endpoint_has_extended_config(ep) if {
-	ep.protocol
+	protocol := object.get(ep, "protocol", "")
+	protocol != ""
+	lower(protocol) != "tcp"
 }
 
 endpoint_has_extended_config(ep) if {

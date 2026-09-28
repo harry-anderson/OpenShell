@@ -39,6 +39,11 @@ pub fn oidc_token_path(gateway_name: &str) -> Result<PathBuf> {
     Ok(user_gateway_dir(gateway_name)?.join("oidc_token.json"))
 }
 
+/// Path to the one-shot marker that asks the next browser login to prompt.
+pub fn oidc_login_prompt_required_path(gateway_name: &str) -> Result<PathBuf> {
+    Ok(user_gateway_dir(gateway_name)?.join("oidc_login_prompt_required"))
+}
+
 /// Store an OIDC token bundle for a gateway.
 pub fn store_oidc_token(gateway_name: &str, bundle: &OidcTokenBundle) -> Result<()> {
     let path = oidc_token_path(gateway_name)?;
@@ -50,6 +55,7 @@ pub fn store_oidc_token(gateway_name: &str, bundle: &OidcTokenBundle) -> Result<
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write OIDC token to {}", path.display()))?;
     set_file_owner_only(&path)?;
+    clear_oidc_login_prompt(gateway_name)?;
     Ok(())
 }
 
@@ -76,6 +82,33 @@ pub fn remove_oidc_token(gateway_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mark the next interactive OIDC login as requiring a fresh `IdP` prompt.
+pub fn request_oidc_login_prompt(gateway_name: &str) -> Result<()> {
+    let path = oidc_login_prompt_required_path(gateway_name)?;
+    ensure_parent_dir_restricted(&path)?;
+    std::fs::write(&path, b"1\n")
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    set_file_owner_only(&path)?;
+    Ok(())
+}
+
+/// Return whether the next interactive OIDC login should request a fresh prompt.
+pub fn oidc_login_prompt_required(gateway_name: &str) -> bool {
+    oidc_login_prompt_required_path(gateway_name).is_ok_and(|path| path.exists())
+}
+
+/// Clear the one-shot fresh-login marker for a gateway.
+pub fn clear_oidc_login_prompt(gateway_name: &str) -> Result<()> {
+    let path = oidc_login_prompt_required_path(gateway_name)?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Check if the stored access token is expired or near expiry.
 ///
 /// Returns `true` if the token expires within the next 30 seconds.
@@ -89,6 +122,21 @@ pub fn is_token_expired(bundle: &OidcTokenBundle) -> bool {
         .unwrap_or_default()
         .as_secs();
     now + 30 >= expires_at
+}
+
+/// Check whether the stored access token has actually expired.
+///
+/// Unlike [`is_token_expired`], this does not include the 30-second refresh
+/// window. Tokens without expiry metadata are treated as valid.
+pub fn is_token_actually_expired(bundle: &OidcTokenBundle) -> bool {
+    let Some(expires_at) = bundle.expires_at else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now >= expires_at
 }
 
 #[cfg(test)]
@@ -127,6 +175,62 @@ mod tests {
             assert!(store_oidc_token("../escape", &bundle).is_err());
             assert!(load_oidc_token("../escape").is_none());
             assert!(remove_oidc_token("../escape").is_err());
+        });
+    }
+
+    #[test]
+    fn expiry_checks_distinguish_refresh_window_from_actual_expiry() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bundle = OidcTokenBundle {
+            access_token: "token".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 10),
+            issuer: "https://issuer.example.com".to_string(),
+            client_id: "openshell-cli".to_string(),
+        };
+
+        assert!(is_token_expired(&bundle));
+        assert!(!is_token_actually_expired(&bundle));
+
+        let expired = OidcTokenBundle {
+            expires_at: Some(now.saturating_sub(1)),
+            ..bundle
+        };
+        assert!(is_token_actually_expired(&expired));
+    }
+
+    #[test]
+    fn oidc_login_prompt_marker_is_per_gateway() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            assert!(!oidc_login_prompt_required("alpha"));
+            assert!(!oidc_login_prompt_required("beta"));
+
+            request_oidc_login_prompt("alpha").unwrap();
+
+            assert!(oidc_login_prompt_required("alpha"));
+            assert!(!oidc_login_prompt_required("beta"));
+
+            let bundle = OidcTokenBundle {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                issuer: "https://issuer.example.com".to_string(),
+                client_id: "openshell-cli".to_string(),
+            };
+            store_oidc_token("alpha", &bundle).unwrap();
+
+            assert!(!oidc_login_prompt_required("alpha"));
+
+            request_oidc_login_prompt("alpha").unwrap();
+            assert!(oidc_login_prompt_required("alpha"));
+
+            clear_oidc_login_prompt("alpha").unwrap();
+
+            assert!(!oidc_login_prompt_required("alpha"));
         });
     }
 }

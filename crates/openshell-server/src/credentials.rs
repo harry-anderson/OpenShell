@@ -25,6 +25,9 @@ use std::{
 use async_trait::async_trait;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::extension_protocol::{
+    ExtensionFamily, NegotiatedExtension, extension_metadata, gateway_metadata, negotiate,
+};
 use openshell_core::proto::credentials::v1::{
     DeleteCredentialRequest, GetCredentialDriverCapabilitiesRequest,
     GetCredentialDriverCapabilitiesResponse, ResolveCredentialRequest, ResolveCredentialsRequest,
@@ -38,6 +41,7 @@ use openshell_driver_db_credstore::{
 };
 use openshell_driver_kubernetes_secrets::KubernetesSecretsCredentialDriver;
 use openshell_driver_vault::VaultCredentialDriver;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
@@ -50,9 +54,12 @@ use tower::service_fn;
 use tracing::warn;
 
 use crate::persistence::{PersistenceError, Store, WriteCondition};
+use crate::storage_proto::StoredRefreshMaterialDeletion;
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;
+const REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN: &[u8] =
+    b"openshell-refresh-material-credential-key-v1";
 const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
     "transport",
     "socket_path",
@@ -81,6 +88,22 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
     fn stored_credential_count(&self) -> Option<usize> {
         None
     }
+
+    #[cfg(test)]
+    fn fail_next_store(&self) {}
+
+    #[cfg(test)]
+    fn fail_next_delete(&self) {}
+
+    #[cfg(test)]
+    fn gate_next_store(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -89,11 +112,20 @@ pub struct ResolvedProviderCredentials {
     pub expires_at_ms: HashMap<String, i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshMaterialScope<'a> {
+    pub provider_name: &'a str,
+    pub workspace: &'a str,
+    pub provider_id: &'a str,
+    pub credential_key: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub struct CredentialRuntime {
     registry: CredentialDriverRegistry,
     drivers: BTreeMap<String, Arc<dyn CredentialDriver>>,
     _driver_processes: Vec<Arc<ManagedCredentialDriverProcess>>,
+    negotiated_extensions: Vec<NegotiatedExtension>,
 }
 
 impl CredentialRuntime {
@@ -126,10 +158,15 @@ impl CredentialRuntime {
             }
         }
 
+        let negotiated_extensions = drivers
+            .keys()
+            .map(|name| negotiate_builtin_credential_driver(name))
+            .collect::<CoreResult<Vec<_>>>()?;
         Ok(Self {
             registry,
             drivers,
             _driver_processes: Vec::new(),
+            negotiated_extensions,
         })
     }
 
@@ -156,6 +193,7 @@ impl CredentialRuntime {
         let registry = CredentialDriverRegistry::from_config(config)?;
         let mut drivers = BTreeMap::new();
         let mut driver_processes = Vec::new();
+        let mut negotiated_extensions = Vec::new();
         let empty_config = toml::Table::new();
         let default_store_config = config_file
             .and_then(|file| file.openshell.gateway.credential_storage.as_ref())
@@ -166,6 +204,11 @@ impl CredentialRuntime {
             default_store_config,
             registry.requires_default_store(),
         )?;
+        if drivers.contains_key(DbCredstoreCredentialDriver::NAME) {
+            negotiated_extensions.push(negotiate_builtin_credential_driver(
+                DbCredstoreCredentialDriver::NAME,
+            )?);
+        }
 
         for driver_name in registry.enabled_driver_names() {
             let driver_config = config_file
@@ -177,12 +220,14 @@ impl CredentialRuntime {
                 let built =
                     build_configured_driver(driver_name, driver_config, store.clone()).await?;
                 drivers.insert(driver_name.clone(), built.driver);
+                negotiated_extensions.push(built.negotiated_extension);
                 if let Some(process) = built.process {
                     driver_processes.push(process);
                 }
             } else {
                 let driver = build_default_in_tree_driver(driver_name, store.clone()).await?;
                 drivers.insert(driver_name.clone(), driver);
+                negotiated_extensions.push(negotiate_builtin_credential_driver(driver_name)?);
             }
         }
 
@@ -190,6 +235,7 @@ impl CredentialRuntime {
             registry,
             drivers,
             _driver_processes: driver_processes,
+            negotiated_extensions,
         })
     }
 
@@ -202,6 +248,11 @@ impl CredentialRuntime {
         self.drivers.contains_key(&driver_name)
     }
 
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        &self.negotiated_extensions
+    }
+
     pub fn storage_owns_handle(&self, handle: &CredentialHandle) -> bool {
         normalize_driver_name(&handle.driver) == self.registry.storage_owner_name()
     }
@@ -211,6 +262,33 @@ impl CredentialRuntime {
         self.drivers
             .get(&self.registry.storage_owner_name())
             .and_then(|driver| driver.stored_credential_count())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_store(&self) {
+        if let Some(driver) = self.drivers.get(&self.registry.storage_owner_name()) {
+            driver.fail_next_store();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete(&self) {
+        if let Some(driver) = self.drivers.get(&self.registry.storage_owner_name()) {
+            driver.fail_next_delete();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_store(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.drivers
+            .get(&self.registry.storage_owner_name())
+            .and_then(|driver| driver.gate_next_store())
+            .expect("test credential driver supports store gating")
     }
 
     pub async fn store_provider_credentials(
@@ -261,7 +339,7 @@ impl CredentialRuntime {
                     .cloned();
                 let mut handle = driver
                     .store_credential(StoreCredentialRequest {
-                        provider_name: provider_name.to_string(),
+                        provider: provider_name.to_string(),
                         credential_key: credential_key.clone(),
                         value: value.clone(),
                         existing_handle,
@@ -328,6 +406,169 @@ impl CredentialRuntime {
         Ok(successes)
     }
 
+    /// Store gateway-only refresh material through the active credential
+    /// driver. Material names never become backend keys directly; a
+    /// deterministic driver-safe key binds each slot to its injectable
+    /// credential without exposing caller-controlled names in backend paths.
+    pub async fn store_refresh_material_with_object_id(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        object_id: &str,
+        material: &HashMap<String, String>,
+        existing_handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, CredentialHandle>, Status> {
+        let mut values_by_storage_key = HashMap::with_capacity(material.len());
+        let mut handles_by_storage_key = HashMap::with_capacity(existing_handles.len());
+        let mut material_by_storage_key = HashMap::with_capacity(material.len());
+
+        for (material_key, value) in material {
+            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            material_by_storage_key.insert(storage_key.clone(), material_key.clone());
+            values_by_storage_key.insert(storage_key, value.clone());
+        }
+        for (material_key, handle) in existing_handles {
+            handles_by_storage_key.insert(
+                refresh_material_storage_key(scope.credential_key, material_key),
+                handle.clone(),
+            );
+        }
+
+        let stored = self
+            .store_provider_credentials_with_object_id(
+                scope.provider_name,
+                scope.workspace,
+                scope.provider_id,
+                object_id,
+                &values_by_storage_key,
+                &handles_by_storage_key,
+            )
+            .await?;
+        stored
+            .into_iter()
+            .map(|(storage_key, handle)| {
+                material_by_storage_key
+                    .remove(&storage_key)
+                    .map(|material_key| (material_key, handle))
+                    .ok_or_else(|| {
+                        Status::internal(
+                            "credential driver returned an unknown refresh material key",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn resolve_refresh_material(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, String>, Status> {
+        if handles.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut material_by_storage_key = HashMap::with_capacity(handles.len());
+        let mut storage_handles = HashMap::with_capacity(handles.len());
+        for (material_key, handle) in handles {
+            let storage_key = refresh_material_storage_key(scope.credential_key, material_key);
+            material_by_storage_key.insert(storage_key.clone(), material_key.clone());
+            storage_handles.insert(storage_key, handle.clone());
+        }
+        // Reuse the normal driver-batched resolver with a synthetic provider.
+        // Refresh inputs are gateway-only and have no provider-level expiry;
+        // passing zero below prevents an expired injectable credential from
+        // suppressing resolution of an otherwise valid refresh-material handle.
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: scope.provider_id.to_string(),
+                name: scope.provider_name.to_string(),
+                workspace: scope.workspace.to_string(),
+                ..Default::default()
+            }),
+            credential_handles: storage_handles,
+            ..Default::default()
+        };
+        let resolved = self.resolve_provider_handles(&provider, 0).await?;
+        resolved
+            .values
+            .into_iter()
+            .map(|(storage_key, value)| {
+                material_by_storage_key
+                    .remove(&storage_key)
+                    .map(|material_key| (material_key, value))
+                    .ok_or_else(|| {
+                        Status::internal(
+                            "credential driver resolved an unknown refresh material key",
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub async fn delete_refresh_material_handles(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<(), Status> {
+        let storage_handles = handles
+            .iter()
+            .map(|(material_key, handle)| {
+                (
+                    refresh_material_storage_key(scope.credential_key, material_key),
+                    handle.clone(),
+                )
+            })
+            .collect();
+        self.delete_provider_credential_handles(
+            scope.provider_name,
+            scope.workspace,
+            scope.provider_id,
+            &storage_handles,
+        )
+        .await
+    }
+
+    pub async fn delete_refresh_material_deletions(
+        &self,
+        scope: RefreshMaterialScope<'_>,
+        deletions: &[StoredRefreshMaterialDeletion],
+    ) -> Result<(), Status> {
+        let futures = deletions.iter().map(|deletion| async move {
+            if deletion.material_key.is_empty() {
+                return Err(Status::failed_precondition(
+                    "pending refresh-material deletion has no material key",
+                ));
+            }
+            let handle = deletion.handle.clone().ok_or_else(|| {
+                Status::failed_precondition(
+                    "pending refresh-material deletion has no credential handle",
+                )
+            })?;
+            let storage_key =
+                refresh_material_storage_key(scope.credential_key, &deletion.material_key);
+            self.delete_provider_credential_handle(
+                scope.provider_name,
+                scope.workspace,
+                scope.provider_id,
+                &storage_key,
+                handle,
+            )
+            .await
+        });
+        let results = futures::future::join_all(futures).await;
+        let mut first_error = None;
+        for result in results {
+            if let Err(err) = result
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(())
+    }
+
     pub async fn delete_provider_credential_handles(
         &self,
         provider_name: &str,
@@ -371,7 +612,7 @@ impl CredentialRuntime {
         let driver = self.connected_driver(&driver_name)?;
         driver
             .delete_credential(DeleteCredentialRequest {
-                provider_name: provider_name.to_string(),
+                provider: provider_name.to_string(),
                 credential_key: credential_key.to_string(),
                 handle: Some(handle),
                 workspace: workspace.to_string(),
@@ -421,7 +662,7 @@ impl CredentialRuntime {
                 .or_default()
                 .push(ResolveCredentialRequest {
                     request_id,
-                    provider_name: provider_name.clone(),
+                    provider: provider_name.clone(),
                     credential_key: credential_key.clone(),
                     handle: Some(selected_handle),
                     workspace: workspace.clone(),
@@ -466,31 +707,36 @@ impl CredentialRuntime {
 
                 // Check provider-level expiration
                 let provider_expires_at_ms = provider
-                    .credential_expires_at_ms
+                    .credential_expiration_times
                     .get(&credential_key)
-                    .copied()
-                    .unwrap_or(0);
+                    .map(openshell_core::time::timestamp_to_millis)
+                    .transpose()
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let driver_expires_at_ms = response
+                    .expiration_time
+                    .as_ref()
+                    .map(openshell_core::time::timestamp_to_millis)
+                    .transpose()
+                    .map_err(|error| Status::internal(error.to_string()))?;
 
-                // Compute effective expiration (earliest non-zero timestamp)
-                let effective_expires_at_ms = match (provider_expires_at_ms, response.expires_at_ms)
-                {
-                    (0, driver) => driver,
-                    (provider, 0) => provider,
-                    (provider, driver) => provider.min(driver),
-                };
+                // Compute effective expiration (earliest present timestamp).
+                let effective_expires_at_ms = effective_credential_expiration_ms(
+                    provider_expires_at_ms,
+                    driver_expires_at_ms,
+                );
 
-                if effective_expires_at_ms > 0 && effective_expires_at_ms <= now_ms {
-                    warn!(
-                        provider_name = %provider_name,
-                        credential_key = %credential_key,
-                        provider_expires_at_ms,
-                        driver_expires_at_ms = response.expires_at_ms,
-                        effective_expires_at_ms,
-                        "skipping expired handle-backed credential"
-                    );
-                    continue;
-                }
-                if effective_expires_at_ms > 0 {
+                if let Some(effective_expires_at_ms) = effective_expires_at_ms {
+                    if effective_expires_at_ms <= now_ms {
+                        warn!(
+                            provider_name = %provider_name,
+                            credential_key = %credential_key,
+                            ?provider_expires_at_ms,
+                            ?driver_expires_at_ms,
+                            effective_expires_at_ms,
+                            "skipping expired handle-backed credential"
+                        );
+                        continue;
+                    }
                     resolved
                         .expires_at_ms
                         .insert(credential_key.clone(), effective_expires_at_ms);
@@ -517,6 +763,28 @@ impl CredentialRuntime {
             ))
         })
     }
+}
+
+fn effective_credential_expiration_ms(
+    provider_expiration_ms: Option<i64>,
+    driver_expiration_ms: Option<i64>,
+) -> Option<i64> {
+    match (provider_expiration_ms, driver_expiration_ms) {
+        (Some(provider), Some(driver)) => Some(provider.min(driver)),
+        (Some(provider), None) => Some(provider),
+        (None, Some(driver)) => Some(driver),
+        (None, None) => None,
+    }
+}
+
+fn refresh_material_storage_key(credential_key: &str, material_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(REFRESH_MATERIAL_CREDENTIAL_KEY_DOMAIN);
+    hasher.update([0]);
+    hasher.update(credential_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(material_key.as_bytes());
+    format!("openshell.refresh.{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -883,10 +1151,27 @@ fn connect_default_credential_store(
     Ok(())
 }
 
+fn negotiate_builtin_credential_driver(name: &str) -> CoreResult<NegotiatedExtension> {
+    let gateway = gateway_metadata(ExtensionFamily::Credentials);
+    negotiate(
+        ExtensionFamily::Credentials,
+        name,
+        &gateway,
+        Some(extension_metadata(
+            ExtensionFamily::Credentials,
+            format!("openshell/{name}"),
+            openshell_core::VERSION,
+            [],
+        )),
+    )
+    .map_err(|error| Error::config(error.to_string()))
+}
+
 #[derive(Debug)]
 struct BuiltCredentialDriver {
     driver: Arc<dyn CredentialDriver>,
     process: Option<Arc<ManagedCredentialDriverProcess>>,
+    negotiated_extension: NegotiatedExtension,
 }
 
 async fn build_configured_driver(
@@ -906,6 +1191,7 @@ async fn build_configured_driver(
             Ok(BuiltCredentialDriver {
                 driver,
                 process: None,
+                negotiated_extension: negotiate_builtin_credential_driver(driver_name)?,
             })
         }
         CredentialDriverTransport::Uds => {
@@ -1244,10 +1530,14 @@ async fn connect_uds_driver(
     if config.command.is_some() {
         spawn_uds_driver(driver_name, config, socket_path).await
     } else {
-        let channel = connect_ready_credential_driver(driver_name, socket_path).await?;
+        let (channel, negotiated_extension) =
+            connect_ready_credential_driver(driver_name, socket_path)
+                .await
+                .map_err(CredentialDriverReadinessError::into_error)?;
         Ok(BuiltCredentialDriver {
             driver: Arc::new(RemoteCredentialDriver::new(channel)),
             process: None,
+            negotiated_extension,
         })
     }
 }
@@ -1300,7 +1590,7 @@ async fn spawn_uds_driver(
             command_path.display()
         ))
     })?;
-    let channel = wait_for_launched_credential_driver(
+    let (channel, negotiated_extension) = wait_for_launched_credential_driver(
         driver_name,
         socket_path,
         &mut child,
@@ -1314,6 +1604,7 @@ async fn spawn_uds_driver(
     Ok(BuiltCredentialDriver {
         driver: Arc::new(RemoteCredentialDriver::new(channel)),
         process: Some(process),
+        negotiated_extension,
     })
 }
 
@@ -1365,7 +1656,25 @@ async fn wait_for_launched_credential_driver(
     socket_path: &Path,
     child: &mut tokio::process::Child,
     timeout: Duration,
-) -> CoreResult<Channel> {
+) -> CoreResult<(Channel, NegotiatedExtension)> {
+    wait_for_launched_credential_driver_with(driver_name, socket_path, child, timeout, || {
+        connect_ready_credential_driver(driver_name, socket_path)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn wait_for_launched_credential_driver_with<F, Fut>(
+    driver_name: &str,
+    socket_path: &Path,
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+    mut connect: F,
+) -> CoreResult<(Channel, NegotiatedExtension)>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(Channel, NegotiatedExtension), CredentialDriverReadinessError>>,
+{
     let deadline = Instant::now() + timeout;
     let mut last_error: Option<String> = None;
 
@@ -1390,14 +1699,12 @@ async fn wait_for_launched_credential_driver(
             )));
         }
 
-        match tokio::time::timeout(
-            remaining,
-            connect_ready_credential_driver(driver_name, socket_path),
-        )
-        .await
-        {
-            Ok(Ok(channel)) => return Ok(channel),
-            Ok(Err(err)) => last_error = Some(err.to_string()),
+        match tokio::time::timeout(remaining, connect()).await {
+            Ok(Ok(connected)) => return Ok(connected),
+            Ok(Err(error)) if error.is_retryable() => {
+                last_error = Some(error.into_error().to_string());
+            }
+            Ok(Err(error)) => return Err(error.into_error()),
             Err(_) => {
                 return Err(Error::execution(format!(
                     "timed out waiting for credential driver '{driver_name}' to respond to GetCapabilities"
@@ -1418,18 +1725,80 @@ async fn wait_for_launched_credential_driver(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+enum CredentialDriverReadinessError {
+    Retryable(Error),
+    RpcStatus { driver_name: String, status: Status },
+    Terminal(Error),
+}
+
+#[cfg(unix)]
+impl CredentialDriverReadinessError {
+    fn rpc_status(driver_name: &str, status: Status) -> Self {
+        Self::RpcStatus {
+            driver_name: driver_name.to_string(),
+            status,
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Retryable(_) => true,
+            Self::RpcStatus { status, .. } => matches!(
+                status.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::ResourceExhausted
+                    | tonic::Code::Aborted
+                    | tonic::Code::Internal
+                    | tonic::Code::Unknown
+            ),
+            Self::Terminal(_) => false,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            Self::Retryable(error) | Self::Terminal(error) => error,
+            Self::RpcStatus {
+                driver_name,
+                status,
+            } => Error::config(format!(
+                "credential driver '{driver_name}' GetCapabilities failed: {status}"
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn connect_ready_credential_driver(
     driver_name: &str,
     socket_path: &Path,
-) -> CoreResult<Channel> {
-    let channel = connect_credential_driver_socket(driver_name, socket_path).await?;
+) -> Result<(Channel, NegotiatedExtension), CredentialDriverReadinessError> {
+    let channel = connect_credential_driver_socket(driver_name, socket_path)
+        .await
+        .map_err(CredentialDriverReadinessError::Retryable)?;
     let mut client = CredentialDriverClient::new(channel.clone());
-    let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {});
+    let gateway = gateway_metadata(ExtensionFamily::Credentials);
+    let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {
+        gateway: Some(gateway.clone()),
+    });
     let timeout = Duration::from_secs(DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS);
     request.set_timeout(timeout);
-    await_credential_driver_capabilities(driver_name, timeout, client.get_capabilities(request))
-        .await?;
-    Ok(channel)
+    let capabilities = await_credential_driver_capabilities(
+        driver_name,
+        timeout,
+        client.get_capabilities(request),
+    )
+    .await?;
+    let negotiated_extension = negotiate(
+        ExtensionFamily::Credentials,
+        driver_name,
+        &gateway,
+        capabilities.extension,
+    )
+    .map_err(|error| CredentialDriverReadinessError::Terminal(Error::config(error.to_string())))?;
+    Ok((channel, negotiated_extension))
 }
 
 #[cfg(unix)]
@@ -1439,20 +1808,16 @@ async fn await_credential_driver_capabilities(
     response: impl Future<
         Output = Result<tonic::Response<GetCredentialDriverCapabilitiesResponse>, Status>,
     >,
-) -> CoreResult<()> {
+) -> Result<GetCredentialDriverCapabilitiesResponse, CredentialDriverReadinessError> {
     tokio::time::timeout(timeout, response)
         .await
         .map_err(|_| {
-            Error::config(format!(
+            CredentialDriverReadinessError::Retryable(Error::config(format!(
                 "credential driver '{driver_name}' GetCapabilities timed out"
-            ))
+            )))
         })?
-        .map_err(|status| {
-            Error::config(format!(
-                "credential driver '{driver_name}' GetCapabilities failed: {status}"
-            ))
-        })?;
-    Ok(())
+        .map_err(|status| CredentialDriverReadinessError::rpc_status(driver_name, status))
+        .map(tonic::Response::into_inner)
 }
 
 #[cfg(unix)]
@@ -1480,6 +1845,15 @@ async fn connect_credential_driver_socket(
 #[derive(Debug)]
 struct TestStaticCredentialDriver {
     values: std::sync::Mutex<HashMap<String, String>>,
+    fail_next_store: std::sync::atomic::AtomicBool,
+    fail_next_delete: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    store_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1489,6 +1863,10 @@ impl TestStaticCredentialDriver {
     fn new() -> Self {
         Self {
             values: std::sync::Mutex::new(HashMap::new()),
+            fail_next_store: std::sync::atomic::AtomicBool::new(false),
+            fail_next_delete: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            store_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -1511,6 +1889,19 @@ impl CredentialDriver for TestStaticCredentialDriver {
         &self,
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
+        #[cfg(test)]
+        let gate = self.store_gate.lock().ok().and_then(|mut gate| gate.take());
+        #[cfg(test)]
+        if let Some((hit, release)) = gate {
+            let _ = hit.send(());
+            let _ = release.await;
+        }
+        if self
+            .fail_next_store
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("injected credential store failure"));
+        }
         let handle = request
             .existing_handle
             .map(|handle| handle.handle)
@@ -1518,7 +1909,7 @@ impl CredentialDriver for TestStaticCredentialDriver {
             .unwrap_or_else(|| {
                 format!(
                     "{}:{}:{}",
-                    request.provider_name, request.credential_key, request.object_id
+                    request.provider, request.credential_key, request.object_id
                 )
             });
         self.values
@@ -1533,6 +1924,12 @@ impl CredentialDriver for TestStaticCredentialDriver {
     }
 
     async fn delete_credential(&self, request: DeleteCredentialRequest) -> Result<(), Status> {
+        if self
+            .fail_next_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("injected credential delete failure"));
+        }
         let handle = Self::handle_from_request("delete", request.handle)?;
         self.values
             .lock()
@@ -1558,7 +1955,7 @@ impl CredentialDriver for TestStaticCredentialDriver {
             responses.push(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expires_at_ms: 0,
+                expiration_time: None,
             });
         }
 
@@ -1568,6 +1965,31 @@ impl CredentialDriver for TestStaticCredentialDriver {
     #[cfg(test)]
     fn stored_credential_count(&self) -> Option<usize> {
         self.values.lock().ok().map(|values| values.len())
+    }
+
+    #[cfg(test)]
+    fn fail_next_store(&self) {
+        self.fail_next_store
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_delete(&self) {
+        self.fail_next_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn gate_next_store(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )> {
+        let (hit_tx, hit_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.store_gate.lock().ok()? = Some((hit_tx, release_rx));
+        Some((hit_rx, release_tx))
     }
 }
 
@@ -1596,6 +2018,17 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn effective_expiration_preserves_timestamp_presence() {
+        assert_eq!(effective_credential_expiration_ms(None, None), None);
+        assert_eq!(effective_credential_expiration_ms(Some(0), None), Some(0));
+        assert_eq!(effective_credential_expiration_ms(None, Some(0)), Some(0));
+        assert_eq!(
+            effective_credential_expiration_ms(Some(2_000), Some(1_000)),
+            Some(1_000)
+        );
     }
 
     fn config_file(toml: &str) -> crate::config_file::ConfigFile {
@@ -1641,6 +2074,23 @@ mod tests {
         assert_eq!(
             registry.storage_owner_name().as_str(),
             DbCredstoreCredentialDriver::NAME
+        );
+    }
+
+    #[test]
+    fn built_in_credential_driver_uses_common_negotiation_snapshot() {
+        let runtime = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+
+        let negotiated = runtime.negotiated_extensions();
+        assert_eq!(negotiated.len(), 1);
+        assert_eq!(negotiated[0].family, ExtensionFamily::Credentials);
+        assert_eq!(negotiated[0].configured_name, "test-static");
+        assert_eq!(
+            negotiated[0].protocol_major,
+            openshell_core::extension_protocol::PROTOCOL_MAJOR
         );
     }
 
@@ -1757,6 +2207,16 @@ mod tests {
             resolved.values.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-test")
         );
+
+        provider.credential_expiration_times.insert(
+            "OPENAI_API_KEY".to_string(),
+            openshell_core::time::timestamp_from_millis(0).unwrap(),
+        );
+        let expired = runtime
+            .resolve_provider_handles(&provider, 1_000)
+            .await
+            .unwrap();
+        assert!(!expired.values.contains_key("OPENAI_API_KEY"));
     }
 
     #[tokio::test]
@@ -2124,9 +2584,83 @@ socket_path = {socket_path_toml}
             response,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_error();
 
         assert!(err.to_string().contains("GetCapabilities timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launched_driver_failed_precondition_is_terminal() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        let err = wait_for_launched_credential_driver_with(
+            "enterprise-secrets",
+            Path::new("/unused-test-socket"),
+            &mut child,
+            Duration::from_secs(30),
+            || async {
+                await_credential_driver_capabilities(
+                    "enterprise-secrets",
+                    Duration::from_secs(30),
+                    std::future::ready(Err(Status::failed_precondition(
+                        "credentials extension 'enterprise-secrets' uses unsupported protocol 2.0; gateway supports 1.0",
+                    ))),
+                )
+                .await?;
+                unreachable!("failed-precondition response cannot produce capabilities")
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported protocol 2.0"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_driver_rpc_status_retries_only_transient_failures() {
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+            Code::Aborted,
+            Code::Internal,
+            Code::Unknown,
+        ] {
+            assert!(
+                CredentialDriverReadinessError::rpc_status(
+                    "enterprise-secrets",
+                    Status::new(code, "not ready"),
+                )
+                .is_retryable(),
+                "{code:?} should be retried"
+            );
+        }
+
+        for code in [
+            Code::InvalidArgument,
+            Code::FailedPrecondition,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::Unimplemented,
+        ] {
+            assert!(
+                !CredentialDriverReadinessError::rpc_status(
+                    "enterprise-secrets",
+                    Status::new(code, "incompatible"),
+                )
+                .is_retryable(),
+                "{code:?} should fail immediately"
+            );
+        }
     }
 
     #[test]
@@ -2137,7 +2671,6 @@ socket_path = {socket_path_toml}
                 r#"
 transport = "in_tree"
 namespace = "openshell"
-allow_reference_namespace = true
 "#,
             ),
         )
@@ -2149,13 +2682,6 @@ allow_reference_namespace = true
                 .get("namespace")
                 .and_then(toml::Value::as_str),
             Some("openshell")
-        );
-        assert_eq!(
-            parsed
-                .backend_config
-                .get("allow_reference_namespace")
-                .and_then(toml::Value::as_bool),
-            Some(true)
         );
         assert!(!parsed.backend_config.contains_key("transport"));
     }

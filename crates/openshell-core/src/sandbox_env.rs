@@ -8,6 +8,9 @@
 //! supervisor process (which reads them on startup).  Using constants here
 //! prevents typos from producing silently broken sandboxes.
 
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+
 /// Name of the sandbox (used for policy sync and identification).
 pub const SANDBOX: &str = "OPENSHELL_SANDBOX";
 
@@ -23,8 +26,107 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
-/// Shell command to run inside the sandbox.
-pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
+/// Versioned specification for the exact canonical main process.
+///
+/// Most drivers use JSON directly. Transports that cannot preserve spaces in
+/// environment values may use the `base64url:`-prefixed representation.
+pub const MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
+
+const MAIN_PROCESS_SPEC_BASE64URL_PREFIX: &str = "base64url:";
+
+/// Lossless driver-to-supervisor representation of the canonical process.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MainProcessConfig {
+    pub version: u32,
+    /// Canonical command. Empty means "no command supplied": the supervisor
+    /// asks the sandbox boundary to resolve the default login shell against
+    /// the agent image. A non-empty
+    /// command is the exact program+args and is run verbatim.
+    pub command: Vec<String>,
+    pub tty: bool,
+    #[serde(default)]
+    pub await_main_process_attachment: bool,
+}
+
+impl MainProcessConfig {
+    pub const VERSION: u32 = 1;
+
+    /// Default config for a sandbox created without a command. The command is
+    /// left empty on purpose: the sandbox boundary picks a login shell that
+    /// exists in the agent image (bash when present, otherwise `/bin/sh`). A TTY is
+    /// requested because the default is an interactive login shell.
+    #[must_use]
+    pub fn scratch() -> Self {
+        Self {
+            version: Self::VERSION,
+            command: Vec::new(),
+            tty: true,
+            await_main_process_attachment: false,
+        }
+    }
+
+    #[must_use]
+    pub fn from_driver_spec(spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>) -> Self {
+        match spec {
+            Some(spec) if !spec.command.is_empty() => Self {
+                version: Self::VERSION,
+                command: spec.command.clone(),
+                tty: spec.tty,
+                await_main_process_attachment: spec.await_main_process_attachment,
+            },
+            None | Some(_) => Self::scratch(),
+        }
+    }
+
+    /// Decode the versioned transport without shell interpretation.
+    pub fn decode(encoded: &str) -> Result<Self, String> {
+        let decoded;
+        let json = if let Some(payload) = encoded.strip_prefix(MAIN_PROCESS_SPEC_BASE64URL_PREFIX) {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|error| format!("invalid {MAIN_PROCESS_SPEC} base64url: {error}"))?;
+            decoded = String::from_utf8(bytes)
+                .map_err(|error| format!("invalid {MAIN_PROCESS_SPEC} UTF-8: {error}"))?;
+            decoded.as_str()
+        } else {
+            encoded
+        };
+        let config: Self = serde_json::from_str(json)
+            .map_err(|error| format!("invalid {MAIN_PROCESS_SPEC}: {error}"))?;
+        if config.version != Self::VERSION {
+            return Err(format!(
+                "unsupported {MAIN_PROCESS_SPEC} version {}",
+                config.version
+            ));
+        }
+        // An empty command is valid: it means "no command supplied", and the
+        // sandbox boundary resolves the default login shell. Only a present-but-blank
+        // program is rejected.
+        if !config.command.is_empty() && config.command[0].is_empty() {
+            return Err(format!(
+                "{MAIN_PROCESS_SPEC} command program must not be empty"
+            ));
+        }
+        Ok(config)
+    }
+
+    /// Encode the versioned driver-to-supervisor transport.
+    pub fn encode_driver_spec(
+        spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
+    ) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&Self::from_driver_spec(spec))
+    }
+
+    /// Encode the versioned transport without whitespace for constrained
+    /// environment-variable transports used by embedded runtimes.
+    pub fn encode_driver_spec_base64url(
+        spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
+    ) -> Result<String, serde_json::Error> {
+        let json = Self::encode_driver_spec(spec)?;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        Ok(format!("{MAIN_PROCESS_SPEC_BASE64URL_PREFIX}{payload}"))
+    }
+}
 
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
@@ -33,8 +135,23 @@ pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 /// `"sidecar"`; the default combined supervisor path omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
 
+/// The isolation backend admitted by the deployment configuration (RFC 0012).
+///
+/// Delivered on a channel separate from the topology descriptor so descriptor
+/// verification against the admitted backend is not self-referential. Required
+/// whenever a topology descriptor is supplied.
+pub const ADMITTED_ISOLATION_BACKEND: &str = "OPENSHELL_ADMITTED_ISOLATION_BACKEND";
+
 /// Network enforcement backend selected by the compute driver.
 pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
+
+/// Comma-separated runtime networking capabilities supplied by the compute
+/// driver. Capabilities describe substrate the shared supervisor may activate;
+/// they never move policy evaluation into the driver.
+pub const NETWORK_RUNTIME_CAPABILITIES: &str = "OPENSHELL_NETWORK_RUNTIME_CAPABILITIES";
+
+/// Driver capability for policy-gated DNS and transparent TCP interception.
+pub const POLICY_DNS_TRANSPARENT_TCP_CAPABILITY: &str = "policy-dns-transparent-tcp";
 
 /// Whether network policy evaluation must bind requests to the peer binary.
 ///
@@ -56,6 +173,17 @@ pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 /// Directory where the network supervisor writes the proxy CA files consumed
 /// by workload child processes.
 pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
+/// Optional path to a durable PEM-encoded interception CA certificate.
+/// Must be configured together with [`PROXY_CA_KEY`].
+pub const PROXY_CA_CERT: &str = "OPENSHELL_PROXY_CA_CERT";
+
+/// Optional path to the private key for [`PROXY_CA_CERT`].
+/// Must be configured together with the certificate path.
+pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
+
+/// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
+pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
 
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
@@ -115,6 +243,18 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
+/// Default numeric UID assigned to a sandbox when the image declares no OCI
+/// `USER` (for example, a minimal base image).
+///
+/// Local container drivers (Docker, Podman) supply this in place of an empty
+/// OCI declaration so the supervisor runs the sandbox as a synthesized non-root
+/// account instead of rejecting the image, matching the numeric-identity
+/// behavior of the Kubernetes and VM drivers.
+pub const DEFAULT_SANDBOX_UID: u32 = 1000;
+
+/// Default numeric GID paired with [`DEFAULT_SANDBOX_UID`].
+pub const DEFAULT_SANDBOX_GID: u32 = 1000;
+
 /// Raw OCI `Config.User` declaration from the immutable image selected by a
 /// local container driver.
 ///
@@ -130,3 +270,96 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
 // way it could bake `ENV` values.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_process_transport_preserves_argument_boundaries() {
+        let spec = crate::proto::compute::v1::DriverSandboxSpec {
+            command: vec!["/bin/sh".into(), "-c".into(), "printf '%s' 'a b'".into()],
+            tty: false,
+            await_main_process_attachment: true,
+            ..Default::default()
+        };
+        let encoded = MainProcessConfig::encode_driver_spec(Some(&spec)).unwrap();
+        let decoded = MainProcessConfig::decode(&encoded).unwrap();
+        assert_eq!(decoded.command, spec.command);
+        assert!(!decoded.tty);
+        assert!(decoded.await_main_process_attachment);
+    }
+
+    #[test]
+    fn base64url_main_process_transport_preserves_spaces() {
+        let spec = crate::proto::compute::v1::DriverSandboxSpec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo ready; while true; do sleep 1; done".into(),
+            ],
+            tty: false,
+            ..Default::default()
+        };
+        let encoded = MainProcessConfig::encode_driver_spec_base64url(Some(&spec)).unwrap();
+
+        assert!(!encoded.contains(char::is_whitespace));
+        let decoded = MainProcessConfig::decode(&encoded).unwrap();
+        assert_eq!(decoded.command, spec.command);
+        assert!(!decoded.tty);
+    }
+
+    #[test]
+    fn main_process_transport_rejects_unknown_version() {
+        let error =
+            MainProcessConfig::decode(r#"{"version":2,"command":["/bin/true"],"tty":false}"#)
+                .unwrap_err();
+        assert!(error.contains("unsupported"));
+    }
+
+    #[test]
+    fn legacy_driver_spec_without_command_uses_scratch_main() {
+        let legacy = crate::proto::compute::v1::DriverSandboxSpec::default();
+        let config = MainProcessConfig::from_driver_spec(Some(&legacy));
+
+        assert_eq!(config, MainProcessConfig::scratch());
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert_eq!(MainProcessConfig::decode(&encoded).unwrap(), config);
+    }
+
+    #[test]
+    fn omitted_command_stays_empty_for_supervisor_resolution() {
+        // No command supplied → empty command; the sandbox boundary resolves the
+        // default login shell against the sandbox image.
+        let empty = crate::proto::compute::v1::DriverSandboxSpec::default();
+        assert!(
+            MainProcessConfig::from_driver_spec(Some(&empty))
+                .command
+                .is_empty()
+        );
+        assert!(MainProcessConfig::from_driver_spec(None).command.is_empty());
+
+        // An explicit command is preserved verbatim and never rewritten.
+        let explicit = crate::proto::compute::v1::DriverSandboxSpec {
+            command: vec!["/bin/bash".into(), "-l".into()],
+            tty: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            MainProcessConfig::from_driver_spec(Some(&explicit)).command,
+            vec!["/bin/bash".to_string(), "-l".to_string()]
+        );
+
+        // An empty command survives the transport round-trip.
+        let encoded = serde_json::to_string(&MainProcessConfig::scratch()).unwrap();
+        assert!(
+            MainProcessConfig::decode(&encoded)
+                .unwrap()
+                .command
+                .is_empty()
+        );
+
+        // A present-but-blank program is still rejected.
+        assert!(MainProcessConfig::decode(r#"{"version":1,"command":[""],"tty":false}"#).is_err());
+    }
+}

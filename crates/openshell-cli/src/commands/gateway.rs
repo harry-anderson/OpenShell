@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::color::Colorize;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
     require_tls_materials,
@@ -19,8 +20,7 @@ use openshell_bootstrap::{
     save_active_gateway, store_gateway_metadata,
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
-use openshell_core::proto::{GetGatewayInfoRequest, HealthRequest, ServiceStatus};
-use owo_colors::OwoColorize;
+use openshell_core::proto::{ExtensionKind, GetGatewayInfoRequest, HealthRequest, ServiceStatus};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};
@@ -33,6 +33,7 @@ struct GatewayInfoView {
     status: String,
     version: String,
     compute_drivers: Vec<ComputeDriverInfoView>,
+    extensions: Vec<ExtensionInfoView>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,17 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionInfoView {
+    kind: String,
+    configured_name: String,
+    implementation_name: String,
+    implementation_version: String,
+    protocol_version: String,
+    supported_capabilities: Vec<String>,
+    required_capabilities: Vec<String>,
 }
 
 /// Show gateway status.
@@ -376,6 +388,19 @@ pub async fn gateway_info(
         })?
         .into_inner();
 
+    let extensions = info
+        .extensions
+        .into_iter()
+        .map(|extension| ExtensionInfoView {
+            kind: extension_kind_name(extension.kind).to_string(),
+            configured_name: extension.configured_name,
+            implementation_name: extension.implementation_name,
+            implementation_version: extension.implementation_version,
+            protocol_version: format!("{}.{}", extension.protocol_major, extension.protocol_minor),
+            supported_capabilities: extension.supported_capabilities,
+            required_capabilities: extension.required_capabilities,
+        })
+        .collect();
     let view = GatewayInfoView {
         gateway: gateway_name.to_string(),
         server: server.to_string(),
@@ -396,6 +421,7 @@ pub async fn gateway_info(
                 }
             })
             .collect(),
+        extensions,
     };
 
     print_gateway_info(&view, output)
@@ -422,8 +448,50 @@ fn print_gateway_info(view: &GatewayInfoView, output: &str) -> Result<()> {
     println!("  {} {}", "Status:".dimmed(), view.status);
     println!("  {} {}", "Version:".dimmed(), view.version);
     print_compute_driver_info(&view.compute_drivers);
+    print_extension_info(&view.extensions);
 
     Ok(())
+}
+
+fn extension_kind_name(kind: i32) -> &'static str {
+    match ExtensionKind::try_from(kind).unwrap_or(ExtensionKind::Unspecified) {
+        ExtensionKind::ComputeDriver => "compute-driver",
+        ExtensionKind::CredentialDriver => "credential-driver",
+        ExtensionKind::GatewayInterceptor => "gateway-interceptor",
+        ExtensionKind::SupervisorMiddleware => "supervisor-middleware",
+        ExtensionKind::Unspecified => "unspecified",
+    }
+}
+
+fn print_extension_info(extensions: &[ExtensionInfoView]) {
+    if extensions.is_empty() {
+        return;
+    }
+    println!("  {}", "Extensions:".dimmed());
+    for extension in extensions {
+        println!("    {} ({})", extension.configured_name, extension.kind);
+        println!(
+            "      {} {} {} (protocol {})",
+            "Implementation:".dimmed(),
+            extension.implementation_name,
+            extension.implementation_version,
+            extension.protocol_version
+        );
+        if !extension.supported_capabilities.is_empty() {
+            println!(
+                "      {} {}",
+                "Capabilities:".dimmed(),
+                extension.supported_capabilities.join(", ")
+            );
+        }
+        if !extension.required_capabilities.is_empty() {
+            println!(
+                "      {} {}",
+                "Requires gateway:".dimmed(),
+                extension.required_capabilities.join(", ")
+            );
+        }
+    }
 }
 
 fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
@@ -467,6 +535,15 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 },
             }))
             .collect::<Vec<_>>(),
+        "extensions": view.extensions.iter().map(|extension| serde_json::json!({
+            "kind": &extension.kind,
+            "configured_name": &extension.configured_name,
+            "implementation_name": &extension.implementation_name,
+            "implementation_version": &extension.implementation_version,
+            "protocol_version": &extension.protocol_version,
+            "supported_capabilities": &extension.supported_capabilities,
+            "required_capabilities": &extension.required_capabilities,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -905,6 +982,26 @@ pub async fn gateway_add(
                     false
                 }
             }
+        } else if is_browser_suppressed() {
+            match crate::oidc_auth::oidc_device_code_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+                gateway_insecure,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+                    eprintln!("{} Authenticated via device code", "✓".green().bold());
+                    true
+                }
+                Err(e) => {
+                    eprintln!("{} Authentication failed: {e}", "!".yellow());
+                    false
+                }
+            }
         } else {
             match crate::oidc_auth::oidc_browser_auth_flow(
                 issuer,
@@ -912,6 +1009,7 @@ pub async fn gateway_add(
                 oidc_audience,
                 oidc_scopes,
                 gateway_insecure,
+                false,
             )
             .await
             {
@@ -1116,9 +1214,20 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
                 .unwrap_or("openshell-cli");
             let audience = metadata.oidc_audience.as_deref();
             let scopes = metadata.oidc_scopes.as_deref();
+            let force_fresh_login =
+                openshell_bootstrap::oidc_token::oidc_login_prompt_required(name);
 
             let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
                 crate::oidc_auth::oidc_client_credentials_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
+            } else if is_browser_suppressed() {
+                crate::oidc_auth::oidc_device_code_flow(
                     issuer,
                     client_id,
                     audience,
@@ -1133,12 +1242,14 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
                     audience,
                     scopes,
                     gateway_insecure,
+                    force_fresh_login,
                 )
                 .await?
             };
 
             let username = jwt_preferred_username(&bundle.access_token);
             openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+            openshell_bootstrap::oidc_token::clear_oidc_login_prompt(name)?;
 
             if let Some(user) = username {
                 eprintln!(
@@ -1184,6 +1295,7 @@ pub fn gateway_logout(name: &str) -> Result<()> {
     match metadata.auth_mode.as_deref() {
         Some("oidc") => {
             openshell_bootstrap::oidc_token::remove_oidc_token(name)?;
+            openshell_bootstrap::oidc_token::request_oidc_login_prompt(name)?;
         }
         Some("cloudflare_jwt") => {
             openshell_bootstrap::edge_token::remove_edge_token(name)?;
@@ -1430,6 +1542,9 @@ fn remove_gateway_registration(name: &str) {
     if let Err(err) = openshell_bootstrap::oidc_token::remove_oidc_token(name) {
         tracing::debug!("failed to remove oidc token: {err}");
     }
+    if let Err(err) = openshell_bootstrap::oidc_token::clear_oidc_login_prompt(name) {
+        tracing::debug!("failed to clear oidc login prompt marker: {err}");
+    }
     if let Err(err) = remove_gateway_metadata(name) {
         tracing::debug!("failed to remove gateway metadata: {err}");
     }
@@ -1469,9 +1584,9 @@ pub fn gateway_remove(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayAuthenticationState,
-        GatewayInfoView, TlsOptions, format_gateway_select_header, format_gateway_select_items,
-        gateway_add, gateway_auth_label, gateway_authentication_state,
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, ExtensionInfoView,
+        GatewayAuthenticationState, GatewayInfoView, TlsOptions, format_gateway_select_header,
+        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_authentication_state,
         gateway_env_override_warning, gateway_info_to_json, gateway_remote_label,
         gateway_select_with, gateway_to_json, gateway_type_label, http_health_check,
         import_local_package_mtls_bundle, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
@@ -1786,6 +1901,15 @@ mod tests {
                     driver_version: "0.0.75".to_string(),
                 },
             }],
+            extensions: vec![ExtensionInfoView {
+                kind: "compute-driver".to_string(),
+                configured_name: "podman".to_string(),
+                implementation_name: "openshell/podman".to_string(),
+                implementation_version: "0.0.75".to_string(),
+                protocol_version: "1.0".to_string(),
+                supported_capabilities: vec!["openshell.compute.contract".to_string()],
+                required_capabilities: vec!["openshell.compute.contract".to_string()],
+            }],
         };
 
         let json = gateway_info_to_json(&view);
@@ -1798,6 +1922,7 @@ mod tests {
             json["compute_drivers"][0]["capabilities"]["driver_name"],
             "podman"
         );
+        assert_eq!(json["extensions"][0]["protocol_version"], "1.0");
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
@@ -1813,6 +1938,7 @@ mod tests {
             status: "healthy".to_string(),
             version: "0.0.74".to_string(),
             compute_drivers: Vec::new(),
+            extensions: Vec::new(),
         };
 
         let json = gateway_info_to_json(&view);
@@ -1932,7 +2058,6 @@ mod tests {
 
     #[test]
     fn gateway_add_registers_plaintext_loopback_gateway_without_local_flag() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -1964,7 +2089,6 @@ mod tests {
 
     #[test]
     fn gateway_add_respects_local_flag_for_plaintext_registrations() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -1994,7 +2118,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_health_check_supports_plain_http_endpoints() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let server = thread::spawn(move || {
@@ -2023,7 +2146,6 @@ mod tests {
 
     #[test]
     fn gateway_add_oidc_rolls_back_on_auth_failure() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -2080,7 +2202,6 @@ mod tests {
     }
     #[test]
     fn gateway_add_oidc_rollback_keeps_system_active_fallback_userless() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let user = tempfile::tempdir().expect("create user tmpdir");
         let system = tempfile::tempdir().expect("create system tmpdir");
         with_tmp_xdg_and_system(user.path(), system.path(), || {
@@ -2121,7 +2242,6 @@ mod tests {
 
     #[test]
     fn gateway_add_cloud_rolls_back_on_auth_failure() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
@@ -2179,7 +2299,6 @@ mod tests {
     }
     #[test]
     fn gateway_add_cloud_rollback_keeps_system_active_fallback_userless() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let user = tempfile::tempdir().expect("create user tmpdir");
         let system = tempfile::tempdir().expect("create system tmpdir");
         with_tmp_xdg_and_system(user.path(), system.path(), || {

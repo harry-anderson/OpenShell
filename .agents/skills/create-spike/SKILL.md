@@ -1,6 +1,8 @@
 ---
 name: create-spike
 description: Investigate a plain-language problem description by deeply exploring the codebase, then create a structured GitHub issue with technical findings. Prequel to build-from-issue — maps vague ideas to concrete, buildable issues. Trigger keywords - spike, investigate, explore, research issue, technical investigation, create spike, new spike, feasibility, codebase exploration.
+metadata:
+  internal: true
 ---
 
 # Create Spike
@@ -91,7 +93,7 @@ The prompt to the reviewer **must** instruct it to:
 
 9. **Check architecture docs** in the `architecture/` directory for relevant documentation about the affected subsystems.
 
-10. **Assess gateway config documentation impact.** If the change would add, remove, rename, or change defaults for gateway TOML keys or driver-specific config options, call out that `docs/reference/gateway-config.mdx` must be updated. If the change is surfaced through Helm or compute-driver setup docs, call out the relevant deployment or compute-driver docs too.
+10. **Assess gateway config documentation impact.** If the change would add, remove, rename, or change defaults for gateway TOML keys or driver-specific config options, call out that `docs/how-it-works/gateways/configuration.mdx` must be updated. If the change is surfaced through Helm or compute-driver setup docs, call out the relevant deployment or compute-driver docs too.
 
 11. **Assess Linux Security Module (LSM) impact.** If the change involves process identity, `/proc` filesystem access, file labeling, binary execution, or inter-process visibility, call out whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. For example: reading `/proc/<pid>/exe` across an SELinux domain boundary returns ENOENT, not EACCES. Tests that fork+exec into system binaries (different SELinux label) will fail on enforcing hosts. Flag any LSM-sensitive code paths and recommend mitigations.
 
@@ -211,7 +213,7 @@ gh issue create \
 - <what tests exist for the affected area today, what patterns should be followed, any test infrastructure gaps>
 
 ---
-*Created by spike investigation. `state:validated` means the issue is ready for human disposition; `state:needs-info` means specific evidence is still required. A human applies `state:accepted` or places the issue on the roadmap if OpenShell should pursue the work. To queue unattended agent planning, a human applies `agent:plan-requested`; a direct request to an agent does not require that label.*
+*Created by spike investigation. `state:validated` means the issue is ready for human disposition; `state:needs-info` means specific evidence is still required. A human applies `state:accepted` or places the issue on the roadmap if OpenShell should pursue the work. To queue unattended agent planning, a human applies `agent:plan-requested`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them.*
 EOF
 )"
 ```
@@ -235,7 +237,7 @@ After creating the issue, report:
 
 For `state:validated`:
 
-> Review the issue and decide whether OpenShell should pursue it. If yes, apply `state:accepted`, associate it with a roadmap item, or do both. Either action records acceptance; roadmap placement additionally records sequencing. The work may remain human-owned. Apply `agent:plan-requested` to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`. If no, close it as not planned and record the rationale.
+> Review the issue and decide whether OpenShell should pursue it. If yes, apply `state:accepted`, associate it with a roadmap item, or do both. Either action records acceptance; roadmap placement additionally records sequencing. The work may remain human-owned. Apply `agent:plan-requested` to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`; on a direct request, the agent warns about missing expected workflow labels and continues without changing them. If no, close it as not planned and record the rationale.
 
 For `state:needs-info`:
 

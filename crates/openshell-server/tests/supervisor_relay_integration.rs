@@ -23,7 +23,7 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
+    GatewayMessage, PeerRelayFrame, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -48,6 +48,57 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn get_current_user(
         &self,
         _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
@@ -67,6 +118,44 @@ impl OpenShell for RelayGateway {
     }
 
     // ------ unused stubs ------
+
+    async fn create_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    type PeerRelayStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send>>;
+
+    async fn peer_relay(
+        &self,
+        _: tonic::Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     type ConnectSupervisorStream = ReceiverStream<Result<GatewayMessage, Status>>;
     async fn connect_supervisor(
@@ -190,6 +279,22 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("provider readiness"))
+    }
+
     async fn get_sandbox_provider_environment(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,
@@ -234,6 +339,12 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::RevokeSshSessionRequest>,
     ) -> Result<Response<openshell_core::proto::RevokeSshSessionResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn exchange_provider_subject_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::ExchangeProviderSubjectTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
     async fn create_provider(
@@ -354,6 +465,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn report_sandbox_configuration(
+        &self,
+        _: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,

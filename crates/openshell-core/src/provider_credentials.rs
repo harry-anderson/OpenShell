@@ -17,9 +17,25 @@ const MAX_RETAINED_CREDENTIAL_GENERATIONS: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentialSnapshot {
+    /// Identifies this local installation, including repairs at the same revision.
+    pub installation_id: String,
     pub revision: u64,
     pub child_env: HashMap<String, String>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+}
+
+/// One atomic workload-facing snapshot and its local installation identity.
+///
+/// Only the prepared environment crosses an isolation boundary; resolver
+/// material remains in the supervisor. The identity distinguishes an empty
+/// fail-closed snapshot from a later repair with the same provider revision.
+pub struct ChildEnvironmentSnapshot {
+    /// Opaque identity of the installed supervisor snapshot.
+    pub installation_id: String,
+    /// Opaque provider content fingerprint, never an ordered counter.
+    pub revision: u64,
+    /// Prepared environment used by future workload processes.
+    pub environment: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -32,6 +48,8 @@ struct ProviderCredentialStateInner {
     non_secret_environment_keys: HashSet<String>,
     static_credential_bindings: HashMap<String, CompiledStaticCredentialBinding>,
     known_static_credential_keys: HashSet<String>,
+    body_inventory_available: bool,
+    known_body_keys: HashSet<String>,
     static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
 }
 
@@ -45,6 +63,7 @@ struct StaticCredentialIdentityEpoch {
 struct CompiledStaticCredentialBinding {
     endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
     credential_identity: String,
+    workload_credential_handle: String,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +105,7 @@ impl ProviderCredentialState {
                 revision,
             );
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
@@ -96,13 +116,15 @@ impl ProviderCredentialState {
 
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
-                current: snapshot,
+                current: snapshot.clone(),
                 generations,
                 current_resolver,
                 combined_resolver,
                 suppressed_keys: HashSet::new(),
                 non_secret_environment_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
+                body_inventory_available: true,
+                known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
             })),
@@ -122,37 +144,59 @@ impl ProviderCredentialState {
             static_credential_bindings,
             &non_secret_environment_keys,
         )?;
-        let state =
-            Self::from_environment(revision, env, credential_expires_at_ms, dynamic_credentials);
-        {
-            let mut inner = state
-                .inner
-                .write()
-                .expect("provider credential state poisoned");
-            inner
-                .known_static_credential_keys
-                .extend(static_credential_bindings.keys().cloned());
-            update_static_credential_identity_epochs(
-                &mut inner.static_credential_identity_epochs,
+        let stable_handles = static_credential_stable_handles(&static_credential_bindings);
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
+                env,
+                credential_expires_at_ms,
                 revision,
-                &static_credential_bindings,
+                &stable_handles,
             );
-            inner.non_secret_environment_keys = non_secret_environment_keys.into_iter().collect();
-            inner.static_credential_bindings = static_credential_bindings;
-        }
-        Ok(state)
+        let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            revision,
+            child_env,
+            dynamic_credentials,
+        });
+        let generations = generation_resolver.map(Arc::new).into_iter().collect();
+        let current_resolver = current_resolver.map(Arc::new);
+        let combined_resolver = merge_resolvers(&generations, current_resolver.as_ref());
+        let known_static_credential_keys = static_credential_bindings.keys().cloned().collect();
+        let mut static_credential_identity_epochs = HashMap::new();
+        update_static_credential_identity_epochs(
+            &mut static_credential_identity_epochs,
+            revision,
+            &static_credential_bindings,
+        );
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
+                current: snapshot.clone(),
+                generations,
+                current_resolver,
+                combined_resolver,
+                suppressed_keys: HashSet::new(),
+                non_secret_environment_keys: non_secret_environment_keys.into_iter().collect(),
+                static_credential_bindings,
+                body_inventory_available: true,
+                known_body_keys: snapshot.child_env.keys().cloned().collect(),
+                known_static_credential_keys,
+                static_credential_identity_epochs,
+            })),
+        })
     }
 
     /// Build a static provider state from an already-prepared child
     /// environment snapshot.
     ///
-    /// Kubernetes sidecar topology uses this in the process-only supervisor:
-    /// the network sidecar owns provider credential resolvers and sends the
+    /// The Kubernetes sandbox runtime uses this in the sandbox process:
+    /// the supervisor owns provider credential resolvers and sends the
     /// workload-facing env map over a local control channel. The process leaf
     /// must inject that map into child processes without re-placeholderizing it
     /// or holding the gateway-side resolver material.
     pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {
         let snapshot = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -160,13 +204,15 @@ impl ProviderCredentialState {
 
         Self {
             inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
-                current: snapshot,
+                current: snapshot.clone(),
                 generations: VecDeque::new(),
                 current_resolver: None,
                 combined_resolver: None,
                 suppressed_keys: HashSet::new(),
                 non_secret_environment_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
+                body_inventory_available: false,
+                known_body_keys: snapshot.child_env.keys().cloned().collect(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
             })),
@@ -194,6 +240,7 @@ impl ProviderCredentialState {
         }
 
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials: HashMap::new(),
@@ -205,6 +252,7 @@ impl ProviderCredentialState {
         inner.static_credential_bindings.clear();
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
+        inner.body_inventory_available = false;
         inner.current.child_env.len()
     }
 
@@ -250,6 +298,23 @@ impl ProviderCredentialState {
         port: u16,
         path: &str,
     ) -> (Option<Arc<SecretResolver>>, u64) {
+        let (resolver, _, revision) =
+            self.resolver_and_body_classifier_for_endpoint(host, port, path);
+        (resolver, revision)
+    }
+
+    /// Obtain value resolution and body classification from the same revision.
+    #[must_use]
+    pub fn resolver_and_body_classifier_for_endpoint(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> (
+        Option<Arc<SecretResolver>>,
+        Option<Arc<crate::secrets::body::BodyCredentialClassifier>>,
+        u64,
+    ) {
         let request_path = path.split_once('?').map_or(path, |(path, _)| path);
         let request_path = crate::secrets::redact_target_for_policy(request_path);
         let normalized_host = host.to_ascii_lowercase();
@@ -263,7 +328,7 @@ impl ProviderCredentialState {
             // Binding authorization must not depend on real credential
             // material. Malformed placeholder syntax cannot be normalized
             // safely, so expose no endpoint-scoped resolver.
-            return (None, revision);
+            return (None, None, revision);
         };
         let allowed: HashSet<String> = inner
             .static_credential_bindings
@@ -275,6 +340,28 @@ impl ProviderCredentialState {
             })
             .map(|(key, _)| key.clone())
             .collect();
+        let classifier = inner.body_inventory_available.then(|| {
+            Arc::new(crate::secrets::body::BodyCredentialClassifier::new(
+                inner.combined_resolver.as_deref(),
+                inner
+                    .known_body_keys
+                    .union(&inner.known_static_credential_keys)
+                    .cloned()
+                    .collect(),
+                inner.static_credential_bindings.keys().cloned().collect(),
+                inner
+                    .static_credential_identity_epochs
+                    .iter()
+                    .filter(|(key, epoch)| {
+                        inner
+                            .static_credential_bindings
+                            .get(*key)
+                            .is_some_and(|binding| binding.credential_identity == epoch.identity)
+                    })
+                    .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
+                    .collect(),
+            ))
+        });
         let resolver = inner.combined_resolver.as_ref().map(|resolver| {
             let revision_fallback_allowed_revisions = inner
                 .static_credential_identity_epochs
@@ -294,7 +381,7 @@ impl ProviderCredentialState {
                 revision_fallback_allowed_revisions,
             ))
         });
-        (resolver, revision)
+        (resolver, classifier, revision)
     }
 
     #[must_use]
@@ -319,6 +406,7 @@ impl ProviderCredentialState {
         inner.suppressed_keys.insert(key.to_string());
         let mut env = (*inner.current).clone();
         env.child_env.remove(key);
+        env.installation_id = uuid::Uuid::new_v4().to_string();
         inner.current = Arc::new(env);
     }
 
@@ -340,12 +428,49 @@ impl ProviderCredentialState {
     ///    here so SDKs can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
-        use crate::google_cloud;
-
         let inner = self
             .inner
             .read()
             .expect("provider credential state poisoned");
+        Self::resolve_child_env_snapshot(&inner).1
+    }
+
+    /// Return the current revision and its workload-facing environment from
+    /// one state snapshot.
+    ///
+    /// Remote isolation boundaries use the pair as a revisioned update.  The
+    /// revision must describe the exact environment sent across the boundary,
+    /// so callers must not obtain the two values through separate lock
+    /// acquisitions.
+    pub fn child_env_snapshot_with_gcp_resolved(
+        &self,
+    ) -> std::io::Result<(u64, HashMap<String, String>)> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
+        Ok(Self::resolve_child_env_snapshot(&inner))
+    }
+
+    /// Capture installation identity and prepared environment under one lock.
+    pub fn child_environment_snapshot(&self) -> std::io::Result<ChildEnvironmentSnapshot> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
+        let (revision, environment) = Self::resolve_child_env_snapshot(&inner);
+        Ok(ChildEnvironmentSnapshot {
+            installation_id: inner.current.installation_id.clone(),
+            revision,
+            environment,
+        })
+    }
+
+    fn resolve_child_env_snapshot(
+        inner: &ProviderCredentialStateInner,
+    ) -> (u64, HashMap<String, String>) {
+        use crate::google_cloud;
+
         let mut env = inner.current.child_env.clone();
 
         let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST")
@@ -357,7 +482,7 @@ impl ProviderCredentialState {
             .any(|key| env.contains_key(*key) && inner.non_secret_environment_keys.contains(*key));
 
         if !has_gcp_metadata && !has_gcp_config {
-            return env;
+            return (inner.current.revision, env);
         }
 
         if has_gcp_metadata {
@@ -395,7 +520,50 @@ impl ProviderCredentialState {
             }
         }
 
-        env
+        (inner.current.revision, env)
+    }
+
+    /// Compare and install a workload-facing environment snapshot.
+    ///
+    /// Provider environment revisions are opaque content identities, not
+    /// ordered counters. The expected revision rejects a different current
+    /// fingerprint. Callers must also fence publication order when a failed
+    /// refresh and its repair can share that fingerprint.
+    pub fn compare_and_install_child_env_snapshot(
+        &self,
+        expected_revision: u64,
+        revision: u64,
+        mut child_env: HashMap<String, String>,
+    ) -> std::io::Result<u64> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| std::io::Error::other("provider credential state poisoned"))?;
+        if expected_revision != inner.current.revision {
+            return Ok(inner.current.revision);
+        }
+
+        // A failed refresh can clear the map without changing its provider
+        // fingerprint. A matching expectation must therefore install even an
+        // equal revision. Boundary publication ordering fences delayed retries.
+
+        for key in &inner.suppressed_keys {
+            child_env.remove(key);
+        }
+        inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
+            revision,
+            child_env,
+            dynamic_credentials: HashMap::new(),
+        });
+        inner.generations.clear();
+        inner.current_resolver = None;
+        inner.combined_resolver = None;
+        inner.non_secret_environment_keys.clear();
+        inner.static_credential_bindings.clear();
+        inner.known_static_credential_keys.clear();
+        inner.static_credential_identity_epochs.clear();
+        Ok(revision)
     }
 
     /// Return the GCP token placeholder and its remaining lifetime in seconds.
@@ -460,10 +628,14 @@ impl ProviderCredentialState {
         }
 
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
         });
+        inner.body_inventory_available = true;
+        let body_keys = inner.current.child_env.keys().cloned().collect::<Vec<_>>();
+        inner.known_body_keys.extend(body_keys);
         inner.current_resolver = current_resolver.map(Arc::new);
 
         if let Some(resolver) = generation_resolver {
@@ -505,11 +677,13 @@ impl ProviderCredentialState {
             }
         };
 
+        let stable_handles = static_credential_stable_handles(&static_credential_bindings);
         let (mut child_env, generation_resolver, current_resolver) =
-            SecretResolver::from_provider_env_for_current_revision(
+            SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
                 env,
                 credential_expires_at_ms,
                 revision,
+                &stable_handles,
             );
         let mut inner = self
             .inner
@@ -520,10 +694,14 @@ impl ProviderCredentialState {
             child_env.remove(key);
         }
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env,
             dynamic_credentials,
         });
+        inner.body_inventory_available = true;
+        let body_keys = inner.current.child_env.keys().cloned().collect::<Vec<_>>();
+        inner.known_body_keys.extend(body_keys);
         inner.current_resolver = current_resolver.map(Arc::new);
         if static_credential_identities(&inner.static_credential_bindings)
             != static_credential_identities(&static_credential_bindings)
@@ -551,6 +729,66 @@ impl ProviderCredentialState {
         Ok(inner.current.child_env.len())
     }
 
+    /// Install a validated candidate without repeating fallible compilation.
+    ///
+    /// Existing clones keep observing this live state. Preserve suppressed
+    /// environment keys and identity history so refresh cannot restore removed
+    /// keys or authorize old placeholders for a different provider. Callers
+    /// must serialize installs and revocations, as for bound-environment installs.
+    pub fn install_prepared(&self, prepared: &Self) -> usize {
+        // Release the candidate lock before taking the live lock, including
+        // when a caller passes another handle to the same state.
+        let (snapshot, generations, current_resolver, bindings, non_secret_keys) = {
+            let candidate = prepared
+                .inner
+                .read()
+                .expect("provider credential state poisoned");
+            (
+                (*candidate.current).clone(),
+                candidate.generations.clone(),
+                candidate.current_resolver.clone(),
+                candidate.static_credential_bindings.clone(),
+                candidate.non_secret_environment_keys.clone(),
+            )
+        };
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        let mut snapshot = snapshot;
+        for key in &inner.suppressed_keys {
+            snapshot.child_env.remove(key);
+        }
+        if static_credential_identities(&inner.static_credential_bindings)
+            != static_credential_identities(&bindings)
+        {
+            inner.generations.clear();
+        }
+        inner.generations.extend(generations);
+        while inner.generations.len() > MAX_RETAINED_CREDENTIAL_GENERATIONS {
+            inner.generations.pop_front();
+        }
+        inner.current_resolver = current_resolver;
+        inner.combined_resolver =
+            merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
+        inner
+            .known_static_credential_keys
+            .extend(bindings.keys().cloned());
+        update_static_credential_identity_epochs(
+            &mut inner.static_credential_identity_epochs,
+            snapshot.revision,
+            &bindings,
+        );
+        inner.static_credential_bindings = bindings;
+        inner.non_secret_environment_keys = non_secret_keys;
+        inner.body_inventory_available = true;
+        inner
+            .known_body_keys
+            .extend(snapshot.child_env.keys().cloned());
+        inner.current = Arc::new(snapshot);
+        inner.current.child_env.len()
+    }
+
     /// Atomically remove static provider material after a failed refresh.
     ///
     /// Dynamic token grants retain their independently endpoint-bound state
@@ -576,6 +814,7 @@ impl ProviderCredentialState {
         let dynamic_credentials =
             dynamic_credentials.unwrap_or_else(|| inner.current.dynamic_credentials.clone());
         inner.current = Arc::new(ProviderCredentialSnapshot {
+            installation_id: uuid::Uuid::new_v4().to_string(),
             revision,
             child_env: HashMap::new(),
             dynamic_credentials,
@@ -585,6 +824,7 @@ impl ProviderCredentialState {
         inner.combined_resolver = None;
         inner.non_secret_environment_keys.clear();
         inner.static_credential_bindings.clear();
+        inner.body_inventory_available = false;
     }
 }
 
@@ -633,6 +873,13 @@ fn compile_static_credential_bindings(
                 "static credential binding has no authorized endpoints",
             ));
         }
+        if !binding.workload_credential_handle.is_empty()
+            && !is_valid_workload_credential_handle(&binding.workload_credential_handle)
+        {
+            return Err(binding_error(
+                "static credential binding has an invalid workload credential handle",
+            ));
+        }
         for endpoint in &binding.endpoints {
             if endpoint.port == 0 || endpoint.port > u32::from(u16::MAX) {
                 return Err(binding_error(
@@ -655,6 +902,7 @@ fn compile_static_credential_bindings(
                 CompiledStaticCredentialBinding {
                     endpoints,
                     credential_identity: binding.credential_identity,
+                    workload_credential_handle: binding.workload_credential_handle,
                 },
             ))
         })
@@ -683,13 +931,37 @@ fn static_credential_identities(
         .collect()
 }
 
+fn static_credential_stable_handles(
+    bindings: &HashMap<String, CompiledStaticCredentialBinding>,
+) -> HashMap<String, String> {
+    bindings
+        .iter()
+        .filter(|(_, binding)| !binding.workload_credential_handle.is_empty())
+        .map(|(key, binding)| (key.clone(), binding.workload_credential_handle.clone()))
+        .collect()
+}
+
+fn is_valid_workload_credential_handle(handle: &str) -> bool {
+    handle.len() == 64
+        && handle
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn update_static_credential_identity_epochs(
     epochs: &mut HashMap<String, StaticCredentialIdentityEpoch>,
     revision: u64,
     bindings: &HashMap<String, CompiledStaticCredentialBinding>,
 ) {
-    epochs.retain(|key, _| bindings.contains_key(key));
+    epochs.retain(|key, _| {
+        bindings
+            .get(key)
+            .is_some_and(|binding| binding.workload_credential_handle.is_empty())
+    });
     for (key, binding) in bindings {
+        if !binding.workload_credential_handle.is_empty() {
+            continue;
+        }
         match epochs.get_mut(key) {
             Some(epoch) if epoch.identity == binding.credential_identity => {
                 Arc::make_mut(&mut epoch.revisions).insert(revision);
@@ -746,6 +1018,161 @@ mod tests {
     use super::*;
     use crate::google_cloud;
 
+    #[test]
+    fn body_classification_distinguishes_literal_foreign_bound_and_revoked() {
+        use crate::secrets::body::BodyCredentialError;
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            HashMap::from([("API_KEY".into(), "test-secret".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".into(),
+                binding("api.github.com", 443, "/allowed/**"),
+            )]),
+            vec![],
+        )
+        .unwrap();
+        let token = state.snapshot().child_env["API_KEY"].clone();
+        for (host, port, path) in [
+            ("api.openai.com", 443, "/v1/responses"),
+            ("api.github.com", 443, "/allowed/foo"),
+            ("api.github.com", 444, "/allowed/foo"),
+            ("api.github.com", 443, "/other"),
+        ] {
+            let (_, classifier, _) =
+                state.resolver_and_body_classifier_for_endpoint(host, port, path);
+            let classifier = classifier.unwrap();
+            assert_eq!(classifier.check(&token), Ok(()));
+            assert_eq!(
+                classifier.check("sk-OPENSHELL-RESOLVE-ENV-v42_API_KEY"),
+                Ok(())
+            );
+            assert_eq!(classifier.check("openshell:resolve:env:KEY"), Ok(()));
+            assert_eq!(classifier.check("sk-OPENSHELL-RESOLVE-ENV-KEY"), Ok(()));
+            assert_eq!(
+                classifier.check("openshell:resolve:env:v999_API_KEY"),
+                Err(BodyCredentialError::KnownUnavailable)
+            );
+            assert_eq!(
+                classifier.check("openshell:resolve:env:API_KEY"),
+                Err(BodyCredentialError::KnownUnavailable)
+            );
+            assert_eq!(
+                classifier.check("openshell:resolve:env:sbroken_API_KEY"),
+                Err(BodyCredentialError::KnownUnavailable)
+            );
+        }
+        let (_, classifier, _) =
+            state.resolver_and_body_classifier_for_endpoint("api.github.com", 443, "/allowed/foo");
+        assert_eq!(classifier.unwrap().check(&token), Ok(()));
+        assert_eq!(
+            state
+                .resolver_and_body_classifier_for_endpoint("api.github.com", 443, "/allowed/foo")
+                .1
+                .unwrap()
+                .check("sk-OPENSHELL-RESOLVE-ENV-v42_API_KEY"),
+            Ok(())
+        );
+        state.revoke_static_provider_environment(43);
+        assert!(
+            state
+                .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+                .1
+                .is_none()
+        );
+        state
+            .install_bound_environment(
+                44,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+            )
+            .unwrap();
+        let classifier = state
+            .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+            .1
+            .unwrap();
+        assert_eq!(
+            classifier.check(&token),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+        assert_eq!(classifier.check("openshell:resolve:env:KEY"), Ok(()));
+    }
+
+    #[test]
+    fn body_classification_rejects_expired_invalid_and_replaced_credentials() {
+        use crate::secrets::body::BodyCredentialError;
+        for (value, expires) in [("secret", 1), ("bad\r\nvalue", 0)] {
+            let state = ProviderCredentialState::from_bound_environment(
+                42,
+                HashMap::from([("API_KEY".into(), value.into())]),
+                HashMap::from([("API_KEY".into(), expires)]),
+                HashMap::new(),
+                HashMap::from([("API_KEY".into(), binding("api.github.com", 443, "/**"))]),
+                vec![],
+            )
+            .unwrap();
+            let token = state.snapshot().child_env["API_KEY"].clone();
+            for host in ["api.openai.com", "api.github.com"] {
+                let classifier = state
+                    .resolver_and_body_classifier_for_endpoint(host, 443, "/")
+                    .1
+                    .unwrap();
+                assert_eq!(
+                    classifier.check(&token),
+                    Err(BodyCredentialError::KnownUnavailable)
+                );
+            }
+        }
+        let handle = "a".repeat(64);
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            HashMap::from([("API_KEY".into(), "secret".into())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".into(),
+                stable_binding("api.github.com", 443, "/**", &handle),
+            )]),
+            vec![],
+        )
+        .unwrap();
+        let token = state.snapshot().child_env["API_KEY"].clone();
+        let classifier = state
+            .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+            .1
+            .unwrap();
+        assert_eq!(classifier.check(&token), Ok(()));
+        assert_eq!(
+            classifier.check(&token.replace(&handle, &"b".repeat(64))),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+        state
+            .install_bound_environment(
+                43,
+                HashMap::from([("API_KEY".into(), "new-secret".into())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".into(),
+                    stable_binding("api.github.com", 443, "/**", &"b".repeat(64)),
+                )]),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .resolver_and_body_classifier_for_endpoint("api.openai.com", 443, "/")
+                .1
+                .unwrap()
+                .check(&token),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+    }
+
     fn binding(host: &str, port: u32, path: &str) -> StaticCredentialBinding {
         StaticCredentialBinding {
             endpoints: vec![StaticCredentialEndpointBinding {
@@ -754,7 +1181,15 @@ mod tests {
                 path: path.to_string(),
             }],
             credential_identity: "provider-a:API_KEY".to_string(),
+            workload_credential_handle: String::new(),
         }
+    }
+
+    fn stable_binding(host: &str, port: u32, path: &str, handle: &str) -> StaticCredentialBinding {
+        let mut binding = binding(host, port, path);
+        binding.credential_identity = format!("refresh:{handle}");
+        binding.workload_credential_handle = handle.to_string();
+        binding
     }
 
     fn assert_binding_validation_error(
@@ -820,6 +1255,15 @@ mod tests {
             HashMap::from([("API_KEY".to_string(), missing_endpoints)]),
             Vec::new(),
             "static credential binding has no authorized endpoints",
+        );
+
+        let mut invalid_handle = binding("api.example.com", 443, "/**");
+        invalid_handle.workload_credential_handle = "not-an-opaque-handle".to_string();
+        assert_binding_validation_error(
+            credential_env(),
+            HashMap::from([("API_KEY".to_string(), invalid_handle)]),
+            Vec::new(),
+            "static credential binding has an invalid workload credential handle",
         );
 
         for (host, port) in [
@@ -1216,6 +1660,171 @@ mod tests {
             resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             Some("new")
         );
+    }
+
+    #[test]
+    fn stable_handle_resolves_current_token_after_initial_token_expires() {
+        let handle = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_millis(),
+        )
+        .expect("current time fits i64");
+        let binding = stable_binding("api.example.com", 443, "/**", handle);
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "expired".to_string())]),
+            HashMap::from([("API_KEY".to_string(), now_ms - 1)]),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), binding.clone())]),
+            Vec::new(),
+        )
+        .expect("initial stable binding");
+        let workload_placeholder = state.snapshot().child_env["API_KEY"].clone();
+        assert!(workload_placeholder.contains(handle));
+        assert_eq!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver")
+                .resolve_placeholder(&workload_placeholder),
+            None,
+            "the expired access token must fail closed"
+        );
+
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([("API_KEY".to_string(), "current".to_string())]),
+                HashMap::from([("API_KEY".to_string(), now_ms + 60_000)]),
+                HashMap::new(),
+                HashMap::from([("API_KEY".to_string(), binding)]),
+                Vec::new(),
+            )
+            .expect("refreshed stable binding");
+
+        assert_eq!(state.snapshot().child_env["API_KEY"], workload_placeholder);
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1")
+            .expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder(&workload_placeholder),
+            Some("current")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            None,
+            "refresh-managed credentials must not expose revision aliases"
+        );
+    }
+
+    #[test]
+    fn stable_handle_survives_twelve_rotations_and_state_reconstruction() {
+        let handle = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let binding = stable_binding("api.example.com", 443, "/**", handle);
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "token-1".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), binding.clone())]),
+            Vec::new(),
+        )
+        .expect("initial stable binding");
+        let workload_placeholder = state.snapshot().child_env["API_KEY"].clone();
+
+        for revision in 2..=13 {
+            let token = format!("token-{revision}");
+            state
+                .install_bound_environment(
+                    revision,
+                    HashMap::from([("API_KEY".to_string(), token.clone())]),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::from([("API_KEY".to_string(), binding.clone())]),
+                    Vec::new(),
+                )
+                .expect("same-epoch rotation");
+            assert_eq!(state.snapshot().child_env["API_KEY"], workload_placeholder);
+            assert_eq!(
+                state
+                    .resolver_for_endpoint("api.example.com", 443, "/v1")
+                    .expect("resolver")
+                    .resolve_placeholder(&workload_placeholder),
+                Some(token.as_str())
+            );
+        }
+
+        let reconstructed = ProviderCredentialState::from_bound_environment(
+            14,
+            HashMap::from([("API_KEY".to_string(), "token-14".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), binding)]),
+            Vec::new(),
+        )
+        .expect("reconstructed network supervisor state");
+        assert_eq!(
+            reconstructed.snapshot().child_env["API_KEY"],
+            workload_placeholder
+        );
+        assert_eq!(
+            reconstructed
+                .resolver_for_endpoint("api.example.com", 443, "/v1")
+                .expect("resolver")
+                .resolve_placeholder(&workload_placeholder),
+            Some("token-14")
+        );
+    }
+
+    #[test]
+    fn authorization_epoch_or_endpoint_change_revokes_stable_handle() {
+        let old_handle = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let new_handle = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".to_string(),
+                stable_binding("old.example.com", 443, "/v1/**", old_handle),
+            )]),
+            Vec::new(),
+        )
+        .expect("old authorization");
+        let old_placeholder = state.snapshot().child_env["API_KEY"].clone();
+
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([("API_KEY".to_string(), "new".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".to_string(),
+                    stable_binding("new.example.com", 443, "/v2/**", new_handle),
+                )]),
+                Vec::new(),
+            )
+            .expect("replacement authorization");
+
+        let current = state
+            .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
+            .expect("current resolver");
+        assert_eq!(current.resolve_placeholder(&old_placeholder), None);
+        assert_eq!(
+            current.resolve_placeholder(&state.snapshot().child_env["API_KEY"]),
+            Some("new")
+        );
+        let wrong_endpoint = state
+            .resolver_for_endpoint("old.example.com", 443, "/v1/messages")
+            .expect("endpoint-scoped resolver");
+        let error = wrong_endpoint
+            .rewrite_header_value(&state.snapshot().child_env["API_KEY"])
+            .expect_err("new handle must not resolve at the old endpoint");
+        assert!(error.is_endpoint_mismatch());
     }
 
     #[test]
@@ -1821,6 +2430,95 @@ mod tests {
     }
 
     #[test]
+    fn prepared_install_retains_placeholders_for_same_provider_identity() {
+        let make_state = |revision, secret: &str| {
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([("API_KEY".to_string(), secret.to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".to_string(),
+                    binding("api.example.com", 443, "/**"),
+                )]),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "first-secret");
+        let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
+        live.install_prepared(&make_state(2, "second-secret"));
+        let resolver = live
+            .resolver_for_endpoint("api.example.com", 443, "/")
+            .unwrap();
+        assert_eq!(
+            resolver.resolve_placeholder(&old_placeholder),
+            Some("first-secret")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            Some("second-secret"),
+        );
+    }
+
+    #[test]
+    fn prepared_install_restores_body_inventory_after_revocation() {
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        live.revoke_static_provider_environment(2);
+        assert!(!live.inner.read().unwrap().body_inventory_available);
+        let candidate = ProviderCredentialState::from_bound_environment(
+            3,
+            HashMap::from([("NEW_KEY".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "NEW_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        live.install_prepared(&candidate);
+        let inner = live.inner.read().unwrap();
+        assert!(inner.body_inventory_available);
+        assert!(inner.known_body_keys.contains("NEW_KEY"));
+    }
+
+    #[test]
+    fn prepared_install_preserves_suppression_and_rejects_replaced_identity() {
+        let make_state = |revision, identity: &str, secret: &str| {
+            let mut binding = binding("api.example.com", 443, "/**");
+            binding.credential_identity = identity.to_string();
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([("API_KEY".to_string(), secret.to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".to_string(), binding)]),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "first:API_KEY", "first-secret");
+        let observer = live.clone();
+        let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
+        live.remove_env_key("API_KEY");
+        let candidate = make_state(2, "second:API_KEY", "second-secret");
+        live.install_prepared(&candidate);
+        assert_eq!(observer.snapshot().revision, 2);
+        assert!(!observer.snapshot().child_env.contains_key("API_KEY"));
+        let resolver = observer
+            .resolver_for_endpoint("api.example.com", 443, "/")
+            .unwrap();
+        assert!(resolver.resolve_placeholder(&old_placeholder).is_none());
+    }
+
+    #[test]
     fn suppressed_keys_survive_install_environment() {
         let state = ProviderCredentialState::from_environment(
             1,
@@ -1880,6 +2578,86 @@ mod tests {
             state.resolver().is_none(),
             "child-env snapshots must not install provider resolver material"
         );
+    }
+
+    #[test]
+    fn child_env_snapshot_update_uses_opaque_revision_cas() {
+        let state = ProviderCredentialState::from_child_env_snapshot(
+            4,
+            HashMap::from([("TOKEN".to_string(), "four".to_string())]),
+        );
+
+        assert_eq!(
+            state
+                .compare_and_install_child_env_snapshot(
+                    4,
+                    6,
+                    HashMap::from([("TOKEN".to_string(), "six".to_string())]),
+                )
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            state
+                .compare_and_install_child_env_snapshot(
+                    4,
+                    5,
+                    HashMap::from([("TOKEN".to_string(), "stale".to_string())]),
+                )
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            state
+                .compare_and_install_child_env_snapshot(6, 2, HashMap::new())
+                .unwrap(),
+            2,
+            "opaque revisions may move numerically backwards"
+        );
+
+        let (revision, env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
+        assert_eq!(revision, 2);
+        assert!(env.is_empty(), "an empty snapshot must revoke the old env");
+    }
+
+    #[test]
+    fn child_environment_repair_replaces_an_empty_map_at_the_same_revision() {
+        let state = ProviderCredentialState::from_child_env_snapshot(6, HashMap::new());
+        let failed = state.child_environment_snapshot().unwrap();
+        state
+            .compare_and_install_child_env_snapshot(
+                6,
+                6,
+                HashMap::from([("TOKEN".to_string(), "reference".to_string())]),
+            )
+            .unwrap();
+        let repaired = state.child_environment_snapshot().unwrap();
+        assert_ne!(failed.installation_id, repaired.installation_id);
+        assert_eq!(repaired.revision, 6);
+        assert_eq!(
+            repaired.environment.get("TOKEN").map(String::as_str),
+            Some("reference")
+        );
+    }
+
+    #[test]
+    fn poisoned_environment_update_returns_error_without_recovering_state() {
+        let state = ProviderCredentialState::from_child_env_snapshot(4, HashMap::new());
+        let poison = state.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.inner.write().unwrap();
+                panic!("poison state during mutation");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            state
+                .compare_and_install_child_env_snapshot(4, 5, HashMap::new())
+                .is_err()
+        );
+        assert!(state.child_env_snapshot_with_gcp_resolved().is_err());
     }
 
     #[test]
