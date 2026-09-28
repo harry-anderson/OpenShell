@@ -701,6 +701,15 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 </Tip>
 
+<Tip>
+To use the host SSH agent inside the sandbox, pass `--forward-agent` on create and on later connects. See [SSH agent forwarding](/how-it-works/sandboxes/ssh-agent-forwarding).
+
+```shell
+openshell sandbox create --forward-agent --name signed -- claude
+```
+
+</Tip>
+
 ## SSH Config
 
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:

@@ -5,10 +5,10 @@
 //!
 //! The host `SSH_AUTH_SOCK` never leaves the client. The CLI opens an SSH
 //! session with `ForwardAgent=yes` over the existing authenticated
-//! gateway relay; the supervisor binds a pinned Unix socket in the sandbox
-//! and bridges each accept back to the client with `auth-agent@openssh.com`.
-//! That path works for Docker, VM, and Kubernetes: there is no
-//! `host.docker.internal` hop and no cluster Service for the agent.
+//! gateway relay. The workload binds `/tmp/openshell-ssh-agent/agent.sock`
+//! (the supervisor does not share that mount namespace) and the supervisor
+//! bridges each accept back to the client with `auth-agent@openssh.com`.
+//! Docker, VM, and Kubernetes all use this path.
 
 use std::collections::HashMap;
 use std::path::Path;
