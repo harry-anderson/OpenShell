@@ -114,10 +114,9 @@ pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 /// versions (e.g. `"banana"`, `"1.6"`) are rejected at configure time.
 pub const OCSF_SCHEMA_VERSION_VALUES: &[&str] = &["", "1.1", "1.3"];
 
-/// Sandbox-level opt-in recorded by `--forward-agent`. Defaults to false.
-///
-/// The workload still fail-closes the agent socket unless create injected
-/// the pinned `SSH_AUTH_SOCK`. A global true does not forward by itself.
+/// Registered bool, default false. The forwarding path does not read this
+/// value. Create still has to pass `--forward-agent`, which injects the
+/// pinned `SSH_AUTH_SOCK` the workload checks.
 pub const SSH_FORWARD_AGENT_KEY: &str = crate::ssh_agent::SSH_FORWARD_AGENT_KEY;
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
