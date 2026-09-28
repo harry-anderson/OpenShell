@@ -3,12 +3,11 @@
 
 //! Host git identity + SSH-cert signing config for a sandbox.
 //!
-//! PassportControl / YubiKey setups sign with an **SSH certificate in the
-//! agent**, not a `user.signingKey` file. The sandbox therefore gets:
-//! `gpg.format=ssh`, `commit.gpgsign=true`, and
-//! `gpg.ssh.defaultKeyCommand=ssh-add -L` so git asks the forwarded agent.
-//! `allowedSignersFile` is copied and rewritten to a `/tmp` path because the
-//! host path (`~/Library/Group Containers/...`) does not exist in-pod.
+//! SSH signing uses a certificate in the host agent, not a `user.signingKey`
+//! file. The sandbox therefore gets `gpg.format=ssh`, `commit.gpgsign=true`,
+//! and `gpg.ssh.defaultKeyCommand=ssh-add -L` so git asks the forwarded
+//! agent. `allowedSignersFile` is copied and rewritten to a `/tmp` path
+//! because the host path does not exist in the pod.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -115,12 +114,12 @@ mod tests {
     #[test]
     fn render_cert_signing_has_no_signing_key() {
         let cfg = HostGitSignConfig {
-            name: Some("Harry Anderson".into()),
-            email: Some("harry@example.com".into()),
+            name: Some("Dev User".into()),
+            email: Some("dev@example.com".into()),
             gpg_format: Some("ssh".into()),
             commit_gpgsign: true,
             tag_gpgsign: false,
-            allowed_signers_host_path: Some("/Users/harry/Library/Group Containers/x/allowed_signers".into()),
+            allowed_signers_host_path: Some("/home/dev/.ssh/allowed_signers".into()),
         };
         let rendered = render_sandbox_gitconfig(&cfg, true);
         assert!(!rendered.to_ascii_lowercase().contains("signingkey"));
@@ -128,8 +127,8 @@ mod tests {
         assert!(rendered.contains("gpgsign = true"));
         assert!(rendered.contains("defaultKeyCommand = \"ssh-add -L\""));
         assert!(rendered.contains(SANDBOX_GIT_ALLOWED_SIGNERS));
-        assert!(!rendered.contains("/Users/harry"));
-        assert!(rendered.contains("name = \"Harry Anderson\""));
+        assert!(!rendered.contains("/home/dev"));
+        assert!(rendered.contains("name = \"Dev User\""));
     }
 
     #[test]

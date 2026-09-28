@@ -14,14 +14,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Settings registry key. Default false. Gateway-global true is a fleet-wide
-/// allow; the client must still pass `--forward-agent` (CLI forces
-/// `ForwardAgent=no` otherwise).
+/// Settings registry key. Default false. The forwarding path does not read
+/// this value. The client must still pass `--forward-agent`.
 pub const SSH_FORWARD_AGENT_KEY: &str = "ssh_forward_agent";
 
 /// Directory for the pinned in-sandbox agent socket. `/tmp` must be
-/// Landlock `read_write` (true of the default policy and Harry's SWE
-/// policies). Home is often read-only, so `~/.ssh` cannot hold the socket.
+/// Landlock `read_write`, which the default policy grants. Home is often
+/// read-only, so `~/.ssh` cannot hold the socket.
 pub const SANDBOX_AGENT_DIR: &str = "/tmp/openshell-ssh-agent";
 
 /// Pinned socket path exported as `SSH_AUTH_SOCK` inside the sandbox.
@@ -54,7 +53,7 @@ pub fn inject_forward_agent_env(user_environment: &mut HashMap<String, String>) 
 /// that looks like an agent socket file). Missing/empty fails closed.
 pub fn host_agent_socket_ok() -> Result<String, String> {
     let raw = std::env::var(SSH_AUTH_SOCK_ENV).map_err(|_| {
-        format!("{SSH_AUTH_SOCK_ENV} is unset on this host. Start ssh-agent / 1Password / PassportControl.")
+        format!("{SSH_AUTH_SOCK_ENV} is unset on this host. Start your SSH agent.")
     })?;
     if raw.is_empty() {
         return Err(format!("{SSH_AUTH_SOCK_ENV} is empty"));
