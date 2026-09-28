@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn stage_copies_allowed_signers() {
         let host_signers = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(host_signers.path(), "harry namespaces=\"git\" ssh-ed25519-cert-v01@openssh.com AAAA\n").unwrap();
+        std::fs::write(host_signers.path(), "dev namespaces=\"git\" ssh-ed25519-cert-v01@openssh.com AAAA\n").unwrap();
         let cfg = HostGitSignConfig {
             gpg_format: Some("ssh".into()),
             commit_gpgsign: true,

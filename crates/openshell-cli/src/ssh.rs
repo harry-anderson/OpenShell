@@ -232,9 +232,8 @@ fn ssh_base_command(proxy_command: &str) -> Command {
 }
 
 /// Never emit `ForwardAgent=no` on the forwarding path. `IdentityAgent`
-/// is the `SSH_AUTH_SOCK` token, not the raw path: PassportControl sockets
-/// live under a directory whose name contains spaces, and OpenSSH parses
-/// `-o` values as ssh_config lines.
+/// is the `SSH_AUTH_SOCK` token, not the raw path. Agent socket paths can
+/// contain spaces, and OpenSSH parses `-o` values as ssh_config lines.
 fn apply_forward_agent(command: &mut Command, enabled: bool) {
     if enabled {
         if let Ok(sock) = std::env::var(ssh_agent::SSH_AUTH_SOCK_ENV)

@@ -19,6 +19,5 @@ Inside the sandbox, `ssh-add -l` should show the host agent. `SSH_AUTH_SOCK`
 is `/tmp/openshell-ssh-agent/agent.sock`. Git signing uses
 `gpg.ssh.defaultKeyCommand=ssh-add -L` and does not copy a private key.
 
-The architecture, the fail-closed gates, and how `smartcontractkit/openshell`
-`swe/` consumes this (including the legacy `:9922` relay) are in
+The architecture, including the Kubernetes path, is in
 [docs/how-it-works/sandboxes/ssh-agent-forwarding.mdx](docs/how-it-works/sandboxes/ssh-agent-forwarding.mdx).

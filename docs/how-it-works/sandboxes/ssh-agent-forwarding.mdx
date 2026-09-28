@@ -3,42 +3,52 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "SSH agent forwarding"
 sidebar-title: "SSH agent forwarding"
-description: "How opt-in SSH agent forwarding carries the host agent into a sandbox, and how the swe launcher uses it."
-keywords: "SSH, agent forwarding, YubiKey, git signing, PassportControl"
+description: "How opt-in SSH agent forwarding carries the host agent into a sandbox, including on Kubernetes."
+keywords: "SSH, agent forwarding, git signing, Kubernetes"
 ---
 
 `--forward-agent` is opt-in. A sandbox with a live agent can list keys, sign, and push as the host user. A security-key certificate still asks for a tap on the host.
 
-This page describes the implementation on `harry-anderson/OpenShell`, branch `feat/ssh-agent-forward-upstream`. `smartcontractkit/openshell` does not implement the forward. Its `swe/` launchers pass the flag, and they keep an older host TCP relay for the case where the flag is off.
-
-The host agent socket stays on the laptop. Create overwrites `SSH_AUTH_SOCK` with a pinned path inside the sandbox. Agent-protocol bytes ride the existing authenticated SSH session through the gateway relay. Docker, Podman, VM, and Kubernetes use that same path.
+The host agent socket stays on your machine. Create overwrites `SSH_AUTH_SOCK` with a pinned path inside the sandbox. Agent-protocol bytes ride the same authenticated SSH session that `sandbox connect` uses. Docker, Podman, MicroVM, and Kubernetes all use that path.
 
 ## Path
 
-The forward is one SSH session. The host agent never moves. Each accept on the sandbox socket is bridged back to that session.
+The forward is one SSH session. Each accept on the sandbox socket is bridged back to that session.
 
 ```mermaid
 flowchart LR
   agent["Host agent<br/>SSH_AUTH_SOCK"]
   ssh["OpenSSH client<br/>ForwardAgent=yes"]
   proxy["openshell ssh-proxy<br/>gateway relay"]
-  sup["Supervisor russh"]
+  sup["Supervisor SSH server"]
   work["openshell-sandbox<br/>binds agent.sock"]
   agent --> ssh --> proxy --> sup
   work -->|"AgentListen frames"| sup
   sup -->|"auth-agent@openssh.com"| ssh
 ```
 
-1. The laptop agent is already running. PassportControl, `ssh-agent`, or 1Password is fine. Create and connect check that `SSH_AUTH_SOCK` is set and the path exists.
-2. The CLI opens an SSH session with `ForwardAgent=yes` and `IdentityAgent=SSH_AUTH_SOCK`. `IdentityAgent` is that token, not the raw path. PassportControl sockets live under a directory whose name contains spaces, and OpenSSH parses `-o` values as `ssh_config` lines.
-3. `ProxyCommand` is `openshell ssh-proxy`. That is the same authenticated gateway relay `sandbox connect` uses. The client does not dial the sandbox pod or the Docker bridge.
+1. Your SSH agent is already running. Create and connect check that `SSH_AUTH_SOCK` is set and the path exists.
+2. The CLI opens an SSH session with `ForwardAgent=yes` and `IdentityAgent=SSH_AUTH_SOCK`. `IdentityAgent` is that token, not the raw path. Some agent socket paths contain spaces, and OpenSSH parses `-o` values as `ssh_config` lines.
+3. `ProxyCommand` is `openshell ssh-proxy`. That is the same authenticated gateway relay `sandbox connect` uses. The client does not dial the sandbox pod, the Docker bridge, or a published Service.
 4. The supervisor SSH server receives `auth-agent-req@openssh.com`. The first request on that server asks the workload to bind the socket (`Request::AgentListen` on the boundary channel).
-5. `openshell-sandbox`, inside the workload mount namespace, binds `/tmp/openshell-ssh-agent/agent.sock` and multiplexes each accept back to the supervisor. The two processes do not share a mount namespace, so the supervisor cannot bind this socket itself. An earlier revision of this fork did bind it in the supervisor. That only worked while the two processes shared a mount.
-6. For each accept, the supervisor opens `auth-agent@openssh.com` toward the client. OpenSSH on the laptop talks to the host agent. The private key stays there.
+5. `openshell-sandbox`, inside the workload mount namespace, binds `/tmp/openshell-ssh-agent/agent.sock` and multiplexes each accept back to the supervisor. The supervisor and the workload do not share a mount namespace, so the supervisor binds the SSH server socket and the workload binds the agent socket.
+6. For each accept, the supervisor opens `auth-agent@openssh.com` toward the client. OpenSSH on your machine talks to the host agent. The private key stays there.
 
 The mux frame is 9 bytes plus a payload: kind, connection id, length. Kinds are open, data, and close. Payloads are capped at 256 KiB.
 
 The CLI sets `ForwardAgent=no` on every other SSH command, including exec, port forwards, and the readiness probe. A `ForwardAgent yes` line in `~/.ssh/config` does not override that.
+
+## Kubernetes
+
+On Kubernetes the command is the same. You do not need a route to the pod network, and the cluster does not publish an SSH Service for the shell.
+
+`openshell sandbox connect` runs OpenSSH with `ProxyCommand` set to `openshell ssh-proxy`. The proxy asks the gateway for a session. The supervisor Pod already holds an authenticated channel to the gateway, which it opened outbound when the sandbox started. When you connect, the gateway asks that supervisor to open another stream on the same HTTP/2 connection. The supervisor splices those bytes into the SSH server listening on `/run/openshell/ssh.sock` inside the supervisor Pod.
+
+The workload is a different Pod. It does not run an SSH server. `openshell-sandbox` in the workload binds `/tmp/openshell-ssh-agent/agent.sock` when the supervisor sends `AgentListen` over the sandbox boundary. That boundary is the authenticated channel the supervisor already uses for exec and network mediation. A `NetworkPolicy` admits supervisor traffic to the workload boundary Service and denies other workload-initiated egress.
+
+Accepts on the agent socket travel back over that boundary, then over the gateway relay, then to the SSH client on your machine. The cluster never sees the host agent socket, and nothing in the cluster listens for agent protocol on a Service or a host port.
+
+Docker, Podman, and MicroVM use the same relay and the same `AgentListen` request. The difference on Kubernetes is that the supervisor and the workload are separate Pods, so the agent socket cannot be a shared mount.
 
 ## Why the keepalive is a session
 
@@ -72,7 +82,7 @@ Create injects `SSH_AUTH_SOCK=/tmp/openshell-ssh-agent/agent.sock` into the sand
 
 `ssh_forward_agent` is a registered gateway setting and defaults to false. The forwarding path does not read it. The flag and the pinned environment are the gates.
 
-The CLI and the supervisor have to be this fork together. A stock NVIDIA supervisor ignores `auth-agent-req@openssh.com`. The workload binary has to include `AgentListen`, which ships in the same fork images.
+The CLI and the supervisor have to include this support together. A supervisor that ignores `auth-agent-req@openssh.com` will accept the SSH session and never bind the agent socket. The workload binary has to include `AgentListen`.
 
 ## Socket location
 
@@ -86,20 +96,13 @@ The CLI's readiness check is `test -S` on that path, with a 10 second budget. It
 
 `--forward-agent` installs a sandbox git config and does not copy `user.signingKey` or any private key. Certificates stay in the host agent.
 
-Create copies `user.name` and `user.email` from the host git config walk (local, then global, then system). When the host signs with SSH, the sandbox config sets:
-
-- `gpg.format=ssh`
-- `commit.gpgsign` and `tag.gpgsign`, when the host has them
-- `gpg.ssh.defaultKeyCommand=ssh-add -L`
-- `gpg.ssh.allowedSignersFile=/tmp/openshell-git/allowed_signers`, rewritten off the host path. The macOS PassportControl path does not exist in the sandbox.
+Create copies `user.name` and `user.email` from the host git config walk (local, then global, then system). When the host signs with SSH, the sandbox config sets `gpg.format=ssh`, copies `commit.gpgsign` and `tag.gpgsign` when the host has them, and sets `gpg.ssh.defaultKeyCommand=ssh-add -L`. If the host has an allowed signers file, it is copied to `/tmp/openshell-git/allowed_signers`. The host path is not used inside the sandbox, because that path is not present there.
 
 `GIT_CONFIG_GLOBAL=/tmp/openshell-git/config` and `GIT_CONFIG_NOSYSTEM=1` point git at that file. Home is often read-only, so `~/.gitconfig` is not a writable place for it.
 
 ## GitHub SSH is a separate connection
 
-The agent socket answers agent-protocol requests: list keys, sign a challenge. `git fetch git@github.com:...` still opens TCP to `github.com:22`. The supervisor mediates that connection the same way it mediates any other outbound TCP. Policy has to allow the binary that connects, usually `/usr/bin/ssh`.
-
-On the swe Docker policy that allow is the `github-ssh` block. It also still lists `socat`, for images that have not dropped the old `osh-ssh-proxy` `ProxyCommand`. Current images let `ssh` connect to port 22 directly. Putting `ProxyCommand` back on `github.com` sends that hop through `socat` again.
+The agent socket answers agent-protocol requests: list keys, sign a challenge. `git fetch git@github.com:...` still opens TCP to `github.com:22`. The supervisor mediates that connection the same way it mediates any other outbound TCP. Policy has to allow the binary that connects, usually `/usr/bin/ssh`. On Kubernetes that TCP leaves through the supervisor, not through a route from the workload Pod.
 
 ## Reconnect
 
@@ -113,32 +116,15 @@ A dropped session can leave the workload listener running. The socket path may s
 
 OpenSSH exits 0 when the server rejects the agent request. `ExitOnForwardFailure` covers port forwards, not agent forwarding. The CLI notices a missing socket. A leftover socket makes the 10 second wait return immediately, and the checkmark is a false success.
 
-The swe launchers (`swe/scripts/osh.sh`, `osh-k8s.sh`, `osh-bb.sh`) probe the socket with `ssh-add` before connect. Exit 0 means keys are listed. Exit 1 means a live agent with no keys. Exit 2, or a 2 second timeout, means the socket does not answer, and the launcher unlinks it. The next forward then fails in the open:
+If the socket is present but `ssh-add` cannot talk to it, remove the socket and connect again. When the new forward prints this, the previous listener is still held in the workload process:
 
 ```text
 SSH agent forwarding did not bind /tmp/openshell-ssh-agent/agent.sock within 10000ms
 ```
 
-That message means the new `AgentListen` did not bind a socket the probe can see. The usual cause is the previous listener still holding `AGENT_LISTEN_BUSY` in the workload process. Stop and start the sandbox, with the same gateway and workspace. That restarts `openshell-sandbox`, clears the flag, and keeps the workspace volume. Connect again with `--forward-agent`.
+Stop and start the sandbox, with the same gateway and workspace. That restarts `openshell-sandbox`, clears the listener, and keeps the workspace volume. Connect again with `--forward-agent`.
 
 If stop and start still time out, the sandbox was created without `--forward-agent`. The environment gate keeps rejecting `AgentListen`. Delete it and create it again with the flag.
-
-## Host TCP relay
-
-`smartcontractkit/openshell` still has the older path, used when `OSH_FORWARD_AGENT=0`.
-
-The host runs `swe/scripts/ssh-agent-relay.sh`. `socat` listens on `127.0.0.1:9922` and connects to the PassportControl socket, or to `SSH_AUTH_SOCK` when that is set. The sandbox does not dial that port on its own. Its bridge is `socat` listening on a Unix socket and exec'ing `osh-ssh-proxy`, which sends `CONNECT host.docker.internal:9922` to the in-pod proxy at `10.200.0.1:3128`. The proxy dials from the host network namespace. On Docker Desktop, `host.docker.internal` reaches host loopback through vmnet, so a relay bound to `127.0.0.1` is reachable and stays off other host interfaces.
-
-That path needs a policy allow for `socat` to `host.docker.internal:9922`. In the swe Docker policy that is the `ssh-agent-relay` block. The Kubernetes policy drops the block. There is no `host.docker.internal` inside the cluster, and a cluster-reachable relay would publish the agent beyond the laptop. Native `--forward-agent` is the path that works on Docker and on EKS.
-
-With `OSH_FORWARD_AGENT=1` the swe image uses only the native path:
-
-- Login scripts leave `/tmp/openshell-ssh-agent/agent.sock` in place and do not start the 9922 `socat` hop. An older `/etc/swe-env.sh` deleted the forwarded socket and started that hop. The login shell then raced the real listener, and the agent call died at `10.200.0.1:3128`.
-- `osh.sh up` skips the host relay. The relay starts only when `OSH_FORWARD_AGENT=0`.
-- The launchers skip injecting the host `~/.gitconfig`, so `/tmp/openshell-git/config` owns signing. A host `user.signingkey` that points at a PassportControl path does not exist in the sandbox.
-- Create and connect go through the launchers, which pass `--forward-agent`. A raw `openshell sandbox connect`, or `kubectl exec`, opens a shell with no agent channel.
-
-Stock Homebrew OpenShell 0.0.62 has no `--forward-agent`. The laptop CLI has to be this fork, ahead of brew on `PATH`. `openshell sandbox create --help` must list the flag.
 
 ## Commands
 
@@ -164,5 +150,4 @@ git config --get gpg.format
 
 ## Next steps
 
-- [Manage sandboxes](/how-it-works/sandboxes/overview) covers create, connect, stop, and start.
-- [Network rules](/how-it-works/policies/network-rules) are where you allow `github.com:22`. The agent socket carries signing requests only.
+See [Manage sandboxes](/how-it-works/sandboxes/overview) for create, connect, stop, and start, and [Kubernetes setup](/kubernetes/setup) for the cluster runtime. [Network rules](/how-it-works/policies/network-rules) are where you allow `github.com:22`. The agent socket carries signing requests only.
