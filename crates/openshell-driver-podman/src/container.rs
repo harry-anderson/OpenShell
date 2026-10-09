@@ -464,17 +464,12 @@ pub fn resolve_image<'a>(sandbox: &'a DriverSandbox, config: &'a PodmanComputeCo
         .unwrap_or(&config.default_image)
 }
 
-/// Merge environment variables from user spec/template with required driver vars.
-///
-/// User-supplied vars are inserted first so that the required driver
-/// vars always win -- preventing spec/template overrides of security-
-/// critical values like `OPENSHELL_ENDPOINT` or `OPENSHELL_SANDBOX_ID`.
 /// Build the corporate upstream-proxy command-line arguments passed to the
 /// supervisor.
 ///
 /// This operator-owned egress boundary travels on argv, which sandbox
 /// spec/template environment and image `ENV` cannot influence. Credentials
-/// are never on argv — only the root-only mount path is passed; the
+/// are never on argv. Only the root-only mount path is passed; the
 /// supervisor reads the secret from the mount.
 fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
     let mut args = Vec::new();
@@ -517,38 +512,23 @@ fn build_env(
     oci_user: &str,
 ) -> Result<BTreeMap<String, String>, ComputeDriverError> {
     let spec = sandbox.spec.as_ref();
-    let template = spec.and_then(|s| s.template.as_ref());
 
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
-    // 1. User-supplied environment (lowest priority).
-    // Template vars first, then spec overwrites (spec is user-specified).
-    let mut user_env: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(t) = template {
-        for (k, v) in &t.environment {
-            user_env.insert(k.clone(), v.clone());
-        }
-    }
-    if let Some(s) = spec {
-        if !s.log_level.is_empty() {
-            env.insert(
-                openshell_core::sandbox_env::LOG_LEVEL.into(),
-                s.log_level.clone(),
-            );
-        }
-        for (k, v) in &s.environment {
-            user_env.insert(k.clone(), v.clone());
-        }
-    }
-    // User environment belongs exclusively to mediated workload children. In
-    // particular, never activate loader or policy overrides in the supervisor.
-    if !user_env.is_empty() {
-        let json = serde_json::to_string(&user_env)
-            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
-        env.insert(openshell_core::sandbox_env::USER_ENVIRONMENT.into(), json);
+    // User-supplied environment is not placed in this container's environ.
+    // The boundary config carries that map, and the sandbox process installs
+    // it in memory before starting workload children. A JSON copy here would
+    // remain in PID 1's environ for the life of the container.
+    if let Some(s) = spec
+        && !s.log_level.is_empty()
+    {
+        env.insert(
+            openshell_core::sandbox_env::LOG_LEVEL.into(),
+            s.log_level.clone(),
+        );
     }
 
-    // 2. Required driver vars (highest priority -- always overwrite).
+    // Required driver vars (highest priority -- always overwrite).
 
     // The operator's corporate egress proxy settings are not environment
     // variables: they travel on the supervisor's argv (see
@@ -2390,6 +2370,34 @@ mod tests {
                 .get(openshell_core::sandbox_env::SANDBOX)
                 .and_then(|v| v.as_str()),
             Some("my-sandbox"),
+        );
+    }
+
+    #[test]
+    fn container_spec_does_not_serialize_user_environment() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let marker = "rt68-qdrant-marker";
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: std::collections::HashMap::from([(
+                "QDRANT_API_KEY".to_string(),
+                marker.to_string(),
+            )]),
+            ..Default::default()
+        });
+        let spec = build_container_spec(&sandbox, &test_config());
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert!(
+            env_map
+                .get(openshell_core::sandbox_env::USER_ENVIRONMENT)
+                .is_none(),
+            "user environment must not be serialized into the container environ"
+        );
+        let rendered = spec.to_string();
+        assert!(
+            !rendered.contains(marker),
+            "user secret must not appear in the container spec"
         );
     }
 

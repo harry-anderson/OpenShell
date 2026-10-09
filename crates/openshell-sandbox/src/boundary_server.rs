@@ -213,14 +213,10 @@ mod linux {
         std::fs::remove_file(config_path).map_err(|error| {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
-        let child_env = serde_json::to_string(&config.child_env)
-            .map_err(|error| format!("encode boundary workload environment: {error}"))?;
-        // This runs before the Tokio runtime or control threads exist. The process
-        // supervisor consumes the serialized map and applies values only to
-        // workload children.
-        unsafe {
-            std::env::set_var(openshell_core::sandbox_env::USER_ENVIRONMENT, child_env);
-        }
+        // This runs before the Tokio runtime or control threads exist. Keep the
+        // map in memory, wipe any exec-time JSON copy, and drop the variable
+        // before a workload can read this process's environ.
+        crate::user_environment::install(config.child_env.clone());
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
         if nix::unistd::getpid().as_raw() == 1 {

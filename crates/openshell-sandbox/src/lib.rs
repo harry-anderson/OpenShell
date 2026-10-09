@@ -27,6 +27,7 @@ mod pty;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;
+mod user_environment;
 
 /// Results of actively qualifying the admitted workload runtime before the
 /// sandbox consumes protected bootstrap material.

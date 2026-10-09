@@ -69,11 +69,7 @@ pub async fn spawn_workload(
 
     let boundary_runtime = boundary_runtime
         .unwrap_or_else(crate::boundary_io::BoundaryRuntimeState::new_exclusive_pid_namespace);
-    let mut user_environment: std::collections::HashMap<String, String> =
-        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
-            .ok()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
+    let mut user_environment = crate::user_environment::current();
     user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
     let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
         crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),
