@@ -8,8 +8,8 @@
 //! and multiplexes each accept back on that stream.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -31,10 +31,7 @@ impl Drop for ListenGuard {
 }
 
 fn workload_user_environment() -> HashMap<String, String> {
-    std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
-        .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+    crate::user_environment::current()
 }
 
 fn bind_agent_socket() -> Result<UnixListener, String> {

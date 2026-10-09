@@ -208,9 +208,10 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 
 /// JSON-serialized map of user-specified environment variables.
 ///
-/// Set by compute drivers from `SandboxSpec.environment`. The sandbox
-/// supervisor deserializes this at startup and injects the variables into
-/// SSH child processes (which use `env_clear()` for security isolation).
+/// Drivers must not put this in a process's initial environment.
+/// `/proc/<pid>/environ` is that initial block, and removing the variable
+/// later does not clear it. The boundary keeps the map in memory, wipes any
+/// initial copy, and gives workload children the individual keys.
 pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 
 /// Path to the projected `ServiceAccount` JWT (Kubernetes driver).

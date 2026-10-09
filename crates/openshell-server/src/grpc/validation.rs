@@ -473,10 +473,10 @@ pub(super) fn validate_annotations(
 /// `exec_python()` sends a serialized callable via this key.
 const EXEC_ALLOWED_OPENSHELL_KEYS: &[&str] = &["OPENSHELL_PYFUNC_B64"];
 
-/// Maximum total serialized size of user environment (bytes). The drivers
-/// serialize the full map as JSON into a single `OPENSHELL_USER_ENVIRONMENT`
-/// env var; capping the input prevents driver/runtime-specific startup
-/// failures from oversized env blocks.
+/// Maximum total serialized size of user environment (bytes). The map is
+/// copied into the boundary config and into workload children as individual
+/// keys. Capping the input avoids driver and runtime startup failures from
+/// an oversized environment block.
 const MAX_ENV_SERIALIZED_SIZE: usize = 256 * 1024; // 256 KiB
 
 fn validate_env_entries(
