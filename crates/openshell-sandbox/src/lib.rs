@@ -5,6 +5,7 @@
 
 pub mod binary_pins;
 #[cfg(target_os = "linux")]
+mod agent_forward;
 pub mod boundary_exec;
 #[cfg(target_os = "linux")]
 pub mod boundary_io;
@@ -34,6 +35,7 @@ mod pty;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod sftp;
+mod user_environment;
 
 /// Results of actively qualifying the admitted workload runtime before the
 /// sandbox consumes protected bootstrap material.

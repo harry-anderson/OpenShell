@@ -106,6 +106,11 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 /// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
+/// Registered bool, default false. The forwarding path does not read this
+/// value. Create still has to pass `--forward-agent`, which injects the
+/// pinned `SSH_AUTH_SOCK` the workload checks.
+pub const SSH_FORWARD_AGENT_KEY: &str = crate::ssh_agent::SSH_FORWARD_AGENT_KEY;
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // When true the supervisor emits OCSF-JSON records to stderr and writes
     // JSONL to `/var/log/openshell-ocsf*.jsonl` when file logging is available.
@@ -135,6 +140,11 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: PROPOSAL_APPROVAL_MODE_KEY,
         kind: SettingValueKind::String,
         allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
+    },
+    RegisteredSetting {
+        key: SSH_FORWARD_AGENT_KEY,
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
     },
 ];
 

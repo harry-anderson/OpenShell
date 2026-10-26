@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
@@ -413,6 +414,28 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> DuplexStream for T {}
 
 /// An open connection into a boundary loopback target.
 pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
+
+/// Opens the workload-side SSH agent listener.
+///
+/// The socket lives in the workload mount namespace. Bytes are carried back
+/// to the supervisor, which owns the russh session.
+#[async_trait]
+pub trait BoundaryAgentRelay: Send + Sync {
+    /// Bind the pinned agent socket and return the multiplexed byte stream.
+    async fn open_listener(&self) -> Result<BoundaryDuplexStream, BackendError>;
+}
+
+/// Relay used when a backend has no workload agent socket.
+pub struct UnavailableAgentRelay;
+
+#[async_trait]
+impl BoundaryAgentRelay for UnavailableAgentRelay {
+    async fn open_listener(&self) -> Result<BoundaryDuplexStream, BackendError> {
+        Err(BackendError::Process(
+            "ssh agent forwarding is not available on this boundary".to_string(),
+        ))
+    }
+}
 
 // ============================================================================
 // Mediation and binary identity

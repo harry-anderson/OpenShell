@@ -46,6 +46,94 @@ pub fn forward_pid_path(workspace: &str, name: &str, port: u16) -> Result<PathBu
         .join(format!("{name}-{port}.pid")))
 }
 
+/// PID file for the background `ForwardAgent=yes` session. The suffix is
+/// not a port, so [`stop_forwards_for_sandbox`] ignores it until the
+/// explicit agent stop below.
+pub fn agent_forward_pid_path(workspace: &str, name: &str) -> Result<PathBuf> {
+    safe_path_component(workspace, "workspace")?;
+    safe_path_component(name, "sandbox")?;
+    Ok(forward_pid_dir()?
+        .join(workspace)
+        .join(format!("{name}-ssh-agent.pid")))
+}
+
+/// Write a PID file for a background SSH-agent forward.
+pub fn write_agent_forward_pid(
+    workspace: &str,
+    name: &str,
+    pid: u32,
+    sandbox_id: &str,
+) -> Result<()> {
+    let path = agent_forward_pid_path(workspace, name)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| miette::miette!("agent-forward PID path has no parent"))?;
+    create_dir_restricted(dir)?;
+    std::fs::write(&path, format!("{pid}\t{sandbox_id}\tagent"))
+        .into_diagnostic()
+        .wrap_err("failed to write agent-forward PID file")?;
+    Ok(())
+}
+
+/// True when `command` is an OpenShell SSH session forwarding the agent
+/// into `sandbox_name`.
+#[must_use]
+pub fn command_matches_agent_forward(command: &str, sandbox_name: &str) -> bool {
+    command.contains("ssh-proxy")
+        && command.contains("ForwardAgent=yes")
+        && command.contains(&format!("--sandbox {sandbox_name}"))
+}
+
+/// Find a backgrounded SSH agent-forward PID via `pgrep`.
+#[must_use]
+pub fn find_ssh_agent_forward_pid(sandbox_name: &str) -> Option<u32> {
+    let output = Command::new("pgrep").arg("-f").arg("ssh-proxy").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().rev().find_map(|line| {
+        let pid = line.trim().parse::<u32>().ok()?;
+        let cmd = Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let cmd = String::from_utf8_lossy(&cmd.stdout);
+        command_matches_agent_forward(&cmd, sandbox_name).then_some(pid)
+    })
+}
+
+/// Stop the background agent-forward session for `name`, if tracked.
+pub fn stop_agent_forward(workspace: &str, name: &str) -> Result<bool> {
+    let pid_path = agent_forward_pid_path(workspace, name)?;
+    let Ok(contents) = std::fs::read_to_string(&pid_path) else {
+        return Ok(false);
+    };
+    let mut parts = contents.split('\t');
+    let Some(pid) = parts.next().and_then(|raw| raw.trim().parse::<u32>().ok()) else {
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(false);
+    };
+    if pid_is_alive(pid) {
+        let output = Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output();
+        let cmd = output.map_or_else(
+            |_| String::new(),
+            |out| String::from_utf8_lossy(&out.stdout).into_owned(),
+        );
+        if !command_matches_agent_forward(&cmd, name) {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(false);
+        }
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    Ok(true)
+}
+
 /// Write a PID file for a background forward.
 ///
 /// File format: `<pid>\t<sandbox_id>\t<bind_addr>`
@@ -542,8 +630,10 @@ pub fn stop_forwards_for_sandbox(workspace: &str, name: &str) -> Result<Vec<u16>
     let mut stopped = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(&dir) else {
+        let _ = stop_agent_forward(workspace, name)?;
         return Ok(Vec::new());
     };
+    let _ = stop_agent_forward(workspace, name)?;
 
     for entry in entries.flatten() {
         let file_name = entry.file_name();

@@ -130,6 +130,7 @@ impl Connection {
                 stream,
                 config,
                 rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+                Arc::new(openshell_isolation_interface::contract::UnavailableAgentRelay),
                 rpc_test::exec(Arc::new(RejectingExec)),
                 Some(main),
                 server_endpoint,
