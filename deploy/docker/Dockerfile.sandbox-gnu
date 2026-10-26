@@ -1,0 +1,7 @@
+# Fork dev image. The upstream sandbox image is a static musl binary on
+# scratch. This one is the glibc binary on debian so the init container
+# can execute /openshell-sandbox bootstrap.
+FROM debian:13-slim
+COPY deploy/docker/.build/prebuilt-binaries/arm64/openshell-sandbox /openshell-sandbox
+USER 65532:65532
+ENTRYPOINT ["/openshell-sandbox"]

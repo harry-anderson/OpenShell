@@ -14,13 +14,15 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use nix::sys::signal::Signal;
 use openshell_core::driver_mounts;
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args,
-    shell_escape, validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, find_ssh_agent_forward_pid, format_gateway_url,
+    resolve_ssh_gateway, sandbox_ssh_args, shell_escape, validate_ssh_session_response,
+    write_agent_forward_pid, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
     TcpForwardInit, tcp_forward_init,
 };
+use openshell_core::ssh_agent;
 use openshell_core::upload::{
     DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
 };
@@ -46,6 +48,12 @@ use tonic::metadata::AsciiMetadataValue;
 const FORWARD_LISTENER_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delay between listener/PID probes within the configured timeout.
 const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+/// Remote `test -S` is an SSH round-trip; do not hammer the gateway.
+const AGENT_SOCKET_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// Remote command for the agent-forward keep-alive. Must be a real session:
+/// OpenSSH only sends `auth-agent-req@openssh.com` on a session channel, so
+/// `ssh -N` never forwards the agent even with `ForwardAgent=yes`.
+const AGENT_FORWARD_HOLD_COMMAND: &str = "sleep infinity";
 /// Per-attempt connect timeout, so one hung probe cannot consume the whole
 /// grace period.
 const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -213,7 +221,7 @@ async fn ssh_session_config(
     })
 }
 
-fn ssh_base_command(proxy_command: &str) -> Command {
+fn ssh_common_options(proxy_command: &str) -> Command {
     // An explicit environment override wins over the CLI verbosity default.
     let ssh_log_level = std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| {
         DEFAULT_SSH_LOG_LEVEL
@@ -236,6 +244,43 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("ServerAliveInterval=15")
         .arg("-o")
         .arg("ServerAliveCountMax=3");
+    command
+}
+
+fn ssh_base_command(proxy_command: &str) -> Command {
+    let mut command = ssh_common_options(proxy_command);
+    apply_forward_agent(&mut command, false);
+    command
+}
+
+/// Never emit `ForwardAgent=no` on the forwarding path. `IdentityAgent`
+/// is the `SSH_AUTH_SOCK` token, not the raw path: PassportControl sockets
+/// live under a directory whose name contains spaces, and OpenSSH parses
+/// `-o` values as ssh_config lines.
+fn apply_forward_agent(command: &mut Command, enabled: bool) {
+    if enabled {
+        if let Ok(sock) = std::env::var(ssh_agent::SSH_AUTH_SOCK_ENV)
+            && !sock.is_empty()
+        {
+            command.env(ssh_agent::SSH_AUTH_SOCK_ENV, &sock);
+            command.arg("-o").arg("IdentityAgent=SSH_AUTH_SOCK");
+        }
+        command.arg("-o").arg("ForwardAgent=yes");
+    } else {
+        command.arg("-o").arg("ForwardAgent=no");
+    }
+}
+
+fn agent_keepalive_command(proxy_command: &str) -> Command {
+    let mut command = ssh_common_options(proxy_command);
+    apply_forward_agent(&mut command, true);
+    command
+        .arg("-f")
+        .arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(AGENT_FORWARD_HOLD_COMMAND);
     command
 }
 
@@ -274,8 +319,9 @@ async fn exec_or_wait(command: Command, replace_process: bool) -> Result<i32> {
     Ok(process_exit_code(child.wait().await.into_diagnostic()?))
 }
 
-fn main_attach_command(session: &SshSessionConfig) -> Command {
-    let mut command = ssh_base_command(&session.proxy_command);
+fn main_attach_command(session: &SshSessionConfig, forward_agent: bool) -> Command {
+    let mut command = ssh_common_options(&session.proxy_command);
+    apply_forward_agent(&mut command, forward_agent);
     if session.main_terminal {
         command.arg("-tt").arg("-o").arg("RequestTTY=force");
     } else {
@@ -293,8 +339,12 @@ fn main_attach_command(session: &SshSessionConfig) -> Command {
     command
 }
 
-async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> Result<i32> {
-    let command = main_attach_command(session);
+async fn run_main_attach(
+    session: &SshSessionConfig,
+    replace_process: bool,
+    forward_agent: bool,
+) -> Result<i32> {
+    let command = main_attach_command(session, forward_agent);
     exec_or_wait(command, replace_process).await
 }
 
@@ -397,11 +447,12 @@ async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i
 async fn run_main_attach_supervised(
     session: &SshSessionConfig,
     cancellation: &mut ConnectCancellation,
+    forward_agent: bool,
 ) -> Result<i32> {
     #[cfg(not(unix))]
     let _ = cancellation;
 
-    let mut command = TokioCommand::from(main_attach_command(session));
+    let mut command = TokioCommand::from(main_attach_command(session, forward_agent));
     command.kill_on_drop(true);
 
     let mut child = command.spawn().into_diagnostic()?;
@@ -541,6 +592,7 @@ async fn sandbox_connect_supervised(
     name: &str,
     tls: &TlsOptions,
     workspace: &str,
+    forward_agent: bool,
 ) -> Result<i32> {
     let mut recovery_deadline = None;
     let mut retry_delay = CONNECT_RETRY_INITIAL_DELAY;
@@ -589,7 +641,8 @@ async fn sandbox_connect_supervised(
         };
 
         let attach_started = Instant::now();
-        let exit_code = run_main_attach_supervised(&session, &mut cancellation).await?;
+        let exit_code =
+            run_main_attach_supervised(&session, &mut cancellation, forward_agent).await?;
         let attached_for = attach_started.elapsed();
         let recovery_active = recovery_deadline.is_some();
         let main_has_terminal_result = if exit_code == SSH_TRANSPORT_FAILURE_EXIT_CODE {
@@ -656,6 +709,7 @@ async fn sandbox_connect_with_mode(
     replace_process: bool,
     workspace: &str,
     terminal_relay_registration_timeout: Option<Duration>,
+    forward_agent: bool,
 ) -> Result<i32> {
     let session = ssh_session_config(
         server,
@@ -666,7 +720,7 @@ async fn sandbox_connect_with_mode(
     )
     .await?;
 
-    run_main_attach(&session, replace_process).await
+    run_main_attach(&session, replace_process, forward_agent).await
 }
 
 /// Connect to a sandbox via SSH.
@@ -676,7 +730,16 @@ pub async fn sandbox_connect(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_supervised(server, name, tls, workspace).await
+    sandbox_connect_supervised(server, name, tls, workspace, false).await
+}
+
+pub async fn sandbox_connect_forward_agent(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<i32> {
+    sandbox_connect_supervised(server, name, tls, workspace, true).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
@@ -685,7 +748,7 @@ pub(crate) async fn sandbox_connect_without_exec(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
-    sandbox_connect_with_mode(server, name, tls, false, workspace, None).await
+    sandbox_connect_with_mode(server, name, tls, false, workspace, None, false).await
 }
 
 pub(crate) async fn sandbox_connect_terminal_main(
@@ -701,8 +764,96 @@ pub(crate) async fn sandbox_connect_terminal_main(
         false,
         workspace,
         Some(TERMINAL_RELAY_REGISTRATION_TIMEOUT),
+        false,
     )
     .await
+}
+
+/// Keep an authenticated SSH session with `ForwardAgent=yes` so the
+/// workload can bind the pinned agent socket.
+///
+/// This must not use `ssh -N`. `-N` means no session channel, so OpenSSH
+/// never sends `auth-agent-req@openssh.com`.
+pub async fn sandbox_forward_agent(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    ssh_agent::host_agent_socket_ok().map_err(|err| miette::miette!("{err}"))?;
+
+    let session = ssh_session_config(server, name, tls, workspace, None).await?;
+    let mut command = TokioCommand::from(agent_keepalive_command(&session.proxy_command));
+    command
+        .kill_on_drop(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = command.status().await.into_diagnostic()?;
+    if !status.success() {
+        return Err(miette::miette!(
+            "ssh agent-forward exited with status {status}. The supervisor must be this fork."
+        ));
+    }
+
+    if let Err(err) = wait_for_agent_socket(&session).await {
+        if let Some(pid) = find_ssh_agent_forward_pid(name) {
+            let _ = Command::new("kill")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        return Err(err);
+    }
+
+    if let Some(pid) = find_ssh_agent_forward_pid(name) {
+        write_agent_forward_pid(workspace, name, pid, &session.sandbox_id)?;
+    } else {
+        eprintln!(
+            "{} Could not discover backgrounded agent-forward SSH; it may be running but is not tracked",
+            "!".yellow(),
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_agent_socket(session: &SshSessionConfig) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + FORWARD_LISTENER_READINESS_TIMEOUT;
+    loop {
+        if sandbox_agent_socket_exists(session).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "SSH agent forwarding did not bind {} within {}ms. Re-run with OPENSHELL_SSH_LOG_LEVEL=DEBUG.",
+                ssh_agent::SANDBOX_AGENT_SOCK,
+                FORWARD_LISTENER_READINESS_TIMEOUT.as_millis(),
+            ));
+        }
+        tokio::time::sleep(AGENT_SOCKET_PROBE_INTERVAL).await;
+    }
+}
+
+async fn sandbox_agent_socket_exists(session: &SshSessionConfig) -> bool {
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(format!(
+            "test -S {}",
+            shell_escape(ssh_agent::SANDBOX_AGENT_SOCK)
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    tokio::task::spawn_blocking(move || ssh.status())
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .is_some_and(|status| status.success())
 }
 
 pub async fn sandbox_connect_editor(

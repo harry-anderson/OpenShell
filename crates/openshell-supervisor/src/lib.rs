@@ -1502,6 +1502,7 @@ pub async fn run_sandbox_instance(
                 .and_then(|runtime| runtime.ca_file_paths.clone()),
             running.exec(),
             running.loopback_connector(),
+            running.agent_relay(),
             agent.clone(),
             Some(supervisor_session_updates),
             config_apply_tx,

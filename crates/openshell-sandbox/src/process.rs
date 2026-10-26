@@ -20,8 +20,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
@@ -120,6 +120,9 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
     openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+    // The serialized user-environment blob. Children get the individual keys
+    // from the in-memory snapshot, never this second copy.
+    openshell_core::sandbox_env::USER_ENVIRONMENT,
 ];
 
 const PROXY_ENV_VARS: &[&str] = &[
@@ -248,25 +251,8 @@ fn apply_canonical_process_environment(
     }
 }
 
-static BOUNDARY_USER_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
-
-#[cfg(target_os = "linux")]
-pub(crate) fn install_boundary_user_environment(
-    environment: HashMap<String, String>,
-) -> Result<(), String> {
-    BOUNDARY_USER_ENVIRONMENT
-        .set(environment)
-        .map_err(|_| "boundary workload environment already installed".to_string())
-}
-
-pub(crate) fn configured_user_environment() -> HashMap<String, String> {
-    if let Some(environment) = BOUNDARY_USER_ENVIRONMENT.get() {
-        return environment.clone();
-    }
-    std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
-        .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+fn configured_user_environment() -> HashMap<String, String> {
+    crate::user_environment::current()
 }
 
 #[cfg(unix)]
@@ -1656,6 +1642,37 @@ mod tests {
             );
         }
         assert!(stdout.contains("OPENSHELL_ENDPOINT=https://gateway.example.test"));
+    }
+
+    #[tokio::test]
+    async fn workload_child_does_not_inherit_user_environment_blob() {
+        let marker = "rt68-marker-do-not-leak";
+        let blob = serde_json::json!({"QDRANT_API_KEY": marker}).to_string();
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .env(openshell_core::sandbox_env::USER_ENVIRONMENT, &blob)
+            .env("QDRANT_API_KEY", marker)
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        strip_supervisor_only_env(&mut cmd);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(
+            stdout.contains(&format!("QDRANT_API_KEY={marker}")),
+            "individual key must still reach the child: {stdout}"
+        );
+        assert!(
+            !stdout.contains("OPENSHELL_USER_ENVIRONMENT="),
+            "serialized user environment must not reach the child: {stdout}"
+        );
+        assert!(
+            !stdout.contains(&blob),
+            "secret marker must not travel inside the serialized blob: {stdout}"
+        );
     }
 
     #[tokio::test]

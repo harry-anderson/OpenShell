@@ -40,7 +40,7 @@ fn request_mode(v: &w::Request) -> Mode {
     match v {
         w::Request::Exec { .. } | w::Request::AttachProcess { .. } => Mode::Input,
         w::Request::AcceptNetwork => Mode::Decision,
-        w::Request::LoopbackConnect { .. } => Mode::Relay,
+        w::Request::LoopbackConnect { .. } | w::Request::AgentListen => Mode::Relay,
         w::Request::OpenMediation => Mode::DnsResponses,
         _ => Mode::Done,
     }
@@ -48,7 +48,9 @@ fn request_mode(v: &w::Request) -> Mode {
 fn response_mode(v: &w::Response) -> Mode {
     match v {
         w::Response::ProcessAttached { .. } | w::Response::ExecStarted { .. } => Mode::Output,
-        w::Response::NetworkConnected { .. } | w::Response::LoopbackConnected => Mode::Relay,
+        w::Response::NetworkConnected { .. }
+        | w::Response::LoopbackConnected
+        | w::Response::AgentListening => Mode::Relay,
         w::Response::MediationReady => Mode::DnsQueries,
         _ => Mode::Done,
     }

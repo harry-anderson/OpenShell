@@ -70,7 +70,7 @@ pub async fn spawn_workload(
 
     let boundary_runtime = boundary_runtime
         .unwrap_or_else(crate::boundary_io::BoundaryRuntimeState::new_exclusive_pid_namespace);
-    let mut user_environment = crate::process::configured_user_environment();
+    let mut user_environment = crate::user_environment::current();
     user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
     let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
         crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),

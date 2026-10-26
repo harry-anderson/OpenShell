@@ -85,6 +85,8 @@ message RequestEnvelope {
     LoopbackConnect loopback_connect = 24;
     OpenMediation open_mediation = 25;
     AcceptNetwork accept_network = 26;
+    // Fork extension: bind the pinned SSH agent socket and relay its bytes.
+    AgentListen agent_listen = 27;
   }
 }
 message ResponseEnvelope {
@@ -106,6 +108,8 @@ message ResponseEnvelope {
     MediationReady mediation_ready = 24;
     NetworkConnected network_connected = 25;
     Error error = 26;
+    // Fork extension: the workload agent socket is bound and the stream relays.
+    AgentListening agent_listening = 27;
   }
 }
 // Read-only image-policy discovery, permitted before attachment.
@@ -210,6 +214,9 @@ message ExecStarted {
 }
 message Resized {}
 message LoopbackConnected {}
+// Empty handshake. Subsequent Exchange frames on this stream are relay bytes.
+message AgentListen {}
+message AgentListening {}
 message MediationReady {}
 message NetworkConnected {
   BinaryIdentity identity = 1;

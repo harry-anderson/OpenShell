@@ -235,7 +235,10 @@ mod linux {
         std::fs::remove_file(config_path).map_err(|error| {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
-        crate::process::install_boundary_user_environment(config.child_env.clone())?;
+        // This runs before the Tokio runtime or control threads exist. Keep the
+        // map in memory, wipe any exec-time JSON copy, and drop the variable
+        // before a workload can read this process's environ.
+        crate::user_environment::install(config.child_env.clone());
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
         // Keep orphaned workload descendants in this process tree so
@@ -1597,6 +1600,35 @@ mod linux {
                 .map_err(|error| format!("write process attachment response: {error}"))?;
                 return runtime.stream_process(stream, attachment);
             }
+            Request::AgentListen => {
+                let listener = match crate::agent_forward::prepare_listener() {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response: guest_error(BoundaryErrorKind::Denied, error),
+                            },
+                        )
+                        .map_err(|error| format!("write agent-listen error response: {error}"))?;
+                        return Ok(());
+                    }
+                };
+                write_frame(
+                    &mut stream,
+                    &ResponseEnvelope {
+                        request_id: request.request_id,
+                        response: Response::AgentListening,
+                    },
+                )
+                .map_err(|error| format!("write agent-listen response: {error}"))?;
+                runtime.process_runtime.block_on(async move {
+                    let stream = stream.into_tokio()?;
+                    crate::agent_forward::serve(listener, stream).await
+                })?;
+                return Ok(());
+            }
             Request::LoopbackConnect { host, port } => {
                 let target = match LoopbackTarget::new(host, port)
                     .map_err(|error| format!("validate port-forward target: {error}"))
@@ -2546,6 +2578,7 @@ mod linux {
                 | Request::TerminateBoundary
                 | Request::AttachProcess { .. }
                 | Request::LoopbackConnect { .. }
+                | Request::AgentListen
                 | Request::AcceptNetwork => guest_error(
                     BoundaryErrorKind::Invalid,
                     "streaming request used on control path",

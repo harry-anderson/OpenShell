@@ -30,6 +30,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
@@ -163,6 +164,7 @@ pub async fn run_ssh_server(
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     shared_socket: bool,
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+    agent_relay: Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay>,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     host_key: PrivateKey,
@@ -192,6 +194,7 @@ pub async fn run_ssh_server(
                 consecutive_unknown_errors = 0;
                 let config = config.clone();
                 let port_forward = port_forward.clone();
+                let agent_relay = agent_relay.clone();
                 let boundary_exec = boundary_exec.clone();
                 let main_session = main_session.clone();
 
@@ -200,6 +203,7 @@ pub async fn run_ssh_server(
                         stream,
                         config,
                         port_forward,
+                        agent_relay,
                         boundary_exec,
                         main_session,
                         SSH_PEER_TIMEOUT,
@@ -341,6 +345,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+    agent_relay: Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay>,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     peer_timeout: Duration,
@@ -359,7 +364,7 @@ async fn handle_connection(
             .build()
     );
 
-    let handler = SshHandler::new(port_forward, boundary_exec, main_session);
+    let handler = SshHandler::new(port_forward, agent_relay, boundary_exec, main_session);
     let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
         .await
@@ -423,6 +428,8 @@ struct SshHandler {
     /// this connects from inside the workload netns; a delegated backend
     /// tunnels into its guest. The handler does not know which.
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+    agent_relay: Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay>,
+    agent_listener_started: AtomicBool,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     channels: HashMap<ChannelId, ChannelState>,
@@ -450,11 +457,14 @@ impl Drop for SshHandler {
 impl SshHandler {
     fn new(
         port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
+        agent_relay: Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay>,
         boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
         main_session: Option<Arc<MainSession>>,
     ) -> Self {
         Self {
             port_forward,
+            agent_relay,
+            agent_listener_started: AtomicBool::new(false),
             boundary_exec,
             main_session,
             channels: HashMap::new(),
@@ -920,6 +930,59 @@ impl russh::server::Handler for SshHandler {
         }
         session.channel_success(channel)?;
         Ok(())
+    }
+
+    async fn agent_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        if self
+            .agent_listener_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            session.channel_success(channel)?;
+            return Ok(true);
+        }
+        match self.agent_relay.open_listener().await {
+            Ok(stream) => {
+                let handle = session.handle();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        crate::agent_bridge::bridge_agent_listener(stream, handle).await
+                    {
+                        tracing::warn!("agent-forward bridge ended: {error}");
+                    }
+                });
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Allowed)
+                        .disposition(DispositionId::Allowed)
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .message("agent-forward listener requested in the workload")
+                        .build()
+                );
+                session.channel_success(channel)?;
+                Ok(true)
+            }
+            Err(error) => {
+                self.agent_listener_started.store(false, Ordering::Release);
+                ocsf_emit!(
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .message(format!("agent-forward rejected: {error}"))
+                        .build()
+                );
+                session.channel_failure(channel)?;
+                Ok(false)
+            }
+        }
     }
 
     async fn data(
@@ -1595,6 +1658,9 @@ mod tests {
                     tokio::spawn(async move {
                         let handler = SshHandler::new(
                             rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+                            Arc::new(
+                                openshell_isolation_interface::contract::UnavailableAgentRelay,
+                            ),
                             rpc_test::exec(Arc::new(RejectingExec)),
                             None,
                         );
@@ -1731,6 +1797,7 @@ mod tests {
 
         let handler = SshHandler::new(
             rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+            Arc::new(openshell_isolation_interface::contract::UnavailableAgentRelay),
             boundary_exec,
             main_session,
         );

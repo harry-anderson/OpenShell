@@ -508,6 +508,7 @@ impl WireMessage for w::RequestEnvelope {
                 host: host.to_string(),
                 port: u32::from(*port),
             }),
+            W::AgentListen => P::AgentListen(p::AgentListen {}),
             W::OpenMediation => P::OpenMediation(p::OpenMediation {}),
             W::AcceptNetwork => P::AcceptNetwork(p::AcceptNetwork {}),
         };
@@ -571,6 +572,7 @@ impl WireMessage for w::RequestEnvelope {
                 host: parse(&v.host)?,
                 port: number(v.port.into())?,
             },
+            P::AgentListen(_) => W::AgentListen,
             P::OpenMediation(_) => W::OpenMediation,
             P::AcceptNetwork(_) => W::AcceptNetwork,
         };
@@ -636,6 +638,7 @@ impl WireMessage for w::ResponseEnvelope {
             }),
             W::Resized => P::Resized(p::Resized {}),
             W::LoopbackConnected => P::LoopbackConnected(p::LoopbackConnected {}),
+            W::AgentListening => P::AgentListening(p::AgentListening {}),
             W::MediationReady => P::MediationReady(p::MediationReady {}),
             W::NetworkConnected {
                 identity,
@@ -705,6 +708,7 @@ impl WireMessage for w::ResponseEnvelope {
             },
             P::Resized(_) => W::Resized,
             P::LoopbackConnected(_) => W::LoopbackConnected,
+            P::AgentListening(_) => W::AgentListening,
             P::MediationReady(_) => W::MediationReady,
             P::NetworkConnected(v) => W::NetworkConnected {
                 identity: w::BinaryIdentityWire::from_proto(required(v.identity)?)?,

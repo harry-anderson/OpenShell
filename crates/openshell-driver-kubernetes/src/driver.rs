@@ -18,9 +18,10 @@ use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
     SHARED_INSTANCE_KEY, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
     SupervisorClientTls, boundary_service, boundary_service_matches_mode, control_policy,
-    generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
-    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference, shared_control_policy,
-    shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    copy_workload_scheduling, generate_proxy_ca_material, image_pull_secret_copy,
+    sandbox_bootstrap_secret, sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
+    shared_control_policy, shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod,
+    workload_fence,
 };
 use crate::shared_supervisor::{
     ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
@@ -2965,6 +2966,7 @@ impl KubernetesComputeDriver {
                         main_process_spec,
                         log_level,
                         staged.upstream_proxy_ca_bundle.is_some(),
+                        sandbox_cr.data.pointer("/spec/podTemplate/spec"),
                     )
                     .await?;
                 GenerationSupervisor::Dedicated {
@@ -3107,6 +3109,10 @@ impl KubernetesComputeDriver {
     }
 
     /// Create one generation's gated supervisor Pod and return its UID.
+    ///
+    /// `--driver-config-json` scheduling lands only on the workload pod. A
+    /// dedicated supervisor is a separate Pod, so copy the workload node
+    /// selector and tolerations onto it before create.
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     async fn create_sandbox_runtime_supervisor(
         &self,
@@ -3120,51 +3126,53 @@ impl KubernetesComputeDriver {
         main_process_spec: &str,
         log_level: &str,
         upstream_proxy_ca_bundle_staged: bool,
+        workload_pod_spec: Option<&serde_json::Value>,
     ) -> Result<String, KubernetesDriverError> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        pods.create(
-            &PostParams::default(),
-            &supervisor_pod(
-                namespace,
-                names,
-                sandbox_id,
-                sandbox_name,
-                &self.config.gateway_id,
-                &self.config.supervisor_image,
-                self.config.supervisor_image_pull_policy,
-                &self.config.service_account_name,
-                agent_uid,
-                agent_gid,
-                &self.generation_image_pull_secret_names(names),
-                &self.config.grpc_endpoint,
-                self.config.supervisor_client_tls(),
-                main_process_spec,
-                log_level,
-                self.config.effective_sa_token_ttl_secs(),
-                self.config.https_proxy.as_deref(),
-                self.config.no_proxy.as_deref(),
+        let mut supervisor = supervisor_pod(
+            namespace,
+            names,
+            sandbox_id,
+            sandbox_name,
+            &self.config.gateway_id,
+            &self.config.supervisor_image,
+            self.config.supervisor_image_pull_policy,
+            &self.config.service_account_name,
+            agent_uid,
+            agent_gid,
+            &self.generation_image_pull_secret_names(names),
+            &self.config.grpc_endpoint,
+            self.config.supervisor_client_tls(),
+            main_process_spec,
+            log_level,
+            self.config.effective_sa_token_ttl_secs(),
+            self.config.https_proxy.as_deref(),
+            self.config.no_proxy.as_deref(),
+            self.config
+                .proxy_auth_secret_name
+                .as_deref()
+                .zip(self.config.proxy_auth_secret_key.as_deref()),
+            self.config.proxy_auth_allow_insecure == Some(true),
+            self.config.proxy_connect_by_hostname == Some(true),
+            upstream_proxy_ca_bundle_staged,
+            self.config.provider_spiffe_enabled().then_some(
                 self.config
-                    .proxy_auth_secret_name
-                    .as_deref()
-                    .zip(self.config.proxy_auth_secret_key.as_deref()),
-                self.config.proxy_auth_allow_insecure == Some(true),
-                self.config.proxy_connect_by_hostname == Some(true),
-                upstream_proxy_ca_bundle_staged,
-                self.config.provider_spiffe_enabled().then_some(
-                    self.config
-                        .provider_spiffe_workload_api_socket_path
-                        .as_str(),
-                ),
-                owner,
-                &self.supervisor_otlp_environment(),
-            )
-            .map_err(KubernetesDriverError::Message)?,
+                    .provider_spiffe_workload_api_socket_path
+                    .as_str(),
+            ),
+            owner,
+            &self.supervisor_otlp_environment(),
         )
-        .await
-        .map_err(KubernetesDriverError::from_kube)?
-        .metadata
-        .uid
-        .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
+        .map_err(KubernetesDriverError::Message)?;
+        if let Some(workload_pod_spec) = workload_pod_spec {
+            copy_workload_scheduling(&mut supervisor, workload_pod_spec);
+        }
+        pods.create(&PostParams::default(), &supervisor)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?
+            .metadata
+            .uid
+            .ok_or_else(|| KubernetesDriverError::Message("supervisor Pod has no UID".to_string()))
     }
 
     /// Read the gateway's shared supervisor Service: its address and the
@@ -4028,6 +4036,7 @@ impl KubernetesComputeDriver {
                         &main_process_spec,
                         &log_level,
                         staged.upstream_proxy_ca_bundle.is_some(),
+                        object.data.pointer("/spec/podTemplate/spec"),
                     )
                     .await?,
                 connection: control_connection,
