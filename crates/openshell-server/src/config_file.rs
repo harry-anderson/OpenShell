@@ -1120,6 +1120,8 @@ issuer = "https://idp.example.com/realms/openshell"
 audience = "openshell-cli"
 jwks_allowed_origins = ["https://keys.example.com"]
 dangerously_allow_insecure_http = false
+roles_from_userinfo = true
+client_id = "0oaxriwwte2cvhLFC5d7"
 
 [openshell.drivers.kubernetes]
 namespace = "agents"
@@ -1145,6 +1147,8 @@ namespace = "agents"
         assert!(gw.tls.is_some());
         let oidc = gw.oidc.as_ref().expect("OIDC config parses");
         assert!(!oidc.dangerously_allow_insecure_http);
+        assert!(oidc.roles_from_userinfo);
+        assert_eq!(oidc.client_id, "0oaxriwwte2cvhLFC5d7");
         assert_eq!(
             oidc.jwks_allowed_origins,
             ["https://keys.example.com".to_string()]

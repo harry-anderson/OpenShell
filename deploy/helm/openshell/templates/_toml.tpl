@@ -153,6 +153,8 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $oidcConfig "audience") -}}{{- $_ := set $oidcConfig "audience" (get $legacyOidc "audience") -}}{{- end -}}
 {{- if not (hasKey $oidcConfig "jwks_ttl_secs") -}}{{- $_ := set $oidcConfig "jwks_ttl_secs" (get $legacyOidc "jwksTtl") -}}{{- end -}}
 {{- if and (get $legacyOidc "rolesClaim") (not (hasKey $oidcConfig "roles_claim")) -}}{{- $_ := set $oidcConfig "roles_claim" (get $legacyOidc "rolesClaim") -}}{{- end -}}
+{{- if and (get $legacyOidc "rolesFromUserinfo") (not (hasKey $oidcConfig "roles_from_userinfo")) -}}{{- $_ := set $oidcConfig "roles_from_userinfo" (get $legacyOidc "rolesFromUserinfo") -}}{{- end -}}
+{{- if and (get $legacyOidc "clientId") (not (hasKey $oidcConfig "client_id")) -}}{{- $_ := set $oidcConfig "client_id" (get $legacyOidc "clientId") -}}{{- end -}}
 {{- if and (get $legacyOidc "adminRole") (not (hasKey $oidcConfig "admin_role")) -}}{{- $_ := set $oidcConfig "admin_role" (get $legacyOidc "adminRole") -}}{{- end -}}
 {{- if and (get $legacyOidc "userRole") (not (hasKey $oidcConfig "user_role")) -}}{{- $_ := set $oidcConfig "user_role" (get $legacyOidc "userRole") -}}{{- end -}}
 {{- if and (get $legacyOidc "scopesClaim") (not (hasKey $oidcConfig "scopes_claim")) -}}{{- $_ := set $oidcConfig "scopes_claim" (get $legacyOidc "scopesClaim") -}}{{- end -}}

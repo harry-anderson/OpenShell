@@ -439,6 +439,18 @@ pub struct OidcConfig {
     #[serde(default = "default_roles_claim")]
     pub roles_claim: String,
 
+    /// When the access token does not contain `roles_claim`, read that same
+    /// path from the issuer's userinfo endpoint. The Okta org authorization
+    /// server puts `groups` on userinfo and not on the access token.
+    #[serde(default)]
+    pub roles_from_userinfo: bool,
+
+    /// Expected OAuth client id. When non-empty, the access token `cid` claim
+    /// must match. The Okta org authorization server sets `aud` to the issuer
+    /// for every app, so `audience` cannot pin the native app.
+    #[serde(default)]
+    pub client_id: String,
+
     /// Role name that grants admin access. Defaults to `openshell-admin`.
     #[serde(default = "default_admin_role")]
     pub admin_role: String,

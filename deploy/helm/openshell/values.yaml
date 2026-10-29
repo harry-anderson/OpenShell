@@ -616,6 +616,12 @@ server:
     # -- Dot-separated path to the roles array in the JWT claims.
     # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".
     rolesClaim: ""
+    # -- Read rolesClaim from the issuer userinfo endpoint when the access
+    # token omits it. Required for the Okta org authorization server.
+    rolesFromUserinfo: false
+    # -- Expected access-token cid. Empty skips the check. Set this to the
+    # Okta native app client id when aud is the org issuer URL.
+    clientId: ""
     # -- Role name for admin access. Leave empty (with userRole also empty) for
     # authentication-only mode. Both must be set or both empty.
     adminRole: ""

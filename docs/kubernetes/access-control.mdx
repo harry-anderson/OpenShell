@@ -46,7 +46,7 @@ helm upgrade openshell \
 
 Client certificates are optional at the TLS handshake, so OIDC callers can connect without them. Set `server.tls.clientCaSecretName=""` to disable client-certificate verification entirely. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
-The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
+The `audience` value must match the access token `aud` claim. On a custom authorization server that is the OpenShell client ID. On the Okta org authorization server, `aud` is the issuer URL, so set `audience` to that URL and set `client_id` to the native app client id.
 
 ### OIDC values reference
 
@@ -56,6 +56,8 @@ The `audience` value must match the client ID configured in your identity provid
 | `gatewayConfig.openshell.gateway.oidc.audience` | `openshell-cli` | Expected `aud` claim in the JWT. |
 | `gatewayConfig.openshell.gateway.oidc.jwks_ttl_secs` | `3600` | JWKS key cache TTL in seconds. Must be greater than zero. |
 | `gatewayConfig.openshell.gateway.oidc.roles_claim` | `""` | Dot-separated path to the roles array in JWT claims. |
+| `gatewayConfig.openshell.gateway.oidc.roles_from_userinfo` | `false` | Read `roles_claim` from userinfo when the access token omits it. |
+| `gatewayConfig.openshell.gateway.oidc.client_id` | `""` | Expected access-token `cid`. Empty skips the check. |
 | `gatewayConfig.openshell.gateway.oidc.admin_role` | `""` | Role name that grants admin access. |
 | `gatewayConfig.openshell.gateway.oidc.user_role` | `""` | Role name that grants standard user access. |
 | `gatewayConfig.openshell.gateway.oidc.scopes_claim` | `""` | Dot-separated path to the scopes array in JWT claims. |

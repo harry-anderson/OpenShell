@@ -243,6 +243,21 @@ struct RunArgs {
     )]
     oidc_roles_claim: String,
 
+    /// Read `roles_claim` from the issuer userinfo endpoint when the access
+    /// token does not contain it. Required for the Okta org authorization server.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ROLES_FROM_USERINFO",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    oidc_roles_from_userinfo: bool,
+
+    /// Expected access-token `cid` claim. Empty skips the check. Set this to
+    /// the Okta native app client id when `aud` is the org issuer URL.
+    #[arg(long, env = "OPENSHELL_OIDC_CLIENT_ID", default_value = "")]
+    oidc_client_id: String,
+
     /// Role name that grants admin access.
     #[arg(
         long,
@@ -638,6 +653,8 @@ fn prepare_server_config_with_drivers(
             audience: args.oidc_audience.clone(),
             jwks_ttl_secs: args.oidc_jwks_ttl,
             roles_claim: args.oidc_roles_claim.clone(),
+            roles_from_userinfo: args.oidc_roles_from_userinfo,
+            client_id: args.oidc_client_id.clone(),
             admin_role: args.oidc_admin_role.clone(),
             user_role: args.oidc_user_role.clone(),
             scopes_claim: args.oidc_scopes_claim.clone(),
@@ -1311,6 +1328,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         }
         if arg_defaulted(matches, "oidc_roles_claim") {
             args.oidc_roles_claim.clone_from(&oidc.roles_claim);
+        }
+        if arg_defaulted(matches, "oidc_roles_from_userinfo") {
+            args.oidc_roles_from_userinfo = oidc.roles_from_userinfo;
+        }
+        if args.oidc_client_id.is_empty() && arg_defaulted(matches, "oidc_client_id") {
+            args.oidc_client_id.clone_from(&oidc.client_id);
         }
         if arg_defaulted(matches, "oidc_admin_role") {
             args.oidc_admin_role.clone_from(&oidc.admin_role);

@@ -151,6 +151,8 @@ tests:
       server.oidc.adminRole: platform-admin
       server.oidc.userRole: platform-user
       server.oidc.scopesClaim: permissions
+      server.oidc.rolesFromUserinfo: true
+      server.oidc.clientId: 0oaxriwwte2cvhLFC5d7
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
@@ -164,6 +166,12 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.oidc\].*?user_role = "platform-user"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?roles_from_userinfo = true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?client_id = "0oaxriwwte2cvhLFC5d7"'
 
   - it: fills absent schema-v2 OIDC fields from legacy values without overwriting schema-v2 fields
     set:

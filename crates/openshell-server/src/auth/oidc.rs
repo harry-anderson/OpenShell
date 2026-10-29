@@ -60,6 +60,8 @@ const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
 /// deserialization while leaving ample room for large enterprise key sets.
 const OIDC_DISCOVERY_MAX_BYTES: usize = 64 * 1024;
 const JWKS_MAX_BYTES: usize = 1024 * 1024;
+const USERINFO_MAX_BYTES: usize = 256 * 1024;
+const USERINFO_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Cached JWKS key set fetched from the OIDC issuer.
 ///
@@ -83,6 +85,10 @@ pub struct JwksCache {
     refresh_mutex: tokio::sync::Mutex<()>,
     http: Client,
     config: OidcConfig,
+    /// Issuer userinfo URL. Set only when `roles_from_userinfo` is enabled.
+    userinfo_endpoint: Option<String>,
+    /// Roles read from userinfo, keyed by token `jti` or `sub:exp`.
+    userinfo_roles: Arc<RwLock<HashMap<String, (Vec<String>, Instant)>>>,
 }
 
 impl std::fmt::Debug for JwksCache {
@@ -99,6 +105,8 @@ impl std::fmt::Debug for JwksCache {
 struct OidcDiscovery {
     issuer: String,
     jwks_uri: String,
+    #[serde(default)]
+    userinfo_endpoint: Option<String>,
 }
 
 fn is_numeric_loopback(host: &str) -> bool {
@@ -165,6 +173,48 @@ fn validate_jwks_origin(
     Ok(origin)
 }
 
+fn validate_userinfo_url(
+    value: &str,
+    issuer: &url::Url,
+    dangerously_allow_insecure_http: bool,
+) -> Result<url::Url, String> {
+    let parsed = validate_oidc_url(
+        value,
+        "OIDC userinfo endpoint",
+        dangerously_allow_insecure_http,
+    )?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("OIDC userinfo endpoint must not include a query or fragment".to_string());
+    }
+    if parsed.origin() != issuer.origin() {
+        return Err(format!(
+            "OIDC userinfo endpoint origin '{}' does not match issuer origin '{}'",
+            parsed.origin().ascii_serialization(),
+            issuer.origin().ascii_serialization(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn roles_at_path(root: &serde_json::Value, roles_claim: &str) -> Vec<String> {
+    let mut value = root;
+    for segment in roles_claim.split('.') {
+        match value.get(segment) {
+            Some(next) => value = next,
+            None => return Vec::new(),
+        }
+    }
+    value
+        .as_array()
+        .map(|roles| {
+            roles
+                .iter()
+                .filter_map(|role| role.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn validate_jwks_url(
     value: &str,
     issuer: &url::Url,
@@ -214,8 +264,21 @@ async fn fetch_bounded_json<T: serde::de::DeserializeOwned>(
     description: &str,
     max_bytes: usize,
 ) -> Result<T, String> {
-    let mut response = client
-        .get(url.clone())
+    fetch_bounded_json_bearer(client, url, description, max_bytes, None).await
+}
+
+async fn fetch_bounded_json_bearer<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &url::Url,
+    description: &str,
+    max_bytes: usize,
+    bearer: Option<&str>,
+) -> Result<T, String> {
+    let mut request = client.get(url.clone());
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let mut response = request
         .send()
         .await
         .map_err(|error| format!("{description} request failed: {error}"))?;
@@ -527,19 +590,22 @@ impl OidcClaims {
     /// - `roles` (Entra ID)
     /// - `groups` (Okta)
     fn extract_roles(&mut self, roles_claim: &str) {
-        let mut value = &self.extra;
-        for segment in roles_claim.split('.') {
-            match value.get(segment) {
-                Some(v) => value = v,
-                None => return,
-            }
-        }
-        if let Some(arr) = value.as_array() {
-            self.roles = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
+        self.roles = roles_at_path(&self.extra, roles_claim);
+    }
+
+    fn userinfo_cache_key(&self) -> String {
+        self.extra
+            .get("jti")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let exp = self
+                    .extra
+                    .get("exp")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                format!("{}:{exp}", self.sub)
+            })
     }
 
     /// Extract scopes from the JWT claims using a dot-separated path.
@@ -637,8 +703,28 @@ impl JwksCache {
         }
 
         let jwks_uri = validate_jwks_url(&discovery.jwks_uri, &issuer_url, config)?;
+        let userinfo_endpoint = if config.roles_from_userinfo {
+            if config.client_id.is_empty() {
+                warn!(
+                    "OIDC roles_from_userinfo is enabled without client_id; any access token from this issuer can supply roles"
+                );
+            }
+            let raw = discovery.userinfo_endpoint.as_deref().ok_or_else(|| {
+                "OIDC discovery has no userinfo_endpoint; roles_from_userinfo requires it"
+                    .to_string()
+            })?;
+            Some(
+                validate_userinfo_url(raw, &issuer_url, config.dangerously_allow_insecure_http)?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
 
         info!(jwks_uri = %jwks_uri, "OIDC JWKS URI discovered");
+        if let Some(endpoint) = &userinfo_endpoint {
+            info!(userinfo = %endpoint, "OIDC roles will be read from userinfo when the access token omits them");
+        }
 
         let cache = Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
@@ -664,6 +750,8 @@ impl JwksCache {
             refresh_mutex: tokio::sync::Mutex::new(()),
             http,
             config: config.clone(),
+            userinfo_endpoint,
+            userinfo_roles: Arc::new(RwLock::new(HashMap::new())),
         };
 
         cache.refresh_keys().await?;
@@ -874,7 +962,11 @@ impl JwksCache {
         })?;
 
         let mut claims = token_data.claims;
+        self.enforce_client_id(&claims)?;
         claims.extract_roles(&self.config.roles_claim);
+        if claims.roles.is_empty() && self.config.roles_from_userinfo {
+            claims.roles = self.roles_from_userinfo(token, &claims).await?;
+        }
 
         let scopes = if self.config.scopes_claim.is_empty() {
             vec![]
@@ -889,6 +981,89 @@ impl JwksCache {
             scopes,
             provider: IdentityProvider::Oidc,
         })
+    }
+
+    fn enforce_client_id(&self, claims: &OidcClaims) -> Result<(), AuthRejection> {
+        if self.config.client_id.is_empty() {
+            return Ok(());
+        }
+        let cid = claims.extra.get("cid").and_then(|value| value.as_str());
+        if cid == Some(self.config.client_id.as_str()) {
+            return Ok(());
+        }
+        debug!("OIDC access token cid does not match the configured client id");
+        Err(reject(
+            AuthFailureReason::InvalidCredential,
+            Status::unauthenticated("invalid token"),
+        ))
+    }
+
+    async fn roles_from_userinfo(
+        &self,
+        token: &str,
+        claims: &OidcClaims,
+    ) -> Result<Vec<String>, AuthRejection> {
+        let cache_key = claims.userinfo_cache_key();
+        {
+            let cache = self.userinfo_roles.read().await;
+            if let Some((roles, expires_at)) = cache.get(&cache_key)
+                && *expires_at > Instant::now()
+            {
+                return Ok(roles.clone());
+            }
+        }
+
+        let endpoint = self.userinfo_endpoint.as_deref().ok_or_else(|| {
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::internal("OIDC userinfo endpoint is not configured"),
+            )
+        })?;
+        let url = url::Url::parse(endpoint).map_err(|error| {
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::internal(format!("OIDC userinfo URL is invalid: {error}")),
+            )
+        })?;
+        let document = fetch_bounded_json_bearer::<serde_json::Value>(
+            &self.http,
+            &url,
+            "OIDC userinfo",
+            USERINFO_MAX_BYTES,
+            Some(token),
+        )
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "OIDC userinfo request failed");
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::internal("OIDC userinfo request failed"),
+            )
+        })?;
+
+        let Some(subject) = document.get("sub").and_then(|value| value.as_str()) else {
+            debug!("OIDC userinfo response has no subject");
+            return Err(reject(
+                AuthFailureReason::InvalidCredential,
+                Status::unauthenticated("invalid token"),
+            ));
+        };
+        if subject != claims.sub {
+            debug!("OIDC userinfo subject does not match the access token");
+            return Err(reject(
+                AuthFailureReason::InvalidCredential,
+                Status::unauthenticated("invalid token"),
+            ));
+        }
+
+        let roles = roles_at_path(&document, &self.config.roles_claim);
+        let mut cache = self.userinfo_roles.write().await;
+        cache.retain(|_, (_, expires_at)| *expires_at > Instant::now());
+        cache.insert(
+            cache_key,
+            (roles.clone(), Instant::now() + USERINFO_CACHE_TTL),
+        );
+        Ok(roles)
     }
 }
 
@@ -959,6 +1134,8 @@ mod tests {
             audience: "test-audience".to_string(),
             jwks_ttl_secs: 3600,
             roles_claim: "roles".to_string(),
+            roles_from_userinfo: false,
+            client_id: String::new(),
             admin_role: "admin".to_string(),
             user_role: "user".to_string(),
             scopes_claim: String::new(),
@@ -1475,6 +1652,8 @@ mod tests {
             audience: TEST_AUDIENCE.to_owned(),
             jwks_ttl_secs: 3600,
             roles_claim: "realm_access.roles".to_owned(),
+            roles_from_userinfo: false,
+            client_id: String::new(),
             admin_role: "openshell-admin".to_owned(),
             user_role: "openshell-user".to_owned(),
             scopes_claim: "scope".to_owned(),
@@ -1502,6 +1681,502 @@ mod tests {
         assert_eq!(identity.roles, vec!["openshell-user".to_owned()]);
         assert_eq!(identity.scopes, vec!["sandbox:write".to_owned()]);
         assert_eq!(identity.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn userinfo_groups_fill_roles_when_the_access_token_has_none() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "user-42",
+                "groups": ["openshell-admins-sec-dev", "openshell-users-sec-dev"],
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer,
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: "0oaxriwwte2cvhLFC5d7".to_owned(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache should accept a same-origin userinfo endpoint");
+
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "user-42",
+                "iss": server.uri(),
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+                "jti": "token-1",
+                "cid": "0oaxriwwte2cvhLFC5d7",
+            }),
+            TEST_KID,
+        );
+        let identity = cache
+            .validate_token(&token)
+            .await
+            .expect("userinfo groups should authorize the token");
+        assert_eq!(
+            identity.roles,
+            vec![
+                "openshell-admins-sec-dev".to_owned(),
+                "openshell-users-sec-dev".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn userinfo_subject_mismatch_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "someone-else",
+                "groups": ["openshell-admins-sec-dev"],
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer: issuer.clone(),
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: String::new(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache");
+
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "user-42",
+                "iss": issuer,
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+            }),
+            TEST_KID,
+        );
+        let error = cache.validate_token(&token).await.expect_err("mismatch");
+        assert_eq!(error.reason, AuthFailureReason::InvalidCredential);
+    }
+
+    #[tokio::test]
+    async fn roles_from_userinfo_rejects_a_foreign_userinfo_origin() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": "http://127.0.0.1:9/userinfo",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let error = JwksCache::new(&OidcConfig {
+            issuer,
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: String::new(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect_err("foreign userinfo origin must fail at startup");
+        assert!(
+            error.contains("does not match issuer origin"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn roles_from_userinfo_rejects_a_userinfo_query() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo?next=1"),
+            })))
+            .mount(&server)
+            .await;
+
+        let error = JwksCache::new(&OidcConfig {
+            issuer,
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: String::new(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect_err("userinfo query must fail at startup");
+        assert!(
+            error.contains("must not include a query or fragment"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn userinfo_without_subject_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "groups": ["openshell-admins-sec-dev"],
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer: issuer.clone(),
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: String::new(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache");
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "user-42",
+                "iss": issuer,
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+            }),
+            TEST_KID,
+        );
+        let error = cache.validate_token(&token).await.expect_err("missing sub");
+        assert_eq!(error.reason, AuthFailureReason::InvalidCredential);
+    }
+
+    #[tokio::test]
+    async fn userinfo_http_error_fails_closed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer: issuer.clone(),
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: String::new(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache");
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "user-42",
+                "iss": issuer,
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+            }),
+            TEST_KID,
+        );
+        let error = cache
+            .validate_token(&token)
+            .await
+            .expect_err("userinfo failure must not grant roles");
+        assert_eq!(error.reason, AuthFailureReason::IdentityProviderUnavailable);
+    }
+
+    #[tokio::test]
+    async fn client_id_mismatch_is_rejected_without_calling_userinfo() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "user-42",
+                "groups": ["openshell-admins-sec-dev"],
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer: issuer.clone(),
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: "0oaxriwwte2cvhLFC5d7".to_owned(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache");
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "user-42",
+                "iss": issuer,
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+                "cid": "other-app",
+                "groups": ["openshell-admins-sec-dev"],
+            }),
+            TEST_KID,
+        );
+        let error = cache
+            .validate_token(&token)
+            .await
+            .expect_err("a different Okta app must not be accepted");
+        assert_eq!(error.reason, AuthFailureReason::InvalidCredential);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn access_token_roles_skip_userinfo() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer: issuer.clone(),
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: String::new(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache");
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "user-42",
+                "iss": issuer,
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+                "groups": ["openshell-users-sec-dev"],
+            }),
+            TEST_KID,
+        );
+        let identity = cache
+            .validate_token(&token)
+            .await
+            .expect("roles already in the access token must not call userinfo");
+        assert_eq!(identity.roles, vec!["openshell-users-sec-dev".to_owned()]);
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -1875,6 +2550,8 @@ mod tests {
                 audience: "test-audience".to_string(),
                 jwks_ttl_secs: 3600,
                 roles_claim: "roles".to_string(),
+                roles_from_userinfo: false,
+                client_id: String::new(),
                 admin_role: "admin".to_string(),
                 user_role: "user".to_string(),
                 scopes_claim: String::new(),
