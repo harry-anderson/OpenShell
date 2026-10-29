@@ -1041,15 +1041,19 @@ impl JwksCache {
             )
         })?;
 
-        let Some(subject) = document.get("sub").and_then(|value| value.as_str()) else {
+        let Some(subject) = document
+            .get("sub")
+            .and_then(|value| value.as_str())
+            .filter(|subject| !subject.is_empty())
+        else {
             debug!("OIDC userinfo response has no subject");
             return Err(reject(
                 AuthFailureReason::InvalidCredential,
                 Status::unauthenticated("invalid token"),
             ));
         };
-        if subject != claims.sub {
-            debug!("OIDC userinfo subject does not match the access token");
+        if !userinfo_subject_matches(claims, subject) {
+            debug!("OIDC userinfo subject does not match the access token subject or uid");
             return Err(reject(
                 AuthFailureReason::InvalidCredential,
                 Status::unauthenticated("invalid token"),
@@ -1069,6 +1073,25 @@ impl JwksCache {
 
 fn reject(reason: AuthFailureReason, status: Status) -> AuthRejection {
     AuthRejection::new(AuthMechanism::Oidc, reason, status)
+}
+
+/// Bind a userinfo document to the access token.
+///
+/// Standard issuers use the same `sub` in both. The Okta org authorization
+/// server sets the access-token `sub` to the login and `uid` to the user id,
+/// and userinfo `sub` is that user id.
+fn userinfo_subject_matches(claims: &OidcClaims, userinfo_sub: &str) -> bool {
+    if userinfo_sub.is_empty() {
+        return false;
+    }
+    if userinfo_sub == claims.sub {
+        return true;
+    }
+    claims
+        .extra
+        .get("uid")
+        .and_then(|value| value.as_str())
+        .is_some_and(|uid| !uid.is_empty() && uid == userinfo_sub)
 }
 
 fn decode_failure_reason(kind: &jsonwebtoken::errors::ErrorKind) -> AuthFailureReason {
@@ -1817,6 +1840,7 @@ mod tests {
         let token = mint_rs256(
             &serde_json::json!({
                 "sub": "user-42",
+                "uid": "00u-not-the-userinfo-subject",
                 "iss": issuer,
                 "aud": TEST_AUDIENCE,
                 "exp": now_secs() + 3600,
@@ -1825,6 +1849,78 @@ mod tests {
         );
         let error = cache.validate_token(&token).await.expect_err("mismatch");
         assert_eq!(error.reason, AuthFailureReason::InvalidCredential);
+    }
+
+    #[tokio::test]
+    async fn okta_org_userinfo_uid_matches_when_token_sub_is_the_login() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sub": "00u-okta-user",
+                "groups": ["openshell-admins-sec-dev"],
+            })))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new(&OidcConfig {
+            issuer: issuer.clone(),
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_owned(),
+            roles_from_userinfo: true,
+            client_id: "0oaxriwwte2cvhLFC5d7".to_owned(),
+            admin_role: "openshell-admins-sec-dev".to_owned(),
+            user_role: "openshell-users-sec-dev".to_owned(),
+            scopes_claim: String::new(),
+        })
+        .await
+        .expect("cache");
+
+        let token = mint_rs256(
+            &serde_json::json!({
+                "sub": "ada@example.com",
+                "uid": "00u-okta-user",
+                "cid": "0oaxriwwte2cvhLFC5d7",
+                "iss": issuer,
+                "aud": TEST_AUDIENCE,
+                "exp": now_secs() + 3600,
+            }),
+            TEST_KID,
+        );
+        let identity = cache
+            .validate_token(&token)
+            .await
+            .expect("Okta uid should bind userinfo to the access token");
+        assert_eq!(identity.subject, "ada@example.com");
+        assert_eq!(identity.roles, vec!["openshell-admins-sec-dev".to_owned()]);
     }
 
     #[tokio::test]

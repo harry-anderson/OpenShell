@@ -195,8 +195,10 @@ scopes, and enabling scope checks would deny every call.
 
 The gateway still validates the access token signature, issuer, audience, and
 expiry. It rejects a token whose `cid` is not `client_id`. When the token has
-no groups, it reads them from the issuer userinfo endpoint and requires that
-response's `sub` to match the token. A custom authorization server that puts
+no groups, it reads them from the issuer userinfo endpoint. It accepts that
+response when its `sub` matches the token `sub`, or the token `uid`. The Okta
+org authorization server sets `sub` to the login and `uid` to the user id, and
+userinfo `sub` is that user id. A custom authorization server that puts
 `groups` in the access token and a dedicated `aud` does not need
 `roles_from_userinfo`.
 
