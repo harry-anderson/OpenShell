@@ -957,6 +957,8 @@ async fn unrelated_oidc_configuration_does_not_reset_mtls_admission_identity() {
         audience: "openshell-cli".into(),
         jwks_ttl_secs: 300,
         roles_claim: String::new(),
+        roles_from_userinfo: false,
+        client_id: String::new(),
         admin_role: String::new(),
         user_role: String::new(),
         scopes_claim: String::new(),
