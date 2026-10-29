@@ -140,15 +140,16 @@ fn device_authorization_form(
     client_id: &str,
     scopes: &str,
     audience: Option<&str>,
-    code_challenge: &str,
-    code_challenge_method: &str,
+    pkce: Option<(&str, &str)>,
 ) -> Vec<(&'static str, String)> {
     let mut params = vec![
         ("client_id", client_id.to_string()),
         ("scope", scopes.to_string()),
-        ("code_challenge", code_challenge.to_string()),
-        ("code_challenge_method", code_challenge_method.to_string()),
     ];
+    if let Some((code_challenge, code_challenge_method)) = pkce {
+        params.push(("code_challenge", code_challenge.to_string()));
+        params.push(("code_challenge_method", code_challenge_method.to_string()));
+    }
     if let Some(audience) = audience {
         params.push(("audience", audience.to_string()));
     }
@@ -158,17 +159,33 @@ fn device_authorization_form(
 fn device_token_form(
     client_id: &str,
     device_code: &str,
-    code_verifier: &str,
+    code_verifier: Option<&str>,
 ) -> Vec<(&'static str, String)> {
-    vec![
+    let mut params = vec![
         (
             "grant_type",
             "urn:ietf:params:oauth:grant-type:device_code".to_string(),
         ),
         ("device_code", device_code.to_string()),
         ("client_id", client_id.to_string()),
-        ("code_verifier", code_verifier.to_string()),
-    ]
+    ];
+    if let Some(code_verifier) = code_verifier.filter(|verifier| !verifier.is_empty()) {
+        params.push(("code_verifier", code_verifier.to_string()));
+    }
+    params
+}
+
+/// Okta's org authorization server verifies a device code on a hosted page
+/// that cannot carry a PKCE challenge. Sending one makes the token poll fail
+/// after the user approves the code. Custom Okta servers use
+/// `/oauth2/{id}/v1/device/authorize` and still get PKCE.
+fn okta_org_device_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(endpoint)
+        .trim_end_matches('/')
+        .ends_with("/oauth2/v1/device/authorize")
 }
 
 /// Run the OIDC Authorization Code + PKCE browser flow.
@@ -335,15 +352,24 @@ pub async fn oidc_device_code_flow(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Use PKCE for the device flow as well as the browser flow. Keycloak
-    // requires these parameters when the public client enforces S256 PKCE.
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    // Keycloak public clients require S256 PKCE on the device request. Okta's
+    // org authorization server rejects that pair because its verification page
+    // does not include the challenge.
+    let pkce = if okta_org_device_endpoint(device_auth_endpoint) {
+        None
+    } else {
+        Some(PkceCodeChallenge::new_random_sha256())
+    };
+    let pkce_method = pkce
+        .as_ref()
+        .map(|(challenge, _)| challenge.method().as_str().to_string());
     let form_params = device_authorization_form(
         client_id,
         &scopes_param,
         audience,
-        pkce_challenge.as_str(),
-        pkce_challenge.method().as_str(),
+        pkce.as_ref()
+            .zip(pkce_method.as_deref())
+            .map(|((challenge, _), method)| (challenge.as_str(), method)),
     );
 
     let device_auth_resp = http
@@ -393,8 +419,10 @@ pub async fn oidc_device_code_flow(
 
         tokio::time::sleep(poll_interval).await;
 
-        let token_params =
-            device_token_form(client_id, &device_auth.device_code, pkce_verifier.secret());
+        let code_verifier = pkce
+            .as_ref()
+            .map(|(_, verifier)| verifier.secret().as_str());
+        let token_params = device_token_form(client_id, &device_auth.device_code, code_verifier);
 
         let poll_resp = http
             .post(&discovery.token_endpoint)
@@ -823,8 +851,7 @@ mod tests {
             "openshell-cli",
             "openid profile",
             Some("openshell-api"),
-            "test-challenge",
-            "S256",
+            Some(("test-challenge", "S256")),
         );
         let params: std::collections::HashMap<_, _> = params.into_iter().collect();
 
@@ -852,7 +879,7 @@ mod tests {
 
     #[test]
     fn device_token_form_includes_pkce_verifier() {
-        let params = device_token_form("openshell-cli", "device-code", "test-verifier");
+        let params = device_token_form("openshell-cli", "device-code", Some("test-verifier"));
         let params: std::collections::HashMap<_, _> = params.into_iter().collect();
 
         assert_eq!(
@@ -871,6 +898,35 @@ mod tests {
             params.get("code_verifier").map(String::as_str),
             Some("test-verifier")
         );
+    }
+
+    #[test]
+    fn okta_org_device_form_omits_pkce() {
+        let params = device_authorization_form("0oaxriwwte2cvhLFC5d7", "openid groups", None, None);
+        let params: std::collections::HashMap<_, _> = params.into_iter().collect();
+        assert!(params.get("code_challenge").is_none());
+        assert!(params.get("code_challenge_method").is_none());
+        assert!(params.get("audience").is_none());
+
+        let token = device_token_form("0oaxriwwte2cvhLFC5d7", "device-code", None);
+        let token: std::collections::HashMap<_, _> = token.into_iter().collect();
+        assert!(token.get("code_verifier").is_none());
+    }
+
+    #[test]
+    fn okta_org_device_endpoint_is_the_org_server_path_only() {
+        assert!(okta_org_device_endpoint(
+            "https://sso.smartcontract.com/oauth2/v1/device/authorize"
+        ));
+        assert!(okta_org_device_endpoint(
+            "https://trial.okta.com/oauth2/v1/device/authorize?foo=1"
+        ));
+        assert!(!okta_org_device_endpoint(
+            "https://trial.okta.com/oauth2/default/v1/device/authorize"
+        ));
+        assert!(!okta_org_device_endpoint(
+            "https://keycloak.example/realms/openshell/protocol/openid-connect/auth/device"
+        ));
     }
 
     #[test]
