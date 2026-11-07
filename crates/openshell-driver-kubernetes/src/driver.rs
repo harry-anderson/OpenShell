@@ -21,7 +21,7 @@ use crate::sandbox_runtime::{
     copy_workload_scheduling, generate_proxy_ca_material, image_pull_secret_copy,
     sandbox_bootstrap_secret, sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     shared_control_policy, shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod,
-    workload_fence,
+    supervisor_release_patch, workload_fence,
 };
 use crate::shared_supervisor::{
     ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
@@ -597,6 +597,17 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a dedicated supervisor waits for its workload to be bound before
+/// it is released without node affinity. Covers a Karpenter node launch.
+const SUPERVISOR_PLACEMENT_WAIT: Duration = Duration::from_mins(1);
+/// Workload annotations a dedicated supervisor inherits, so autoscalers
+/// treat the pair as one unit. Only disruption hints: a tenant-supplied value
+/// never reaches any other field of the supervisor Pod, and the operator
+/// allowlist must also admit the key.
+const SUPERVISOR_INHERITED_ANNOTATIONS: &[&str] = &[
+    "karpenter.sh/do-not-disrupt",
+    "cluster-autoscaler.kubernetes.io/safe-to-evict",
+];
 /// How long an operator-mode workspace check waits for the namespace label
 /// watcher's first full listing before reporting the driver unavailable.
 const OPERATOR_ALLOWLIST_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3581,6 +3592,73 @@ impl KubernetesComputeDriver {
         }
     }
 
+    /// Ungate a dedicated supervisor Pod next to its workload.
+    ///
+    /// Waits up to `SUPERVISOR_PLACEMENT_WAIT` for the scheduler to bind the
+    /// workload, then releases the supervisor with a preferred affinity for
+    /// that node and the workload's disruption annotations. If the workload
+    /// is still pending (a new node is being provisioned, or it cannot fit),
+    /// the supervisor is released without affinity as before rather than
+    /// holding up creation.
+    async fn release_generation_supervisor_pod(
+        &self,
+        namespace: &str,
+        pods: &Api<Pod>,
+        workload_pod_name: &str,
+        supervisor_pod_name: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let deadline = tokio::time::Instant::now() + SUPERVISOR_PLACEMENT_WAIT;
+        let workload = loop {
+            let pod = pods
+                .get(workload_pod_name)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            let bound = pod
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.node_name.as_deref())
+                .is_some_and(|node| !node.is_empty());
+            if bound || tokio::time::Instant::now() >= deadline {
+                break pod;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let node = workload
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.node_name.as_deref());
+        if node.is_none() {
+            warn!(
+                workload = workload_pod_name,
+                "workload Pod not scheduled in time; releasing supervisor without node affinity"
+            );
+        }
+        let annotations: BTreeMap<String, String> = workload
+            .metadata
+            .annotations
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(key, _)| {
+                SUPERVISOR_INHERITED_ANNOTATIONS.contains(&key.as_str())
+                    && self.config.pod_annotation_allowed(key)
+            })
+            .collect();
+        // A restarted generation must revalidate immediately before resuming
+        // the gated supervisor as well as before creating it. The shared
+        // topology never carries an additional CA: the gateway refuses that
+        // combination fail-closed.
+        self.ensure_network_additional_ca_config_map(namespace)
+            .await?;
+        pods.patch(
+            supervisor_pod_name,
+            &PatchParams::default(),
+            &Patch::Merge(&supervisor_release_patch(node, &annotations)),
+        )
+        .await
+        .map_err(KubernetesDriverError::from_kube)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     async fn install_sandbox_runtime_generation(
         &self,
@@ -3815,19 +3893,9 @@ impl KubernetesComputeDriver {
                     vec![workload_owner, supervisor_owner],
                 )
                 .await?;
-                // A restarted generation must revalidate immediately before
-                // resuming the gated supervisor as well as before creating
-                // it. The shared topology never carries an additional CA:
-                // the gateway refuses that combination fail-closed.
-                self.ensure_network_additional_ca_config_map(namespace)
-                    .await?;
-                pods.patch(
-                    &names.supervisor_pod,
-                    &PatchParams::default(),
-                    &Patch::Merge(&serde_json::json!({"spec": {"schedulingGates": []}})),
-                )
-                .await
-                .map_err(KubernetesDriverError::from_kube)?;
+                // The supervisor stays gated until the workload has a node;
+                // release_generation_supervisor_pod below revalidates the
+                // additional CA immediately before ungating it.
             }
             GenerationLaunchTarget::Shared { shared, route, .. } => {
                 self.create_generation_image_pull_secrets(
@@ -3886,6 +3954,9 @@ impl KubernetesComputeDriver {
                     })?;
             }
         }
+        // The workload is released first so its supervisor can follow it to
+        // the same node. Only boundary PID 1 starts here, and it waits for the
+        // supervisor to dial in before anything else runs.
         pods.patch(
             &workload_pod_name,
             &PatchParams::default(),
@@ -3893,6 +3964,15 @@ impl KubernetesComputeDriver {
         )
         .await
         .map_err(KubernetesDriverError::from_kube)?;
+        if matches!(target, GenerationLaunchTarget::Dedicated { .. }) {
+            self.release_generation_supervisor_pod(
+                namespace,
+                &pods,
+                &workload_pod_name,
+                &names.supervisor_pod,
+            )
+            .await?;
+        }
         patch_dynamic_object_with_resource_version_retry(&sandbox_api.api, cr_name, |version| {
             sandbox_runtime_bootstrap_phase_patch(version, SandboxRuntimeBootstrapPhase::Released)
         })

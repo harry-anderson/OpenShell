@@ -916,6 +916,40 @@ pub fn copy_workload_scheduling(supervisor: &mut Pod, workload_pod_spec: &serde_
     }
 }
 
+/// Merge patch that releases a gated supervisor Pod.
+///
+/// When the workload Pod already has a node, the supervisor prefers that node
+/// so one node loss takes down one sandbox rather than every supervisor that
+/// happened to land together. Preferred node affinity is one of the fields
+/// Kubernetes lets a caller add while a Pod is still gated. `annotations`
+/// carries the workload annotations the operator allowlisted (for example
+/// `karpenter.sh/do-not-disrupt`), so the pair shares disruption handling.
+#[must_use]
+pub fn supervisor_release_patch(
+    workload_node: Option<&str>,
+    annotations: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    let mut patch = serde_json::json!({"spec": {"schedulingGates": []}});
+    if let Some(node) = workload_node.filter(|node| !node.is_empty()) {
+        patch["spec"]["affinity"] = serde_json::json!({
+            "nodeAffinity": {
+                "preferredDuringSchedulingIgnoredDuringExecution": [{
+                    "weight": 100,
+                    "preference": {"matchExpressions": [{
+                        "key": "kubernetes.io/hostname",
+                        "operator": "In",
+                        "values": [node],
+                    }]},
+                }],
+            },
+        });
+    }
+    if !annotations.is_empty() {
+        patch["metadata"] = serde_json::json!({"annotations": annotations});
+    }
+    patch
+}
+
 fn empty_dir_volume(name: &str) -> Volume {
     Volume {
         name: name.to_string(),
@@ -962,6 +996,39 @@ mod tests {
         assert_eq!(tolerations.len(), 1);
         assert_eq!(tolerations[0].key.as_deref(), Some("kind"));
         assert_eq!(tolerations[0].value.as_deref(), Some("od"));
+    }
+
+    #[test]
+    fn supervisor_release_prefers_the_workload_node() {
+        let annotations = BTreeMap::from([(
+            "karpenter.sh/do-not-disrupt".to_string(),
+            "true".to_string(),
+        )]);
+        let patch = supervisor_release_patch(Some("ip-10-0-1-2"), &annotations);
+        assert_eq!(patch["spec"]["schedulingGates"], serde_json::json!([]));
+        let term = &patch["spec"]["affinity"]["nodeAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"]
+            [0];
+        assert_eq!(term["weight"], 100);
+        assert_eq!(
+            term["preference"]["matchExpressions"][0],
+            serde_json::json!({
+                "key": "kubernetes.io/hostname",
+                "operator": "In",
+                "values": ["ip-10-0-1-2"],
+            })
+        );
+        assert_eq!(
+            patch["metadata"]["annotations"]["karpenter.sh/do-not-disrupt"],
+            "true"
+        );
+    }
+
+    #[test]
+    fn supervisor_release_without_a_workload_node_only_ungates() {
+        let patch = supervisor_release_patch(None, &BTreeMap::new());
+        assert_eq!(patch, serde_json::json!({"spec": {"schedulingGates": []}}));
+        let patch = supervisor_release_patch(Some(""), &BTreeMap::new());
+        assert_eq!(patch, serde_json::json!({"spec": {"schedulingGates": []}}));
     }
 
     #[test]
