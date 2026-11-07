@@ -383,7 +383,8 @@ The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
 
 A dedicated supervisor Pod is created gated too. The driver releases the
-workload first, waits up to one minute for it to be bound, then releases the
+workload first, waits up to two minutes for it to be bound (long enough
+for a Karpenter node launch), then releases the
 supervisor with a preferred node affinity for the workload's node, so losing a
 node takes down the sandboxes on it rather than every supervisor that happened
 to land there. The supervisor also inherits the workload's
