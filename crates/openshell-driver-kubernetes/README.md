@@ -344,6 +344,16 @@ The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
 
+A dedicated supervisor Pod is created gated too. The driver releases the
+workload first, waits up to one minute for it to be bound, then releases the
+supervisor with a preferred node affinity for the workload's node, so losing a
+node takes down the sandboxes on it rather than every supervisor that happened
+to land there. The supervisor also inherits the workload's
+`karpenter.sh/do-not-disrupt` and
+`cluster-autoscaler.kubernetes.io/safe-to-evict` annotations when the operator
+allowlist admits them. If the workload is still pending after the wait, the
+supervisor is released without affinity.
+
 Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
 across clones of the driver. Reconciliation skips busy sandboxes and refreshes
 the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
