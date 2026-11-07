@@ -405,8 +405,10 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a dedicated supervisor waits for its workload to be bound before
-/// it is released without node affinity. Covers a Karpenter node launch.
-const SUPERVISOR_PLACEMENT_WAIT: Duration = Duration::from_mins(1);
+/// it is released without node affinity. Covers a Karpenter node launch: on
+/// scanner-dev a workload waiting for a new node was bound 62 seconds after
+/// creation.
+const SUPERVISOR_PLACEMENT_WAIT: Duration = Duration::from_mins(2);
 /// Workload annotations a dedicated supervisor inherits, so autoscalers
 /// treat the pair as one unit. Only disruption hints: a tenant-supplied value
 /// never reaches any other field of the supervisor Pod, and the operator
