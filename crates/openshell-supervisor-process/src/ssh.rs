@@ -450,6 +450,10 @@ struct SshHandler {
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
     agent_relay: Arc<dyn openshell_isolation_interface::contract::BoundaryAgentRelay>,
     agent_listener_started: AtomicBool,
+    /// Bridge for this session's workload agent listener. The workload
+    /// allows one listener per sandbox, so the bridge must not outlive the
+    /// session or every later `--forward-agent` connect is refused.
+    agent_bridge: Option<tokio::task::JoinHandle<()>>,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
     main_session: Option<Arc<MainSession>>,
     /// This server's endpoint, named on every SSH event it emits.
@@ -459,6 +463,11 @@ struct SshHandler {
 
 impl Drop for SshHandler {
     fn drop(&mut self) {
+        // Before the main-session early return: a session without a main
+        // attachment can still own the agent listener.
+        if let Some(bridge) = self.agent_bridge.take() {
+            bridge.abort();
+        }
         let Some(main_session) = self.main_session.as_ref() else {
             return;
         };
@@ -488,6 +497,7 @@ impl SshHandler {
             port_forward,
             agent_relay,
             agent_listener_started: AtomicBool::new(false),
+            agent_bridge: None,
             boundary_exec,
             main_session,
             server_endpoint,
@@ -977,13 +987,13 @@ impl russh::server::Handler for SshHandler {
         match self.agent_relay.open_listener().await {
             Ok(stream) => {
                 let handle = session.handle();
-                tokio::spawn(async move {
+                self.agent_bridge = Some(tokio::spawn(async move {
                     if let Err(error) =
                         crate::agent_bridge::bridge_agent_listener(stream, handle).await
                     {
                         tracing::warn!("agent-forward bridge ended: {error}");
                     }
-                });
+                }));
                 ocsf_emit!(
                     SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .dst_endpoint((*self.server_endpoint).clone())
@@ -2430,5 +2440,186 @@ mod tests {
         assert!(!is_loopback_host(""));
         assert!(!is_loopback_host("not-an-ip"));
         assert!(!is_loopback_host("[]"));
+    }
+
+    /// Hands the workload end of each agent listener stream to the test.
+    struct DuplexAgentRelay(tokio::sync::mpsc::UnboundedSender<tokio::io::DuplexStream>);
+
+    #[async_trait::async_trait]
+    impl openshell_isolation_interface::contract::BoundaryAgentRelay for DuplexAgentRelay {
+        async fn open_listener(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::BoundaryDuplexStream,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            let (supervisor, workload) = tokio::io::duplex(64 * 1024);
+            self.0.send(workload).map_err(|_| {
+                openshell_isolation_interface::contract::BackendError::Process(
+                    "test workload receiver dropped".to_string(),
+                )
+            })?;
+            Ok(Box::new(supervisor))
+        }
+    }
+
+    /// Client that accepts the server key and passes agent channels to the test.
+    struct AgentChannelClient(
+        tokio::sync::mpsc::UnboundedSender<russh::Channel<russh::client::Msg>>,
+    );
+
+    impl russh::client::Handler for AgentChannelClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn server_channel_open_agent_forward(
+            &mut self,
+            channel: russh::Channel<russh::client::Msg>,
+            reply: russh::client::ChannelOpenHandle,
+            _session: &mut russh::client::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            let _ = self.0.send(channel);
+            Ok(())
+        }
+    }
+
+    struct AgentForwardFixture {
+        client: russh::client::Handle<AgentChannelClient>,
+        /// Kept open so the SSH session stays up until the test ends it.
+        _session_channel: russh::Channel<russh::client::Msg>,
+        workload: tokio::io::DuplexStream,
+        agent_channels: tokio::sync::mpsc::UnboundedReceiver<russh::Channel<russh::client::Msg>>,
+    }
+
+    /// One SSH session (no main attachment, the `Drop` early-return path)
+    /// that has completed `auth-agent-req@openssh.com`.
+    async fn agent_forward_fixture() -> AgentForwardFixture {
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let mut server_config = russh::server::Config {
+            auth_rejection_time: Duration::from_millis(1),
+            ..Default::default()
+        };
+        server_config.keys.push(host_key);
+
+        let (workload_tx, mut workload_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = SshHandler::new(
+            rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+            Arc::new(DuplexAgentRelay(workload_tx)),
+            rpc_test::exec(Arc::new(RejectingExec)),
+            None,
+            Arc::new(ssh_server_endpoint(Path::new(
+                "/run/openshell/test/ssh.sock",
+            ))),
+        );
+        let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(session) =
+                russh::server::run_stream(Arc::new(server_config), server_stream, handler).await
+            {
+                let _ = session.await;
+            }
+        });
+
+        let (agent_tx, agent_channels) = tokio::sync::mpsc::unbounded_channel();
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_stream,
+            AgentChannelClient(agent_tx),
+        )
+        .await
+        .unwrap();
+        let auth = client.authenticate_none("sandbox").await.unwrap();
+        assert!(matches!(auth, russh::client::AuthResult::Success));
+
+        let mut session_channel = client.channel_open_session().await.unwrap();
+        session_channel.agent_forward(true).await.unwrap();
+        assert!(matches!(
+            next_main_event(&mut session_channel).await,
+            russh::ChannelMsg::Success
+        ));
+        let workload = tokio::time::timeout(Duration::from_secs(5), workload_rx.recv())
+            .await
+            .expect("agent listener was not opened")
+            .expect("relay dropped");
+        AgentForwardFixture {
+            client,
+            _session_channel: session_channel,
+            workload,
+            agent_channels,
+        }
+    }
+
+    // The workload refuses a second AgentListen while its listener stream is
+    // open. If the bridge outlives the session, every later --forward-agent
+    // connect to the sandbox is refused until the workload restarts.
+    #[tokio::test]
+    async fn agent_listener_stream_closes_when_the_ssh_session_ends() {
+        use tokio::io::AsyncReadExt as _;
+        let AgentForwardFixture {
+            client,
+            _session_channel: session_channel,
+            mut workload,
+            agent_channels: _agent_channels,
+        } = agent_forward_fixture().await;
+
+        client
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        drop(session_channel);
+        drop(client);
+
+        let mut buf = [0_u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(5), workload.read(&mut buf))
+            .await
+            .expect("workload listener stream stayed open after the SSH session ended");
+        assert_eq!(read.unwrap(), 0, "expected EOF on the workload stream");
+    }
+
+    // An agent client in the workload that hangs up must close its SSH agent
+    // channel. Otherwise the client never closes the channel, the bridge never
+    // sends FRAME_CLOSE back, and the workload keeps the accepted socket.
+    #[tokio::test]
+    async fn workload_close_sends_eof_on_the_agent_channel() {
+        let mut fixture = agent_forward_fixture().await;
+        let open = openshell_core::ssh_agent::AgentFrame {
+            kind: openshell_core::ssh_agent::FRAME_OPEN,
+            conn_id: 1,
+            payload: Vec::new(),
+        };
+        openshell_core::ssh_agent::write_agent_frame(&mut fixture.workload, &open)
+            .await
+            .unwrap();
+        let mut agent_channel =
+            tokio::time::timeout(Duration::from_secs(5), fixture.agent_channels.recv())
+                .await
+                .expect("supervisor did not open an agent channel")
+                .expect("client handler dropped");
+
+        let close = openshell_core::ssh_agent::AgentFrame {
+            kind: openshell_core::ssh_agent::FRAME_CLOSE,
+            conn_id: 1,
+            payload: Vec::new(),
+        };
+        openshell_core::ssh_agent::write_agent_frame(&mut fixture.workload, &close)
+            .await
+            .unwrap();
+
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), agent_channel.wait())
+                .await
+                .expect("agent channel got no EOF after the workload client closed")
+                .expect("agent channel closed without EOF");
+            if matches!(msg, russh::ChannelMsg::Eof) {
+                break;
+            }
+        }
     }
 }
